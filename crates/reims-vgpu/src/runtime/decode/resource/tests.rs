@@ -3171,3 +3171,33 @@ fn a_memoryless_texture_decodes_its_geometry_and_format() {
     assert_eq!(tex.sample_count, 1);
     assert!(decode_memoryless_texture_descriptor(&bytes[..20]).is_err());
 }
+
+#[test]
+fn a_declared_input_primitive_topology_does_not_refuse_the_pipeline() {
+    let decode_at = |topology: u32| {
+        let mut b = vec![0u8; 16 + 1 + 6 + 6];
+        let blen = b.len() as u32;
+        st32(&mut b[0..], TYPE7_OBJECT_RENDER_PIPELINE);
+        st32(&mut b[4..], blen);
+        st32(&mut b[8..], 9);
+        b[16] = 2;
+        b[17] = PIPELINE_TAG_VERTEX_FUNC;
+        b[18] = 4;
+        st32(&mut b[19..], 2);
+        b[23] = PIPELINE_TAG_INPUT_PRIMITIVE_TOPOLOGY;
+        b[24] = 4;
+        st32(&mut b[25..], topology);
+        decode_render_pipeline_descriptor(&b)
+    };
+
+    let triangle = decode_at(3).expect("a declared topology class is not a refusal");
+    let unspecified = decode_at(0).expect("nor is an unspecified one");
+    assert_eq!(
+        triangle, unspecified,
+        "the class must not reach the decoded pipeline: the topology a draw \
+         rasterizes at comes from its own primitive type"
+    );
+
+    assert!(RENDER_PIPELINE_TAGS_BENIGN.contains(&PIPELINE_TAG_INPUT_PRIMITIVE_TOPOLOGY));
+    assert!(!RENDER_PIPELINE_TAGS_BENIGN.contains(&0x6d));
+}
