@@ -4311,7 +4311,7 @@ fn spawn_compute_engine_stall_watchdog(
         crate::observe::fail(format!(
             "compute_engine_stall reason=backend_call_unreturned pipe={pipeline_ref} elapsed_ms={elapsed_ms} grid={grid:?} nbuf={buffers} nimg={images} image_geom={image_geometry:?}"
         ));
-        let base = format!("/tmp/reims-vgpu-compute-stall-pipe-{pipeline_ref}");
+        let base = std::env::temp_dir().join(format!("reims-vgpu-compute-stall-pipe-{pipeline_ref}")).to_string_lossy().into_owned();
         let mut bytes = Vec::with_capacity(spirv.len().saturating_mul(4));
         for word in spirv {
             bytes.extend_from_slice(&word.to_le_bytes());

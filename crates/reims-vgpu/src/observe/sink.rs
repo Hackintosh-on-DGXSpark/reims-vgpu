@@ -123,14 +123,14 @@ pub(crate) fn fail_log_path() -> &'static str {
     #[cfg(test)]
     return FAIL_PATH.get_or_init(|| test_path("fail"));
     #[cfg(not(test))]
-    FAIL_PATH.get_or_init(|| "/tmp/reims-vgpu-fail.log".to_string())
+    FAIL_PATH.get_or_init(|| std::env::temp_dir().join("reims-vgpu-fail.log").to_string_lossy().into_owned())
 }
 
 pub(crate) fn draw_log_path() -> &'static str {
     #[cfg(test)]
     return DRAW_PATH.get_or_init(|| test_path("draw"));
     #[cfg(not(test))]
-    DRAW_PATH.get_or_init(|| "/tmp/reims-vgpu-draw.log".to_string())
+    DRAW_PATH.get_or_init(|| std::env::temp_dir().join("reims-vgpu-draw.log").to_string_lossy().into_owned())
 }
 
 /// Test-harness support: point the always-on sinks at per-process files so a
