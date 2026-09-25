@@ -2741,15 +2741,18 @@ pub(super) fn load_type5_view_rgba<M: HostMemory + HostOps>(
             view.width,
             view.height,
         );
+        let packed_422 = pixel_format::is_packed_422(view.pixel_format);
         for y in 0..view.height as usize {
             let src_off = y.saturating_mul(tight as usize);
             let dst_off = y.saturating_mul(rgba_stride as usize);
-            if !pixel_format::convert_row_to_rgba8(
-                view.pixel_format,
-                &native[src_off..src_off + tight as usize],
-                view.width,
-                &mut rgba[dst_off..dst_off + rgba_stride as usize],
-            ) {
+            let src = &native[src_off..src_off + tight as usize];
+            let dst = &mut rgba[dst_off..dst_off + rgba_stride as usize];
+            let converted = if packed_422 {
+                pixel_format::packed_422_expand_row(view.pixel_format, src, view.width, dst)
+            } else {
+                pixel_format::convert_row_to_rgba8(view.pixel_format, src, view.width, dst)
+            };
+            if !converted {
                 return fail(Type5ViewDecline::Convert { row: y, bpp });
             }
         }
