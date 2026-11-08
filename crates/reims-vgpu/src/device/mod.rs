@@ -15,14 +15,15 @@
 //! this shape: a private `mod`, with the names `crate::qemu::abi` reaches re-exported
 //! at the root.
 
+/// How long each holder keeps the device lock, how long a vCPU waited, and
+/// the order blocked threads get it in.
+pub(crate) mod lock_hold;
+use lock_hold::{try_hold, Held, Holder};
+
 /// The device side of that window: its link, its four QEMU entry points, and
 /// the two publish paths the drain and the poll call. Unconditional, because
 /// the entry points keep a stub arm without the feature and the QEMU ABI
 /// surface must be the same shape either way.
-/// How long each holder keeps the device lock, and how long a vCPU waited.
-pub(crate) mod lock_hold;
-use lock_hold::{try_hold, Held, Holder};
-
 mod window_publish;
 pub(crate) use window_publish::{
     device_window_run_main, device_window_set_early_fb, device_window_start, device_window_stop,
@@ -202,7 +203,7 @@ fn apply_gfx_write(inner: &mut DeviceInner, slot: &BoundDevice, write: QueuedGfx
 /// wait behind shader translation/GPU work.
 fn lock_for_drain(slot: &BoundDevice, holder: Holder) -> Held<'_, DeviceInner> {
     let mut ingress = slot.gfx_ingress.lock();
-    let mut inner = Held::new(slot.inner.lock(), holder);
+    let mut inner = lock_hold::hold_for_drain(&slot.inner, holder);
     while let Some(write) = ingress.pop_front() {
         apply_gfx_write(&mut inner, slot, write);
     }
@@ -488,19 +489,16 @@ pub fn device_gfx_write(id: u64, offset: u64, data: u64, size: u32) -> bool {
 /// the step to "the guest missed a frame" an inference; this measures it where
 /// it is actually paid.
 ///
-/// The uncontended path takes `try_lock` and never reads the clock, so a fast
-/// access pays nothing for the instrument.
+/// A vCPU that has to block is registered as a waiter until it has the lock,
+/// and is served in the order it blocked; see `lock_hold`. The uncontended
+/// path takes `try_lock` and registers nothing.
 fn lock_device_for_vcpu(slot: &BoundDevice, holder: Holder) -> Held<'_, DeviceInner> {
-    if let Some(guard) = slot.inner.try_lock() {
-        crate::runtime::drain::note_vcpu_lock_free();
-        return Held::new(guard, holder);
+    let (held, wait) = lock_hold::hold_for_vcpu(&slot.inner, holder);
+    match wait {
+        None => crate::runtime::drain::note_vcpu_lock_free(),
+        Some(wait) => crate::runtime::drain::note_vcpu_lock_wait(wait.wait_us),
     }
-    let waited = std::time::Instant::now();
-    let guard = slot.inner.lock();
-    let us = waited.elapsed().as_micros() as u64;
-    crate::runtime::drain::note_vcpu_lock_wait(us);
-    lock_hold::CENSUS.note_vcpu_wait(us);
-    Held::new(guard, holder)
+    held
 }
 
 pub fn device_iosfc_read(id: u64, offset: u64, size: u32) -> Option<u64> {
