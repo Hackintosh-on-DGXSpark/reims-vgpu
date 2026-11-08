@@ -5106,11 +5106,22 @@ pub fn drain_iosfc<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut 
     }
 
     // Process requests between consumer and producer when ring is programmed.
-    if state.iosfc.ring_base != 0 && producer > consumer {
+    // Request `idx` lives in slot `idx % capacity`; see
+    // `iosurface_pages::mapper_request_entry_offset`. A ring with a base and no
+    // capacity has no slots to read and catches up as an unprogrammed ring does.
+    if state.iosfc.ring_base != 0 && state.iosfc.capacity == 0 && producer > consumer {
+        note_store_route("iosfc_ring_capacity_unprogrammed");
+    }
+    if state.iosfc.ring_base != 0 && state.iosfc.capacity != 0 && producer > consumer {
+        let capacity = state.iosfc.capacity;
         let start = consumer;
         let end = producer;
         for idx in start..end {
-            let entry_off = (idx as u64) * MAPPER_REQUEST_ENTRY_LEN as u64;
+            let Some(entry_off) =
+                crate::contract::iosurface_pages::mapper_request_entry_offset(idx, capacity)
+            else {
+                break;
+            };
             let mut e = [0u8; MAPPER_REQUEST_ENTRY_LEN];
             if host
                 .read_gpa(state.iosfc.ring_base + entry_off, &mut e)

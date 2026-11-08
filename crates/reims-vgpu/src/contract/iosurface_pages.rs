@@ -599,15 +599,29 @@ pub fn entry_gpa_shift(entry: u32, page_shift: u32) -> Option<u64> {
     Some(((entry >> PAGE_ENTRY_PFN_SHIFT) as u64) << page_shift)
 }
 
-pub fn mapper_request_entry_offset(index: u32) -> u64 {
-    (index as u64) * MAPPER_REQUEST_ENTRY_LEN as u64
+/// Byte offset, from the ring base, of mapper request `index`.
+///
+/// The guest's mapper keeps a free-running request counter and writes request
+/// `n` into slot `n % capacity`, where `capacity` is the entry count it programs
+/// into the capacity register. Reading `n * 16` instead runs past the ring once
+/// the counter passes `capacity`: every later MAP and UNMAP is lost, and a lost
+/// UNMAP leaves this device writing frames into pages the guest has freed.
+/// `None` for a ring whose capacity is not programmed.
+pub fn mapper_request_entry_offset(index: u32, capacity: u32) -> Option<u64> {
+    if capacity == 0 {
+        return None;
+    }
+    Some(u64::from(index % capacity) * MAPPER_REQUEST_ENTRY_LEN as u64)
 }
 
-pub fn mapper_request_published_entry_offset(producer: u32) -> Option<u64> {
+/// Offset of the request published by moving the producer to `producer`, that
+/// is request `producer - 1`. `None` before the first request and for an
+/// unprogrammed ring.
+pub fn mapper_request_published_entry_offset(producer: u32, capacity: u32) -> Option<u64> {
     if producer == 0 {
         None
     } else {
-        Some(mapper_request_entry_offset(producer - 1))
+        mapper_request_entry_offset(producer - 1, capacity)
     }
 }
 
@@ -909,6 +923,20 @@ pub fn build_table_plan(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mapper_request_slots_wrap_at_the_programmed_capacity() {
+        use super::{mapper_request_entry_offset, mapper_request_published_entry_offset};
+        assert_eq!(mapper_request_entry_offset(0, 4), Some(0));
+        assert_eq!(mapper_request_entry_offset(3, 4), Some(3 * 16));
+        assert_eq!(mapper_request_entry_offset(4, 4), Some(0));
+        assert_eq!(mapper_request_entry_offset(9, 4), Some(16));
+        assert_eq!(mapper_request_entry_offset(u32::MAX, 64), Some(63 * 16));
+        assert_eq!(mapper_request_entry_offset(5, 0), None);
+        assert_eq!(mapper_request_published_entry_offset(0, 4), None);
+        assert_eq!(mapper_request_published_entry_offset(5, 4), Some(0));
+        assert_eq!(mapper_request_published_entry_offset(5, 0), None);
+    }
+
     use super::*;
     use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::model::{PAGE_SHIFT_ARM64E, PAGE_SIZE_ARM64E};

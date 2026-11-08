@@ -651,6 +651,8 @@ fn put_u64(h: &mut FakeHost, gpa: u64, v: u64) {
 #[test]
 fn capture_validates_identity_and_ring() {
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    // A one-entry ring: the guest always programs the capacity it wraps at.
+    state.iosfc.capacity = 1;
     let mut host = FakeHost::new();
     let ring = 0x7000_0000u64;
     state.iosfc.ring_base = ring;
@@ -691,6 +693,8 @@ fn capture_handoff_mismatch_is_fail_visible_and_latched() {
     // the mapping never attaches → downstream black. It must return None,
     // latch its reason once (no per-publish flood), and re-arm on clear.
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    // A one-entry ring: the guest always programs the capacity it wraps at.
+    state.iosfc.capacity = 1;
     let mut host = FakeHost::new();
     let ring = 0x7100_0000u64;
     state.iosfc.ring_base = ring;
