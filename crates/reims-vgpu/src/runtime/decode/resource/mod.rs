@@ -79,6 +79,11 @@ pub const OBJECT_TYPE_TEXTURE_VARIANT: u8 = 3;
 pub const OBJECT_TYPE_FUNCTION: u8 = 6;
 pub const OBJECT_TYPE_TYPE7: u8 = 7;
 pub const OBJECT_TYPE_TEXTURE_VIEW: u8 = 8;
+/// A texture with no backing at all, `MTLStorageModeMemoryless`. Its
+/// descriptor is the 44-byte record a type-2 descriptor carries after its
+/// level records, and nothing else. macOS 14 and later attach one as colour 1
+/// of nearly every WindowServer pass.
+pub const OBJECT_TYPE_MEMORYLESS_TEXTURE: u8 = 9;
 pub const OBJECT_TYPE_IOSURFACE: u8 = 11;
 
 /// Type-7 first dword subtypes.
@@ -1753,6 +1758,44 @@ pub fn decode_buffer_descriptor(bytes: &[u8]) -> Result<BufferDescriptor, Decode
     })
 }
 
+/// A type-9 texture: the geometry of a texture that lives only in tile memory.
+///
+/// Measured on macOS 15.6.1, every one of these reads
+/// `01000000 2c000000 <ref> 4205 <format> <width> <height> <depth>
+/// <levels:u16> <array:u16> <samples:u16> 0030 …`. The same record sits at
+/// offset 72 of a type-2 descriptor, where the last field reads `0020`: the
+/// `MTLResourceOptions` storage mode, private there and memoryless here.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MemorylessTextureDescriptor {
+    pub pixel_format: u16,
+    pub width: u32,
+    pub height: u32,
+    pub depth: u32,
+    pub sample_count: u32,
+}
+
+pub const MEMORYLESS_DESC_LEN: usize = 36;
+const MEMORYLESS_DESC_PIXEL_FORMAT: usize = 14;
+const MEMORYLESS_DESC_WIDTH: usize = 16;
+const MEMORYLESS_DESC_HEIGHT: usize = 20;
+const MEMORYLESS_DESC_DEPTH: usize = 24;
+const MEMORYLESS_DESC_SAMPLE_COUNT: usize = 32;
+
+pub fn decode_memoryless_texture_descriptor(
+    bytes: &[u8],
+) -> Result<MemorylessTextureDescriptor, DecodeStatus> {
+    if bytes.len() < MEMORYLESS_DESC_LEN {
+        return Err(DecodeStatus::ErrShort("res_memoryless_desc_short"));
+    }
+    Ok(MemorylessTextureDescriptor {
+        pixel_format: ld16(&bytes[MEMORYLESS_DESC_PIXEL_FORMAT..]),
+        width: ld32(&bytes[MEMORYLESS_DESC_WIDTH..]),
+        height: ld32(&bytes[MEMORYLESS_DESC_HEIGHT..]),
+        depth: ld32(&bytes[MEMORYLESS_DESC_DEPTH..]).max(1),
+        sample_count: u32::from(ld16(&bytes[MEMORYLESS_DESC_SAMPLE_COUNT..])).max(1),
+    })
+}
+
 pub fn decode_texture_descriptor(bytes: &[u8]) -> Result<TextureDescriptor, DecodeStatus> {
     if bytes.len() < TEXTURE_DESC_GEOMETRY_LEN {
         return Err(DecodeStatus::ErrShort("res_texture_desc_short"));
@@ -2289,6 +2332,11 @@ const COMPUTE_PIPELINE_TAG_THREADGROUP_MULTIPLE: u8 = 0x01;
 /// [`RENDER_PIPELINE_TAG_LABEL`] at a different index, for the reason that
 /// constant's doc gives.
 const COMPUTE_PIPELINE_TAG_LABEL: u8 = 0x02;
+/// Property 10 of the compute descriptor, value 2 on every record seen. A
+/// macOS 15 Core Image kernel (`k7x1RGBA14X1Yh`) sets it beside the label and
+/// the threadgroup hint; refusing it lost every frame drawn through that
+/// kernel. Not identified, and taken as a compiler hint like its neighbours.
+const COMPUTE_PIPELINE_TAG_10: u8 = 0x0a;
 /// `MTLComputePipelineDescriptor.stageInputDescriptor` — a byte offset from the
 /// end of the 16-byte type-7 header to a nested property list, in the same units
 /// as [`PIPELINE_TAG_VERTEX_DESCRIPTOR_OFFSET`] and
@@ -2385,9 +2433,10 @@ const RENDER_PIPELINE_TAGS_BENIGN: [u8; 3] = [
 ];
 /// The compute half of [`RENDER_PIPELINE_TAGS_BENIGN`]; same rule, and listed
 /// apart for the same reason `COMPUTE_PIPELINE_TAGS_CONSUMED` is.
-const COMPUTE_PIPELINE_TAGS_BENIGN: [u8; 2] = [
+const COMPUTE_PIPELINE_TAGS_BENIGN: [u8; 3] = [
     COMPUTE_PIPELINE_TAG_THREADGROUP_MULTIPLE,
     COMPUTE_PIPELINE_TAG_LABEL,
+    COMPUTE_PIPELINE_TAG_10,
 ];
 
 /// A pipeline-descriptor field this decoder does not read **and has not

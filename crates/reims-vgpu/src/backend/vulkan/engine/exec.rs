@@ -2850,7 +2850,7 @@ pub(crate) unsafe fn execute_draw_inner(
         req.storage_buffers.len()
             + req.sampled_images.len()
             + req.samplers.len()
-            + req.color_input as usize,
+            + req.color_inputs.count_ones() as usize,
     );
     for b in &req.storage_buffers {
         layout_bindings.push(BindingSig {
@@ -2876,9 +2876,9 @@ pub(crate) unsafe fn execute_draw_inner(
             count: 1,
         });
     }
-    if req.color_input {
+    for index in (0..8u32).filter(|index| req.color_inputs & (1 << index) != 0) {
         layout_bindings.push(BindingSig {
-            binding: super::types::COLOR_INPUT_BINDING,
+            binding: super::types::COLOR_INPUT_BINDING + index,
             ty: vk::DescriptorType::INPUT_ATTACHMENT.as_raw() as u32,
             stages: vk::ShaderStageFlags::FRAGMENT.as_raw(),
             count: 1,
@@ -2966,7 +2966,7 @@ pub(crate) unsafe fn execute_draw_inner(
         };
     }
     pass_key.secondary_count = req.secondary_targets.len() as u8;
-    pass_key.color_input = req.color_input;
+    pass_key.color_inputs = req.color_inputs;
     for resource in &req.sampled_images {
         if let Some(index) =
             feedback_color_index(req, resource, ctx.features.attachment_feedback_loop_layout)
@@ -3038,12 +3038,12 @@ pub(crate) unsafe fn execute_draw_inner(
                 },
             ));
         }
-        if !req.secondary_targets.is_empty() || req.color_input {
+        if !req.secondary_targets.is_empty() || req.color_inputs != 0 {
             return Err(DrawError::Unsupported(
                 super::reason::DrawReason::MultisampleResolveShapeUnsupported {
                     color_targets: 1u32.saturating_add(req.secondary_targets.len() as u32),
                     depth: req.depth.is_some(),
-                    color_input: req.color_input,
+                    color_input: req.color_inputs != 0,
                 },
             ));
         }
@@ -3440,7 +3440,7 @@ pub(crate) unsafe fn execute_draw_inner(
     // slot's cached framebuffer was built against. One predicate, because the
     // two answers it feeds have to agree: which pass the slot is ensured under,
     // and whether the draw builds (and later disposes) a framebuffer of its own.
-    let ordinary_ad_hoc_framebuffer = is_mrt || req.depth.is_some() || req.color_input;
+    let ordinary_ad_hoc_framebuffer = is_mrt || req.depth.is_some() || req.color_inputs != 0;
     let ad_hoc_framebuffer = ordinary_ad_hoc_framebuffer || req.multisample_resolve;
     let (primary_pass, primary_pass_compatibility) = if ad_hoc_framebuffer {
         let mut color_only = PassKey::single(pass_key.load_seed, pass_key.color0_format);
@@ -3460,6 +3460,9 @@ pub(crate) unsafe fn execute_draw_inner(
         vk::Image,
         super::pools::ResidentAccess,
     )> = Vec::new();
+    // The ad-hoc framebuffer's views in attachment order, which is what a
+    // fetched secondary's input descriptor points at.
+    let mut ad_hoc_views: Vec<vk::ImageView> = Vec::new();
     // This draw's depth attachment, when it has one. The framebuffer is always
     // this draw's own and is always disposed after submit; the image behind it
     // is only owned here when the pass named no guest depth texture to key a
@@ -3546,6 +3549,7 @@ pub(crate) unsafe fn execute_draw_inner(
                 if let Some(d) = depth_attachment.as_ref() {
                     transient_depth = Some((d.owned, fb));
                 }
+                ad_hoc_views = views;
                 (primary_image, fb, primary_access, primary_view)
             } else {
                 (primary_image, primary_slot_fb, primary_access, primary_view)
@@ -3582,6 +3586,7 @@ pub(crate) unsafe fn execute_draw_inner(
                 if let Some(d) = depth_attachment.as_ref() {
                     transient_depth = Some((d.owned, fb));
                 }
+                ad_hoc_views = views;
                 (
                     pool_image,
                     fb,
@@ -4125,9 +4130,23 @@ pub(crate) unsafe fn execute_draw_inner(
     // Framebuffer fetch: the input attachment IS the color target's view;
     // derive the same layout as the subpass reference. A draw that also
     // samples the target upgrades both from GENERAL to the feedback layout.
-    let color_input_info = vk::DescriptorImageInfo::default()
-        .image_view(target_view)
-        .image_layout(pass_key.color_layout(0));
+    // A fetched secondary reads its own view out of the ad-hoc framebuffer.
+    let color_input_infos: Vec<(u32, vk::DescriptorImageInfo)> = (0..8usize)
+        .filter(|&index| pass_key.color_fetched(index))
+        .map(|index| {
+            let view = if index == 0 {
+                target_view
+            } else {
+                ad_hoc_views.get(index).copied().unwrap_or(target_view)
+            };
+            (
+                super::types::COLOR_INPUT_BINDING + index as u32,
+                vk::DescriptorImageInfo::default()
+                    .image_view(view)
+                    .image_layout(pass_key.color_layout(index)),
+            )
+        })
+        .collect();
     let dst_set = dset.unwrap_or_default();
     let mut descriptor_writes = Vec::new();
     for (i, (binding, _, _)) in storage_slots.iter().enumerate() {
@@ -4158,13 +4177,13 @@ pub(crate) unsafe fn execute_draw_inner(
                 .image_info(std::slice::from_ref(&sampler_infos[i])),
         );
     }
-    if req.color_input {
+    for (binding, info) in &color_input_infos {
         descriptor_writes.push(
             vk::WriteDescriptorSet::default()
                 .dst_set(dst_set)
-                .dst_binding(super::types::COLOR_INPUT_BINDING)
+                .dst_binding(*binding)
                 .descriptor_type(vk::DescriptorType::INPUT_ATTACHMENT)
-                .image_info(std::slice::from_ref(&color_input_info)),
+                .image_info(std::slice::from_ref(info)),
         );
     }
     if dset.is_some() {
@@ -5181,14 +5200,14 @@ pub(crate) unsafe fn execute_draw_inner(
                 layout: info.image_layout,
             },
         ));
-        if req.color_input {
+        for (binding, info) in &color_input_infos {
             push_state.push(super::pools::PushDescriptorBinding::Image {
-                binding: super::types::COLOR_INPUT_BINDING,
+                binding: *binding,
                 array_element: 0,
                 ty: vk::DescriptorType::INPUT_ATTACHMENT,
-                sampler: color_input_info.sampler,
-                view: color_input_info.image_view,
-                layout: color_input_info.image_layout,
+                sampler: info.sampler,
+                view: info.image_view,
+                layout: info.image_layout,
             });
         }
         if pools.push_descriptors_changed(pipeline_layout, counters) {

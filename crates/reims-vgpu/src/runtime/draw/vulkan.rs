@@ -6278,6 +6278,16 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
                 c.width,
                 c.height,
             )
+        } else if c.memoryless {
+            // No guest destination to follow, so the texture ref names it, as
+            // it names a depth attachment. Its content never outlives the pass.
+            TargetIdentity::Texture {
+                ref_: c.texture_ref,
+                width: c.width,
+                height: c.height,
+                generation: 0,
+                stencil: false,
+            }
         } else {
             crate::runtime::census::present_proxy::note_secondary_mrt_drop(
                 crate::runtime::census::present_proxy::MrtDrop::NoIdentity,
@@ -7070,27 +7080,27 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         };
 
         // Framebuffer fetch (`air.render_target` INPUT param `dest_N` →
-        // reflection `ColorInput` at binding 96+N): the engine supports the
-        // attachment-0 fetch as a Vulkan subpass input. `dest_N>0` (fetching a
-        // secondary MRT attachment) has no engine path yet — fail visibly, never
-        // execute a shader whose destination read would be unbound.
-        let frag_color_input = {
+        // reflection `ColorInput`): the engine reads colour attachment N as
+        // Vulkan subpass input N. A `dest_N` naming an attachment this pass
+        // does not have fails visibly — never execute a shader whose
+        // destination read would be unbound. macOS 14 and later fetch a
+        // memoryless `dest_1` in most WindowServer composites.
+        let frag_color_inputs = {
             use metal2vulkan::reflect::ResourceKind;
-            let mut fetch0 = false;
+            let mut fetched = 0u8;
             for rb in &f_shader.reflection.bindings {
                 if rb.kind == ResourceKind::ColorInput {
-                    if rb.metal_index == 0 {
-                        fetch0 = true;
-                    } else {
+                    if rb.metal_index as usize >= req.colors.len().min(8) {
                         return Err(DrawError::DrawPreparation(
                             DrawPreparationDecline::ColorInputMrtUnsupported {
                                 destination_index: rb.metal_index,
                             },
                         ));
                     }
+                    fetched |= 1 << rb.metal_index;
                 }
             }
-            fetch0
+            fetched
         };
         crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Sampled);
         // The four `sampled_phase` spans below divide this phase's `sampled_us`,
@@ -8158,7 +8168,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         resources.vertex_attributes = attrs;
         resources.storage_buffers = storage;
         resources.sampled_images = images;
-        resources.color_input = frag_color_input;
+        resources.color_inputs = frag_color_inputs;
         resources.continues_render_pass = req.continues_render_pass;
         resources.render_pass_continues = req.render_pass_continues;
         resources.samplers = samplers;

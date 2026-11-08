@@ -58,6 +58,9 @@
 //! background noise.
 
 use super::*;
+use crate::runtime::decode::resource::{
+    decode_memoryless_texture_descriptor, OBJECT_TYPE_MEMORYLESS_TEXTURE,
+};
 /// The colour render target's base format for a **type-4** surface, or nothing.
 ///
 /// On this arm `m.format == 0` is not "unset", it is a decoded refusal:
@@ -354,6 +357,10 @@ pub(super) struct ResolvedRenderTarget {
     /// Vulkan encode replaces this provisional single-sample value with the
     /// bound pipeline's raster sample count before constructing an image.
     pub(super) sample_count: u32,
+    /// A type-9 texture: no mapping and no guest VA, only a host image that
+    /// lives for the pass. Metal lets such an attachment neither load nor
+    /// store, so nothing is seeded into it and nothing is written back.
+    pub(super) memoryless: bool,
 }
 
 /// Why a colour attachment's `texture_ref` could not be turned into somewhere
@@ -463,6 +470,14 @@ pub(super) enum RenderTargetCause {
     NoListEntry,
     /// Something is under the ref and it is not a texture.
     WrongType { object_type: u8 },
+    /// A mip>0 view of a memoryless texture.
+    MemorylessMipView { level: u32 },
+    /// The type-9 entry's descriptor bytes could not be read.
+    MemorylessDescRead,
+    /// The type-9 descriptor is shorter than its geometry.
+    MemorylessDescDecode { len: usize },
+    /// The memoryless texture's format is not one Metal can render into.
+    MemorylessFormat { fmt: u16 },
     /// The texture entry's descriptor bytes could not be read.
     LinearDescRead,
     /// The bytes were read and are not a texture descriptor. Carries the
@@ -547,6 +562,10 @@ impl crate::observe::Decline for RenderTargetRefusal {
             C::Type4Format { .. } => "rt_type4_format",
             C::NoListEntry => crate::observe::ladder_slug!("rt", no_list_entry),
             C::WrongType { .. } => crate::observe::ladder_slug!("rt", wrong_type),
+            C::MemorylessMipView { .. } => "rt_memoryless_mip_view",
+            C::MemorylessDescRead => "rt_memoryless_desc_read",
+            C::MemorylessDescDecode { .. } => "rt_memoryless_desc_decode",
+            C::MemorylessFormat { .. } => "rt_memoryless_format",
             C::LinearDescRead => crate::observe::ladder_slug!("rt_linear", desc_read),
             C::LinearDescDecode { .. } => crate::observe::ladder_slug!("rt_linear", desc_decode),
             C::LinearDescIncomplete { .. } => "rt_linear_desc_incomplete",
@@ -569,7 +588,9 @@ impl crate::observe::Decline for RenderTargetRefusal {
         use RenderTargetCause as C;
         let mut v = vec![("base", self.base_ref.to_string())];
         match self.cause {
-            C::Type11MipView { level } | C::LinearLevelGva { level } => {
+            C::Type11MipView { level }
+            | C::LinearLevelGva { level }
+            | C::MemorylessMipView { level } => {
                 v.push(("level", level.to_string()))
             }
             C::LevelOverflow {
@@ -594,7 +615,9 @@ impl crate::observe::Decline for RenderTargetRefusal {
                 v.push(("mid", mapping_id.to_string()));
                 v.push(("fmt", format!("{fmt:#x}")));
             }
-            C::Type5DescDecode { len } => v.push(("desc_len", len.to_string())),
+            C::Type5DescDecode { len } | C::MemorylessDescDecode { len } => {
+                v.push(("desc_len", len.to_string()))
+            }
             C::Type4MipView { surface_id, level } => {
                 v.push(("sid", surface_id.to_string()));
                 v.push(("level", level.to_string()));
@@ -645,7 +668,9 @@ impl crate::observe::Decline for RenderTargetRefusal {
                 v.push(("dims", format!("{width}x{height}")));
                 v.push(("bpr", row_stride.to_string()));
             }
-            C::LinearFormat { fmt } => v.push(("fmt", format!("{fmt:#x}"))),
+            C::LinearFormat { fmt } | C::MemorylessFormat { fmt } => {
+                v.push(("fmt", format!("{fmt:#x}")))
+            }
             C::LinearLevelStride { row_stride } => v.push(("bpr", row_stride.to_string())),
             C::LinearLevelSpan { row_stride, height } => {
                 v.push(("bpr", row_stride.to_string()));
@@ -691,6 +716,7 @@ impl crate::observe::Decline for RenderTargetRefusal {
             | C::Type5DescRead
             | C::Type5SurfaceZero
             | C::NoListEntry
+            | C::MemorylessDescRead
             | C::LinearDescRead => {}
         }
         v
@@ -877,6 +903,7 @@ fn resolve_render_target<M: HostMemory + HostOps>(
             row_stride: 0,
             format: fmt,
             sample_count: 1,
+            memoryless: false,
         });
     }
     // x86 Ventura/Tahoe type-4 surface/backing (present IOSurface). Object-list
@@ -957,10 +984,55 @@ fn resolve_render_target<M: HostMemory + HostOps>(
             row_stride: 0,
             format: fmt,
             sample_count: 1,
+            memoryless: false,
+        });
+    }
+    let entry = live.ok_or(C::NoListEntry.at(resolved_ref))?;
+    // Type-9 memoryless: geometry and format only, rendered into a host image
+    // that exists for the pass.
+    if entry.object_type == OBJECT_TYPE_MEMORYLESS_TEXTURE {
+        if level != 0 {
+            return Err(C::MemorylessMipView { level }.at(resolved_ref));
+        }
+        let desc_bytes = objects::read_descriptor(state, host, task_id, &entry)
+            .ok_or(C::MemorylessDescRead.at(resolved_ref))?;
+        let tex = decode_memoryless_texture_descriptor(&desc_bytes).map_err(|_| {
+            C::MemorylessDescDecode {
+                len: desc_bytes.len(),
+            }
+            .at(resolved_ref)
+        })?;
+        let fmt = effective_view_sample_format(tex.pixel_format, view_fmt_override)
+            .unwrap_or(tex.pixel_format);
+        if pixel_format::render_target_bpp(fmt).is_none() {
+            return Err(C::MemorylessFormat { fmt }.at(resolved_ref));
+        }
+        if tex.width == 0 || tex.height == 0 {
+            return Err(C::ZeroExtent {
+                width: tex.width,
+                height: tex.height,
+            }
+            .at(resolved_ref));
+        }
+        let row_stride = pixel_format::tight_row_bytes(tex.width, fmt).ok_or(
+            C::RowTight {
+                width: tex.width,
+                fmt,
+            }
+            .at(resolved_ref),
+        )?;
+        return Ok(ResolvedRenderTarget {
+            mapping_id: 0,
+            target_gva: 0,
+            width: tex.width,
+            height: tex.height,
+            row_stride,
+            format: fmt,
+            sample_count: tex.sample_count,
+            memoryless: true,
         });
     }
     // type-2/3 linear GVA (wallpaper/background layers, UI intermediate RTs).
-    let entry = live.ok_or(C::NoListEntry.at(resolved_ref))?;
     if entry.object_type != OBJECT_TYPE_TEXTURE && entry.object_type != OBJECT_TYPE_TEXTURE_VARIANT
     {
         return Err(C::WrongType {
@@ -1104,6 +1176,7 @@ fn resolve_render_target<M: HostMemory + HostOps>(
         row_stride: bpr,
         format: fmt,
         sample_count: 1,
+        memoryless: false,
     })
 }
 

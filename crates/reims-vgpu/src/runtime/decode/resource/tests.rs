@@ -3155,3 +3155,19 @@ fn a_layout_table_past_u16_reports_its_real_length() {
         assert_eq!(icb_layout_table_len(tg_start, tg_start - 8, stride), 0);
     }
 }
+
+/// The type-9 descriptor macOS 15.6.1 attaches as colour 1 of its WindowServer
+/// passes, byte for byte.
+#[test]
+fn a_memoryless_texture_decodes_its_geometry_and_format() {
+    let hex = "010000002c0000000a00000042057300c0030000180000000100000001000100010030000000000000000000";
+    let bytes: Vec<u8> = (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+        .collect();
+    let tex = decode_memoryless_texture_descriptor(&bytes).expect("decodes");
+    assert_eq!(tex.pixel_format, 0x73);
+    assert_eq!((tex.width, tex.height, tex.depth), (960, 24, 1));
+    assert_eq!(tex.sample_count, 1);
+    assert!(decode_memoryless_texture_descriptor(&bytes[..20]).is_err());
+}

@@ -42,9 +42,6 @@ use crate::observe::Decline;
 // longer downgrade at all: they carry the source format through to the bind.
 #[cfg(feature = "backend-vulkan")]
 use crate::runtime::census::srgb_census;
-// Only `vulkan` and the tests read it, through this module's `use super::*`;
-// the Metal arm tests the band instead (`load_action_in_contract`).
-#[cfg(any(test, feature = "backend-vulkan"))]
 use crate::contract::pass_action::MTL_LOAD_ACTION_DONT_CARE;
 #[cfg(any(
     feature = "backend-vulkan",
@@ -815,6 +812,10 @@ pub struct ColorRtRequest {
     /// Multisample attachment discarded into this request's single-sample
     /// target at pass end. Zero for an ordinary colour attachment.
     pub multisample_source_ref: u32,
+    /// A type-9 memoryless texture: `mapping_id` and `target_gva` are both
+    /// zero, and the attachment is a host image keyed by `texture_ref` that is
+    /// never seeded from or written back to the guest.
+    pub memoryless: bool,
 }
 
 /// One `setVisibilityResultMode:offset:`, as the encoder state it is.
@@ -4332,6 +4333,7 @@ pub fn writeback_chain_rgba<M: HostMemory + HostOps>(
         row_stride: bpr,
         format: fmt,
         sample_count: _,
+        memoryless: _,
     }) = lookup_render_target(state, host, task_id, *att)
     else {
         return lost("render_target_unresolved");
@@ -4452,6 +4454,7 @@ pub fn color_target_request<M: HostMemory + HostOps>(
         clear_color: [0.0; 4],
         target_seed_rgba: None,
         multisample_source_ref: 0,
+        memoryless: rt.memoryless,
     };
     Some(DrawEncodeRequest {
         task_id,
@@ -4588,6 +4591,7 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
             row_stride: bpr,
             format: mfmt,
             sample_count: target_sample_count,
+            memoryless,
         } = target;
         #[cfg(feature = "backend-vulkan")]
         let attachment_sample_count = pipeline_sample_count.unwrap_or(target_sample_count);
@@ -4630,7 +4634,16 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
         let mut load_action = att.load_action;
         let mut clear_color = att.clear_color;
         let mut seed = None;
-        if let Some(cl) = clears.iter().find(|a| a.texture_ref == att.texture_ref) {
+        if memoryless {
+            // Nothing to seed from: a memoryless attachment starts cleared or
+            // undefined, and Metal refuses a LOAD on one.
+            if let Some(cl) = clears.iter().find(|a| a.texture_ref == att.texture_ref) {
+                load_action = MTL_LOAD_ACTION_CLEAR;
+                clear_color = cl.clear_color;
+            } else if load_action != MTL_LOAD_ACTION_CLEAR {
+                load_action = MTL_LOAD_ACTION_DONT_CARE;
+            }
+        } else if let Some(cl) = clears.iter().find(|a| a.texture_ref == att.texture_ref) {
             // Clear-only stream record for this attachment: real Metal Clear.
             load_action = MTL_LOAD_ACTION_CLEAR;
             clear_color = cl.clear_color;
@@ -4710,6 +4723,7 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
             clear_color,
             target_seed_rgba: seed,
             multisample_source_ref,
+            memoryless,
         });
     }
     if colors.is_empty() {
