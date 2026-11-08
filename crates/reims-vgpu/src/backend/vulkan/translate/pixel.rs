@@ -132,10 +132,12 @@ pub fn translate(mtl: u16) -> Result<PixelFormat, TranslateReason> {
         p::MTL_FORMAT_RG8_UNORM => linear(vk::Format::R8G8_UNORM, 2),
         p::MTL_FORMAT_RG8_UINT => linear(vk::Format::R8G8_UINT, 2),
         p::MTL_FORMAT_RG16_UNORM => linear(vk::Format::R16G16_UNORM, 4),
+        p::MTL_FORMAT_RG16_UINT => linear(vk::Format::R16G16_UINT, 4),
         p::MTL_FORMAT_R32_UINT => linear(vk::Format::R32_UINT, 4),
         p::MTL_FORMAT_R32_SINT => linear(vk::Format::R32_SINT, 4),
         p::MTL_FORMAT_R32_FLOAT => linear(vk::Format::R32_SFLOAT, 4),
         p::MTL_FORMAT_RG16_FLOAT => linear(vk::Format::R16G16_SFLOAT, 4),
+        p::MTL_FORMAT_RG32_FLOAT => linear(vk::Format::R32G32_SFLOAT, 8),
         p::MTL_FORMAT_RGBA8_UNORM => linear(vk::Format::R8G8B8A8_UNORM, 4),
         p::MTL_FORMAT_RGBA8_UNORM_SRGB => {
             srgb(vk::Format::R8G8B8A8_SRGB, vk::Format::R8G8B8A8_UNORM, 4)
@@ -234,6 +236,8 @@ pub fn sampled_pixels(
         // with mandatory linear filtering, so neither needs a capability gate.
         vk::Format::R16_UNORM => TexelLayout::R16Unorm,
         vk::Format::R16G16_UNORM => TexelLayout::Rg16Unorm,
+        vk::Format::R16G16_UINT => TexelLayout::Rg16Uint,
+        vk::Format::R32G32_SFLOAT => TexelLayout::Rg32Float,
         // The half-float colour layouts. A recent macOS window server
         // composites in `MTLPixelFormatRGBA16Float`, and every such bind used to
         // land on the CPU re-read rung and be quantized to unorm8 on the way in
@@ -283,6 +287,8 @@ pub fn vk_texel_layout(layout: TexelLayout) -> vk::Format {
         TexelLayout::R32Float => vk::Format::R32_SFLOAT,
         TexelLayout::R16Unorm => vk::Format::R16_UNORM,
         TexelLayout::Rg16Unorm => vk::Format::R16G16_UNORM,
+        TexelLayout::Rg16Uint => vk::Format::R16G16_UINT,
+        TexelLayout::Rg32Float => vk::Format::R32G32_SFLOAT,
         TexelLayout::Rgba16Unorm => vk::Format::R16G16B16A16_UNORM,
         TexelLayout::Rgba16Float => vk::Format::R16G16B16A16_SFLOAT,
         TexelLayout::Rg16Float => vk::Format::R16G16_SFLOAT,
@@ -1035,8 +1041,10 @@ mod tests {
     fn a_texture_the_graphics_rail_samples_is_not_refused_by_the_compute_one() {
         const EXCEPTIONS: &[(u16, &str)] = &[
             (p::MTL_FORMAT_A8_UNORM, "needs a component mapping"),
+            (p::MTL_FORMAT_RG16_UINT, "integer: no compute storage selector yet"),
             (p::MTL_FORMAT_RGBA8_UNORM_SRGB, "would downgrade unrecorded"),
             (p::MTL_FORMAT_BGRA8_UNORM_SRGB, "would downgrade unrecorded"),
+            (p::MTL_FORMAT_RG32_FLOAT, "no compute storage selector yet"),
         ];
 
         let mut refused = Vec::new();
@@ -1111,6 +1119,18 @@ mod tests {
     /// derived from the table under test, so a mistranslation shows up as a
     /// diff instead of agreeing with itself.
     const EXPECTED: &[(u16, vk::Format, u32, TransferFunction)] = &[
+        (
+            p::MTL_FORMAT_RG16_UINT,
+            vk::Format::R16G16_UINT,
+            4,
+            TransferFunction::Linear,
+        ),
+        (
+            p::MTL_FORMAT_RG32_FLOAT,
+            vk::Format::R32G32_SFLOAT,
+            8,
+            TransferFunction::Linear,
+        ),
         (
             p::MTL_FORMAT_A8_UNORM,
             vk::Format::R8_UNORM,
@@ -1823,6 +1843,8 @@ mod tests {
             (TexelLayout::R32Float, vk::Format::R32_SFLOAT, 4),
             (TexelLayout::R16Unorm, vk::Format::R16_UNORM, 2),
             (TexelLayout::Rg16Unorm, vk::Format::R16G16_UNORM, 4),
+            (TexelLayout::Rg16Uint, vk::Format::R16G16_UINT, 4),
+            (TexelLayout::Rg32Float, vk::Format::R32G32_SFLOAT, 8),
         ] {
             assert_eq!(
                 vk_texel_layout(layout),
@@ -1886,6 +1908,10 @@ mod tests {
         assert_eq!(
             sampled,
             vec![
+                // The Liquid Glass attachments macOS 26 and 27 render and then
+                // sample: RG16Uint shapes and an RG32Float companion.
+                p::MTL_FORMAT_RG16_UINT,
+                p::MTL_FORMAT_RG32_FLOAT,
                 // A8Unorm is present, and it is the one format here admitted
                 // with a non-identity plan: its byte rides in `R8_UNORM` and
                 // the plan puts it back in alpha. Binding it without the plan
@@ -1934,6 +1960,8 @@ mod tests {
         assert_eq!(
             color,
             vec![
+                p::MTL_FORMAT_RG16_UINT,
+                p::MTL_FORMAT_RG32_FLOAT,
                 // macOS 26 renders into a single-channel half-float linear GVA
                 // target — a blur/backdrop intermediate — and it was refused as
                 // `rt_resolve reason=rt_linear_format` three times a driven

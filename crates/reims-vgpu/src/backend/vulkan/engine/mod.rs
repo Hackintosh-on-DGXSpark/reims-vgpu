@@ -405,7 +405,10 @@ fn end_of_tranche_requires_engine(batch_open: bool, device_lost: bool) -> bool {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct DeviceCapabilitySnapshot(u64);
 
-const CAP_MAX_DIMENSION_BITS: u32 = u32::BITS;
+/// Wide enough for any Vulkan image dimension; the rest of the word is one bit
+/// per texel layout, twice over.
+const CAP_MAX_DIMENSION_BITS: u32 = 24;
+const CAP_MAX_DIMENSION_MASK: u64 = (1 << CAP_MAX_DIMENSION_BITS) - 1;
 const CAP_LAYOUT_SHIFT: u32 = CAP_MAX_DIMENSION_BITS;
 const CAP_GPU_ONLY_BIT: u32 =
     CAP_LAYOUT_SHIFT + crate::contract::pixel_format::TexelLayout::ALL.len() as u32;
@@ -426,7 +429,7 @@ impl DeviceCapabilitySnapshot {
         features: &crate::backend::vulkan::caps::device_features::DeviceFeatures,
         quirks: crate::backend::vulkan::caps::DriverQuirk,
     ) -> Self {
-        let mut word = u64::from(features.max_image_dimension_2d);
+        let mut word = u64::from(features.max_image_dimension_2d).min(CAP_MAX_DIMENSION_MASK);
         for (index, supported) in features.color_attachment_blend.iter().enumerate() {
             if *supported {
                 word |= 1_u64 << (CAP_LAYOUT_SHIFT + index as u32);
@@ -445,7 +448,7 @@ impl DeviceCapabilitySnapshot {
     }
 
     fn max_render_target_dimension(self) -> u32 {
-        self.0 as u32
+        (self.0 & CAP_MAX_DIMENSION_MASK) as u32
     }
 
     fn render_target_layout_supported(

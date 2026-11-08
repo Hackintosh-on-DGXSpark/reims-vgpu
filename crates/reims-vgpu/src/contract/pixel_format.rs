@@ -71,10 +71,16 @@ pub const MTL_FORMAT_RG8_UINT: u16 = 0x21;
 /// `MTLPixelFormatRG16Unorm`. The chroma half of [`MTL_FORMAT_R16_UNORM`],
 /// as [`MTL_FORMAT_RG8_UNORM`] is of [`MTL_FORMAT_R8_UNORM`].
 pub const MTL_FORMAT_RG16_UNORM: u16 = 0x3c;
+/// `MTLPixelFormatRG16Uint`. macOS 26 renders Liquid Glass panels into it and
+/// samples the result back.
+pub const MTL_FORMAT_RG16_UINT: u16 = 0x3f;
 pub const MTL_FORMAT_R32_UINT: u16 = 0x35;
 pub const MTL_FORMAT_R32_SINT: u16 = 0x36;
 pub const MTL_FORMAT_R32_FLOAT: u16 = 0x37;
 pub const MTL_FORMAT_RG16_FLOAT: u16 = 0x41;
+/// `MTLPixelFormatRG32Float`. macOS 27 attaches a memoryless one as a third
+/// colour attachment of its Setup Assistant passes.
+pub const MTL_FORMAT_RG32_FLOAT: u16 = 0x69;
 pub const MTL_FORMAT_RGBA8_UNORM: u16 = 0x46;
 pub const MTL_FORMAT_RGBA8_UNORM_SRGB: u16 = 0x47;
 pub const MTL_FORMAT_RGBA8_UINT: u16 = 0x49;
@@ -254,6 +260,14 @@ pub enum TexelLayout {
     /// 4 bytes/texel — the chroma half of [`Self::R16Unorm`], sampled natively as
     /// `R16G16_UNORM`. Four bytes wide but **not** a colour order.
     Rg16Unorm,
+    /// 4 bytes/texel, two sixteen-bit unsigned integer channels, sampled and
+    /// rendered natively as `R16G16_UINT`. macOS 26 renders Liquid Glass shapes
+    /// into it. Integer texels: no CPU loader, no blending, never a colour order.
+    Rg16Uint,
+    /// 8 bytes/texel, two `float32` channels, rendered natively as
+    /// `R32G32_SFLOAT`. macOS 27 attaches a memoryless one beside its colour
+    /// target. Not a colour order and no CPU loader.
+    Rg32Float,
     /// 8 bytes/texel, four `float16` channels in R,G,B,A order, sampled
     /// natively as `R16G16B16A16_SFLOAT`.
     ///
@@ -332,6 +346,8 @@ impl TexelLayout {
         Self::Rgb10a2Unorm,
         Self::Bgr10a2Unorm,
         Self::Rg11b10Float,
+        Self::Rg16Uint,
+        Self::Rg32Float,
     ];
 
     /// This layout's position in [`Self::ALL`], so a host-side table can be an
@@ -358,6 +374,8 @@ impl TexelLayout {
             Self::Rgb10a2Unorm => 11,
             Self::Bgr10a2Unorm => 12,
             Self::Rg11b10Float => 13,
+            Self::Rg16Uint => 14,
+            Self::Rg32Float => 15,
         }
     }
 
@@ -370,10 +388,10 @@ impl TexelLayout {
             Self::R16Float => R16F_BPP,
             Self::R32Float => R32F_BPP,
             Self::R16Unorm => R16_BPP,
-            Self::Rg16Unorm => RG16_BPP,
+            Self::Rg16Unorm | Self::Rg16Uint => RG16_BPP,
             Self::Rgba16Float => RGBA16F_BPP,
             Self::Rg16Float => RG16F_BPP,
-            Self::Rgba16Unorm => RGBA16_BPP,
+            Self::Rgba16Unorm | Self::Rg32Float => RGBA16_BPP,
             Self::Rgb10a2Unorm | Self::Bgr10a2Unorm | Self::Rg11b10Float => RGBA8_BPP,
         }
     }
@@ -427,6 +445,8 @@ impl TexelLayout {
             | Self::R32Float
             | Self::R16Unorm
             | Self::Rg16Unorm
+            | Self::Rg16Uint
+            | Self::Rg32Float
             | Self::Rgba16Unorm
             | Self::Rgb10a2Unorm
             | Self::Bgr10a2Unorm
@@ -459,6 +479,8 @@ impl TexelLayout {
             | Self::R32Float
             | Self::R16Unorm
             | Self::Rg16Unorm
+            | Self::Rg16Uint
+            | Self::Rg32Float
             | Self::Rgba16Unorm
             | Self::Rgb10a2Unorm
             | Self::Bgr10a2Unorm
@@ -706,7 +728,7 @@ pub fn bytes_per_pixel(format: u16) -> Option<u32> {
         | MTL_FORMAT_RG8_UINT
         | MTL_FORMAT_DEPTH16_UNORM => RG8_BPP,
         MTL_FORMAT_R16_UNORM => R16_BPP,
-        MTL_FORMAT_RG16_UNORM => RG16_BPP,
+        MTL_FORMAT_RG16_UNORM | MTL_FORMAT_RG16_UINT => RG16_BPP,
         MTL_FORMAT_RG16_FLOAT => RG16F_BPP,
         MTL_FORMAT_RGBA8_UNORM
         | MTL_FORMAT_RGBA8_UNORM_SRGB
@@ -732,7 +754,10 @@ pub fn bytes_per_pixel(format: u16) -> Option<u32> {
         // Depth32Float_Stencil8 / X32_Stencil8: 64-bit cells on Apple Silicon
         // (40-bit logical DS + pad; Metal allocates 8 B/texel for this family).
         MTL_FORMAT_DEPTH32_FLOAT_STENCIL8 | MTL_FORMAT_X32_STENCIL8 => 8,
-        MTL_FORMAT_RGBA16_UNORM | MTL_FORMAT_RGBA16_UINT | MTL_FORMAT_RGBA16_FLOAT => RGBA16_BPP,
+        MTL_FORMAT_RGBA16_UNORM
+        | MTL_FORMAT_RGBA16_UINT
+        | MTL_FORMAT_RGBA16_FLOAT
+        | MTL_FORMAT_RG32_FLOAT => RGBA16_BPP,
         MTL_FORMAT_RGBA32_UINT | MTL_FORMAT_RGBA32_FLOAT => RGBA32_BPP,
         _ => return None,
     })
@@ -1215,7 +1240,9 @@ pub fn render_target_bpp(format: u16) -> Option<u32> {
         MTL_FORMAT_BGRA8_UNORM | MTL_FORMAT_BGRA8_UNORM_SRGB => BGRA8_BPP,
         MTL_FORMAT_RGBA16_FLOAT => RGBA16F_BPP,
         MTL_FORMAT_RG16_FLOAT => RG16F_BPP,
+        MTL_FORMAT_RG16_UINT => RG16_BPP,
         MTL_FORMAT_R16_FLOAT => R16F_BPP,
+        MTL_FORMAT_RG32_FLOAT => RGBA16F_BPP,
         MTL_FORMAT_R8_UNORM => R8_BPP,
         _ => return None,
     })
@@ -1615,6 +1642,28 @@ pub fn expand_rgba8_to_texel(
                 }
             }
         }
+        // The integer and two-channel float32 attachments macOS 26 and 27
+        // declare for Liquid Glass. A semantic-RGBA8 seed carries neither an
+        // integer nor a float range, so the two channels it has are kept at
+        // their eight-bit value. Lossy by construction: the resident rail is
+        // what keeps these exact, and this only runs when it is not available.
+        TexelLayout::Rg16Uint => {
+            for i in 0..px {
+                let (s, d) = (i * RGBA8_BPP as usize, i * RG16_BPP as usize);
+                for c in 0..2 {
+                    st16(&mut dst[d + c * 2..d + c * 2 + 2], u16::from(src_rgba[s + c]));
+                }
+            }
+        }
+        TexelLayout::Rg32Float => {
+            for i in 0..px {
+                let (s, d) = (i * RGBA8_BPP as usize, i * RGBA16_BPP as usize);
+                for c in 0..2 {
+                    let f = f32::from(src_rgba[s + c]) / f32::from(UNORM8_MAX);
+                    dst[d + c * 4..d + c * 4 + 4].copy_from_slice(&f.to_le_bytes());
+                }
+            }
+        }
         // The single-channel eight-bit attachment — a coverage, mask or shadow
         // layer, which is what a one-channel unorm target almost always is.
         // Drops G, B and A for the same reason the float arms above do: a seed
@@ -1720,6 +1769,32 @@ pub fn narrow_texel_to_rgba8(
                 for c in chans..3 {
                     dst_rgba[d + c] = 0;
                 }
+                dst_rgba[d + COMPONENT_A] = UNORM8_MAX;
+            }
+        }
+        // The inverses of `expand_rgba8_to_texel`'s Liquid Glass arms, filled
+        // out with zero blue and opaque alpha like the float arms above.
+        TexelLayout::Rg16Uint => {
+            for i in 0..px {
+                let (s, d) = (i * RG16_BPP as usize, i * RGBA8_BPP as usize);
+                for c in 0..2 {
+                    let v = u16::from_le_bytes([src[s + c * 2], src[s + c * 2 + 1]]);
+                    dst_rgba[d + c] = v.min(u16::from(UNORM8_MAX)) as u8;
+                }
+                dst_rgba[d + COMPONENT_B] = 0;
+                dst_rgba[d + COMPONENT_A] = UNORM8_MAX;
+            }
+        }
+        TexelLayout::Rg32Float => {
+            for i in 0..px {
+                let (s, d) = (i * RGBA16_BPP as usize, i * RGBA8_BPP as usize);
+                for c in 0..2 {
+                    let mut word = [0u8; 4];
+                    word.copy_from_slice(&src[s + c * 4..s + c * 4 + 4]);
+                    let f = f32::from_le_bytes(word).clamp(0.0, 1.0);
+                    dst_rgba[d + c] = (f * f32::from(UNORM8_MAX)).round() as u8;
+                }
+                dst_rgba[d + COMPONENT_B] = 0;
                 dst_rgba[d + COMPONENT_A] = UNORM8_MAX;
             }
         }
@@ -1981,6 +2056,17 @@ pub fn convert_rgba8_to_row(format: u16, src_rgba: &[u8], pixels: u32, dst: &mut
     };
     if src_rgba.len() < src_len || dst.len() < dst_len {
         return false;
+    }
+
+    // The Liquid Glass attachments have no `rgba8_to_texel` arm; a Store needs
+    // the same conversion their seed expansion is.
+    let liquid_glass = match format {
+        MTL_FORMAT_RG16_UINT => Some(TexelLayout::Rg16Uint),
+        MTL_FORMAT_RG32_FLOAT => Some(TexelLayout::Rg32Float),
+        _ => None,
+    };
+    if let Some(layout) = liquid_glass {
+        return expand_rgba8_to_texel(layout, src_rgba, pixels, dst);
     }
 
     if format == MTL_FORMAT_RGBA16_FLOAT {
@@ -2698,6 +2784,8 @@ mod tests {
                 TexelLayout::R32Float => MTL_FORMAT_R32_FLOAT,
                 TexelLayout::R16Unorm => MTL_FORMAT_R16_UNORM,
                 TexelLayout::Rg16Unorm => MTL_FORMAT_RG16_UNORM,
+                TexelLayout::Rg16Uint => MTL_FORMAT_RG16_UINT,
+                TexelLayout::Rg32Float => MTL_FORMAT_RG32_FLOAT,
                 TexelLayout::Rgba16Float => MTL_FORMAT_RGBA16_FLOAT,
                 TexelLayout::Rg16Float => MTL_FORMAT_RG16_FLOAT,
                 TexelLayout::Rgba16Unorm => MTL_FORMAT_RGBA16_UNORM,

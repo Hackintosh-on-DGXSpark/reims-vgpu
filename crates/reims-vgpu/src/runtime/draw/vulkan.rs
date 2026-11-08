@@ -2521,6 +2521,7 @@ pub(super) fn load_type5_view_rgba<M: HostMemory + HostOps>(
             pixel_format::MTL_FORMAT_RG8_UNORM => TexelLayout::Rg8,
             pixel_format::MTL_FORMAT_R16_UNORM => TexelLayout::R16Unorm,
             pixel_format::MTL_FORMAT_RG16_UNORM => TexelLayout::Rg16Unorm,
+            pixel_format::MTL_FORMAT_RG16_UINT => TexelLayout::Rg16Uint,
             pixel_format::MTL_FORMAT_RGB10A2_UNORM => TexelLayout::Rgb10a2Unorm,
             pixel_format::MTL_FORMAT_BGR10A2_UNORM => TexelLayout::Bgr10a2Unorm,
             pixel_format::MTL_FORMAT_RG11B10_FLOAT => TexelLayout::Rg11b10Float,

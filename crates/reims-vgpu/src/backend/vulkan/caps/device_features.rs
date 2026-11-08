@@ -686,10 +686,14 @@ pub unsafe fn query(
             .optimal_tiling_features;
         sampled_linear_filter[layout.index()] =
             features.contains(vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR);
-        color_attachment_blend[layout.index()] = features.contains(
+        // An integer layout never blends, in Metal or Vulkan; rendering into it
+        // is the whole capability.
+        let needed = if layout == TexelLayout::Rg16Uint {
             vk::FormatFeatureFlags::COLOR_ATTACHMENT
-                | vk::FormatFeatureFlags::COLOR_ATTACHMENT_BLEND,
-        );
+        } else {
+            vk::FormatFeatureFlags::COLOR_ATTACHMENT | vk::FormatFeatureFlags::COLOR_ATTACHMENT_BLEND
+        };
+        color_attachment_blend[layout.index()] = features.contains(needed);
     }
 
     // The guest is handed ONE sample-count answer and uses it for colour
