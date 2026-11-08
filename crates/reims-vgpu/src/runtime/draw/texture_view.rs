@@ -667,6 +667,11 @@ pub(crate) struct NativeUploads {
     /// `f16_to_unorm8_lut`, which clamps to `[0, 1]` and quantizes to 256
     /// levels; see [`pixel_format::TexelLayout::cpu_loader_arm_is_lossy`].
     pub float16: bool,
+    /// Upload guest packed ten-bit colour (`RGB10A2Unorm`, `BGR10A2Unorm`) as
+    /// the identical `A2B10G10R10` / `A2R10G10B10` `_UNORM_PACK32` word. The
+    /// only exact path, for `float16`'s reason: the CPU arm keeps eight of each
+    /// channel's ten bits.
+    pub ten_bit: bool,
 }
 
 impl NativeUploads {
@@ -675,6 +680,7 @@ impl NativeUploads {
     pub const NONE: Self = Self {
         bgra8: false,
         float16: false,
+        ten_bit: false,
     };
 
     /// Native BGRA8 only — the answer this parameter carried when it was a
@@ -689,6 +695,7 @@ impl NativeUploads {
     pub const BGRA8: Self = Self {
         bgra8: true,
         float16: false,
+        ten_bit: false,
     };
 
     /// Every native layout the loaders can produce.
@@ -701,6 +708,7 @@ impl NativeUploads {
     pub const ALL: Self = Self {
         bgra8: true,
         float16: true,
+        ten_bit: true,
     };
 }
 
@@ -730,6 +738,8 @@ pub(crate) fn linear_native_upload_format(
         SampledClass::Bgra8Unorm if native.bgra8 => TexelLayout::Bgra8,
         SampledClass::Rgba16Float if native.float16 => TexelLayout::Rgba16Float,
         SampledClass::Rg16Float if native.float16 => TexelLayout::Rg16Float,
+        SampledClass::Rgb10a2Unorm if native.ten_bit => TexelLayout::Rgb10a2Unorm,
+        SampledClass::Bgr10a2Unorm if native.ten_bit => TexelLayout::Bgr10a2Unorm,
         _ => return None,
     })
 }

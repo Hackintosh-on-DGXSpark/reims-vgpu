@@ -2039,6 +2039,42 @@ fn a_padded_half_float_row_copies_straight_through_at_eight_bytes_a_texel() {
     );
 }
 
+/// A packed ten-bit texture keeps its own word on the CPU-origin sampled rail
+/// when the caller carries the layout, and narrows to the top eight bits of
+/// each channel when it does not (the colour LOAD seed's answer). Both orders,
+/// so an R/B exchange on either path fails here.
+#[test]
+fn a_ten_bit_sampled_texture_keeps_its_word_or_narrows_by_the_callers_answer() {
+    // Low field full, green half, high field empty, alpha full.
+    let word: u32 = 0x3ff | (0x200 << 10) | (0b11 << 30);
+    for (format, layout, narrowed) in [
+        (
+            pixel_format::MTL_FORMAT_RGB10A2_UNORM,
+            TexelLayout::Rgb10a2Unorm,
+            [0xff, 0x80, 0x00, 0xff],
+        ),
+        (
+            pixel_format::MTL_FORMAT_BGR10A2_UNORM,
+            TexelLayout::Bgr10a2Unorm,
+            [0x00, 0x80, 0xff, 0xff],
+        ),
+    ] {
+        let load = |native: NativeUploads| {
+            load_tight_linear_rgba_with(1, 1, 1, format, native, "test_tight_load", |dst| {
+                dst.copy_from_slice(&word.to_le_bytes());
+                true
+            })
+            .expect("a ten-bit sample loads")
+        };
+        let (bytes, fmt) = load(NativeUploads::ALL);
+        assert_eq!(fmt.layout(), layout, "{format:#x}");
+        assert_eq!(bytes, word.to_le_bytes(), "{format:#x}: the guest's word, unconverted");
+        let (bytes, fmt) = load(NativeUploads::NONE);
+        assert_eq!(fmt.layout(), TexelLayout::Rgba8, "{format:#x}");
+        assert_eq!(bytes, narrowed, "{format:#x}");
+    }
+}
+
 #[test]
 fn tight_rgba_linear_load_preserves_native_bytes() {
     let native = [1, 2, 3, 4, 5, 6, 7, 8];

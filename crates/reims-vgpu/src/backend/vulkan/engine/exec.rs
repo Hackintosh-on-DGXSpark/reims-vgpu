@@ -3374,13 +3374,15 @@ pub(crate) unsafe fn execute_draw_inner(
     // buffer→image copy converts nothing and reads the *image's* texel width
     // per pixel, so staging an RGBA8 seed under a wider attachment would read
     // past the slot and seed the frame with whatever followed it. The wide arm
-    // below restates the seed as the attachment's texels first; the four-byte
+    // below restates the seed as the attachment's texels first; the eight-bit
     // arm is unchanged, which is every attachment this device had until render
-    // targets began following the guest's declared format.
+    // targets began following the guest's declared format. Four bytes is not
+    // eight bits: a packed ten-bit or two-channel half-float attachment is as
+    // wide as RGBA8 and still needs its seed restated.
     phase.enter(super::draw_phase::Phase::StageSeed);
     let seed_wide = seed_bytes.and_then(|rgba8| {
         let layout = crate::backend::vulkan::translate::pixel::texel_layout_of(color0_format)?;
-        if layout.bytes_per_texel() == crate::contract::pixel_format::RGBA8_BPP {
+        if layout.is_four_byte_color() {
             return None;
         }
         Some((rgba8, layout))

@@ -477,6 +477,14 @@ impl DeviceCapabilitySnapshot {
         (self.0 & (1_u64 << CAP_PUBLISHED_BIT) != 0)
             .then_some(self.0 & (1_u64 << (CAP_SAMPLED_FILTER_SHIFT + layout.index() as u32)) != 0)
     }
+
+    fn render_target_layout_supported_if_published(
+        self,
+        layout: crate::contract::pixel_format::TexelLayout,
+    ) -> Option<bool> {
+        (self.0 & (1_u64 << CAP_PUBLISHED_BIT) != 0)
+            .then_some(self.render_target_layout_supported(layout))
+    }
 }
 
 static DEVICE_CAPABILITIES: AtomicU64 = AtomicU64::new(DeviceCapabilitySnapshot::CONSERVATIVE.0);
@@ -550,6 +558,36 @@ mod device_capability_snapshot_tests {
             },
         );
         assert!(!narrowed.deferred_gpu_only_content_allowed());
+    }
+
+    /// A colour attachment is refused only on a device's own word: a host that
+    /// published no `A2R10G10B10` attachment support declines `BGR10A2Unorm`
+    /// targets, the same host renders its required red-low twin, and a snapshot
+    /// no device has published yet declines nothing.
+    #[test]
+    fn only_a_published_device_declines_a_render_target_layout() {
+        let mut features = crate::backend::vulkan::caps::device_features::DeviceFeatures {
+            max_image_dimension_2d: 16_384,
+            ..Default::default()
+        };
+        features.color_attachment_blend[TexelLayout::Rgb10a2Unorm.index()] = true;
+        let snapshot = DeviceCapabilitySnapshot::from_parts(
+            &features,
+            crate::backend::vulkan::caps::DriverQuirk::default(),
+        );
+        assert_eq!(
+            snapshot.render_target_layout_supported_if_published(TexelLayout::Bgr10a2Unorm),
+            Some(false)
+        );
+        assert_eq!(
+            snapshot.render_target_layout_supported_if_published(TexelLayout::Rgb10a2Unorm),
+            Some(true)
+        );
+        assert_eq!(
+            DeviceCapabilitySnapshot::CONSERVATIVE
+                .render_target_layout_supported_if_published(TexelLayout::Bgr10a2Unorm),
+            None
+        );
     }
 }
 
@@ -2151,6 +2189,24 @@ pub fn render_target_layout_supported(layout: crate::contract::pixel_format::Tex
     device_capabilities().render_target_layout_supported(layout)
 }
 
+/// Whether the resolved device has said it cannot render to and blend into
+/// this layout, so a draw must not create a colour attachment at it.
+///
+/// The refusing half of [`render_target_layout_supported`], for the one caller
+/// that has no fallback to narrow to: the attachment a pass renders through is
+/// created at the format the guest declared, and Vulkan leaves colour-attachment
+/// support optional for some renderable formats (`A2R10G10B10_UNORM_PACK32`,
+/// which `BGR10A2Unorm` renders through, is one). Asked only of a published
+/// snapshot: before a device has answered there is nothing to refuse on, and
+/// the device that will create the image is the one that answers.
+pub fn render_target_layout_declined(layout: crate::contract::pixel_format::TexelLayout) -> bool {
+    use crate::contract::pixel_format::TexelLayout;
+    if matches!(layout, TexelLayout::Rgba8 | TexelLayout::Bgra8) {
+        return false;
+    }
+    device_capabilities().render_target_layout_supported_if_published(layout) == Some(false)
+}
+
 pub fn deferred_gpu_only_content_allowed() -> bool {
     device_capabilities().deferred_gpu_only_content_allowed()
 }
@@ -3021,8 +3077,12 @@ pub fn read_target_leased(identity: &TargetIdentity) -> Result<Option<LeasedFram
     // so unlike `read_target_inner` it has nowhere to narrow a wide resident to
     // — the bytes the caller reads are the slot's. Bounded rather than
     // converted, and named so a firing says which rail could not serve.
+    //
+    // Bounded on the colour order, not the width: a packed ten-bit or
+    // two-channel half-float texel is four bytes too, and the caller would read
+    // its word as four eight-bit channels.
     let (snap, layout) = readback_snapshot(pools, identity)?;
-    if layout.bytes_per_texel() != RESIDENT_READ_BYTES_PER_TEXEL {
+    if !layout.is_four_byte_color() {
         return Err(DrawError::TargetRead(
             reason::TargetReadDecline::TexelNotFourBytes {
                 format: snap.format,
@@ -4368,6 +4428,11 @@ fn readback_bytes_per_texel(format: ash::vk::Format) -> u32 {
 /// Returns the bytes and the channel order they are in — `narrow_texel_to_rgba8`
 /// produces semantic RGBA8 whatever the resident's order was, so a narrowed
 /// frame owes no exchange and says so.
+///
+/// Only the two eight-bit colour orders pass through untouched. Four bytes a
+/// texel is not the test: a packed ten-bit word or a two-channel half-float
+/// texel is four bytes too, and handing one on would have its consumer read the
+/// word as four eight-bit channels.
 fn narrow_readback_to_rgba8(
     out: Vec<u8>,
     layout: crate::contract::pixel_format::TexelLayout,
@@ -4375,7 +4440,7 @@ fn narrow_readback_to_rgba8(
     pixels: u64,
     bgra: bool,
 ) -> Result<(Vec<u8>, bool), DrawError> {
-    if layout.bytes_per_texel() == RESIDENT_READ_BYTES_PER_TEXEL {
+    if layout.is_four_byte_color() {
         return Ok((out, bgra));
     }
     let count = u32::try_from(pixels).unwrap_or(u32::MAX);
@@ -5618,12 +5683,12 @@ mod readback_width_tests {
                         (PIXELS * u64::from(RESIDENT_READ_BYTES_PER_TEXEL)) as usize,
                         "{layout:?}: a consumer of drawn pixels reads RGBA8"
                     );
-                    // A four-byte layout is handed back untouched, so it keeps
-                    // the order it was read in; a narrowed one is semantic RGBA8
-                    // and owes no exchange. Both rails pass this straight on.
+                    // An eight-bit colour order is handed back untouched, so it
+                    // keeps the order it was read in; a narrowed one is semantic
+                    // RGBA8 and owes no exchange. Both rails pass this straight on.
                     assert_eq!(
                         bgra,
-                        layout.bytes_per_texel() == RESIDENT_READ_BYTES_PER_TEXEL,
+                        layout.is_four_byte_color(),
                         "{layout:?}: reported the wrong channel order for its rail"
                     );
                 }
@@ -5643,6 +5708,27 @@ mod readback_width_tests {
                     );
                 }
             }
+        }
+    }
+
+    /// A packed ten-bit resident is four bytes a texel and still not RGBA8, so
+    /// a readback of one is narrowed channel by channel rather than handed on
+    /// as four bytes of colour. Both Vulkan words, with red in the low field
+    /// for `A2B10G10R10` and blue there for `A2R10G10B10`.
+    #[test]
+    fn a_ten_bit_readback_is_narrowed_not_passed_through() {
+        // Low field full, green half, high field empty, alpha full.
+        let word: u32 = 0x3ff | (0x200 << 10) | (0b11 << 30);
+        for (layout, want) in [
+            (TexelLayout::Rgb10a2Unorm, [0xff, 0x80, 0x00, 0xff]),
+            (TexelLayout::Bgr10a2Unorm, [0x00, 0x80, 0xff, 0xff]),
+        ] {
+            let format = crate::backend::vulkan::translate::pixel::vk_texel_layout(layout);
+            let (pixels, bgra) =
+                narrow_readback_to_rgba8(word.to_le_bytes().to_vec(), layout, format, 1, true)
+                    .expect("a renderable layout narrows");
+            assert_eq!(pixels, want, "{layout:?}");
+            assert!(!bgra, "{layout:?}: narrowed bytes are semantic RGBA8");
         }
     }
 }

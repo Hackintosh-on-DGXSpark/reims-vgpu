@@ -1789,9 +1789,16 @@ pub(crate) fn note_sampled_narrowing(
     if !crate::observe::first_sight(site, key) {
         return;
     }
+    // A ten-bit unorm channel always fits; only its low two bits go.
+    let lost = match fmt {
+        pixel_format::MTL_FORMAT_RGB10A2_UNORM | pixel_format::MTL_FORMAT_BGR10A2_UNORM => {
+            "256_levels"
+        }
+        _ => "clamp_to_unit_and_256_levels",
+    };
     crate::observe::fail(format!(
         "sampled_texture_narrowed reason={site} ref={texture_ref} fmt={fmt:#x} {w}x{h} \
-         to=rgba8 lost=clamp_to_unit_and_256_levels"
+         to=rgba8 lost={lost}"
     ));
 }
 
@@ -1871,9 +1878,11 @@ fn load_buffer_texture_rgba<M: HostMemory + HostOps>(
     for y in 0..h as usize {
         let src = &raw[y * bpr..y * bpr + tight];
         let dst = &mut rgba[y * dst_row..(y + 1) * dst_row];
-        if !pixel_format::convert_row_to_rgba8(fmt, src, w, dst)
-            && !ten_bit_row_to_rgba8(fmt, src, dst)
-        {
+        // The packed ten-bit icons 26 and 27 draw from buffer textures narrow
+        // here through the shared converter, the same arm the scanout capture
+        // and the readback rails use, so every eight-bit reading of one word
+        // agrees.
+        if !pixel_format::convert_row_to_rgba8(fmt, src, w, dst) {
             crate::observe::fail(format!(
                 "buftex convert_fail ref={texture_ref} buf={} fmt={fmt:#x} row={y} {w}x{h}",
                 bt.buffer_ref
@@ -1882,28 +1891,6 @@ fn load_buffer_texture_rgba<M: HostMemory + HostOps>(
         }
     }
     Some((w, h, rgba))
-}
-
-/// One row of RGB10A2 or BGR10A2 texels narrowed to RGBA8, for the buffer-texture
-/// loader alone. 26 and 27 draw their Setup Assistant icons from buffer textures
-/// in these formats; the shared converters decline them on purpose, because
-/// everywhere else the ten bits are kept by sampling the format natively.
-fn ten_bit_row_to_rgba8(format: u16, src: &[u8], dst: &mut [u8]) -> bool {
-    use crate::contract::pixel_format::{MTL_FORMAT_BGR10A2_UNORM, MTL_FORMAT_RGB10A2_UNORM};
-    if format != MTL_FORMAT_RGB10A2_UNORM && format != MTL_FORMAT_BGR10A2_UNORM {
-        return false;
-    }
-    for (texel, out) in src.chunks_exact(4).zip(dst.chunks_exact_mut(4)) {
-        let word = u32::from_le_bytes([texel[0], texel[1], texel[2], texel[3]]);
-        let (low, high) = ((word >> 2) as u8, (word >> 22) as u8);
-        let (r, b) = if format == MTL_FORMAT_RGB10A2_UNORM {
-            (low, high)
-        } else {
-            (high, low)
-        };
-        out.copy_from_slice(&[r, (word >> 12) as u8, b, ((word >> 30) as u8) * 85]);
-    }
-    true
 }
 
 fn index_elem_size(index_type: u32) -> Option<usize> {

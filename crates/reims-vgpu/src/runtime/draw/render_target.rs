@@ -1621,6 +1621,56 @@ mod tests {
         }
     }
 
+    /// A type-11 surface declared in either packed ten-bit order is a render
+    /// target at that format, and its integer twin is still refused by name.
+    ///
+    /// macOS 26 and 27 render WindowServer surfaces in `BGR10A2Unorm`; each pass
+    /// was refused as `rt_type11_format fmt=0x5e`, and the pass that sampled the
+    /// surface afterwards found no bytes anywhere (`texture_resolve_missing`).
+    #[test]
+    fn a_type11_surface_in_either_ten_bit_order_is_a_render_target() {
+        use crate::contract::pixel_format::{
+            MTL_FORMAT_BGR10A2_UNORM, MTL_FORMAT_RGB10A2_UINT, MTL_FORMAT_RGB10A2_UNORM,
+        };
+        for (mid, tex_ref, format) in [
+            (91, 0x5d0u32, MTL_FORMAT_BGR10A2_UNORM),
+            (92, 0x5d1, MTL_FORMAT_RGB10A2_UNORM),
+            (93, 0x5d2, MTL_FORMAT_RGB10A2_UINT),
+        ] {
+            let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+            let host = FakeHost::new();
+            assert!(state.map_surface(mid));
+            {
+                let m = state.mappings.get_mut(&mid).unwrap();
+                m.has_geom = true;
+                m.width = 276;
+                m.height = 115;
+                m.format = format;
+            }
+            state.texture_to_mapping.insert((3, tex_ref), mid);
+
+            let cap = crate::observe::FailCapture::start();
+            let rt = lookup_render_target(&mut state, &host, 3, attach(tex_ref));
+            if format == MTL_FORMAT_RGB10A2_UINT {
+                assert!(rt.is_none(), "an integer word has no unorm converter");
+                let line = cap.one("rt_resolve");
+                assert!(line.starts_with("rt_resolve reason=rt_type11_format "), "{line}");
+                continue;
+            }
+            let rt = rt.unwrap_or_else(|| panic!("{format:#x}: {:?}", cap.lines()));
+            assert_eq!(
+                (rt.mapping_id, rt.width, rt.height, rt.format),
+                (mid, 276, 115, format),
+                "{format:#x}"
+            );
+            assert!(
+                !cap.lines().iter().any(|l| l.starts_with("rt_resolve")),
+                "{format:#x}: {:?}",
+                cap.lines()
+            );
+        }
+    }
+
     /// A refusal is reported once per attachment per check, not once per draw.
     ///
     /// The guest re-issues the same pass every frame, so this path is entered

@@ -1935,9 +1935,9 @@ mod tests {
                 p::MTL_FORMAT_BGRA8_UNORM,
                 p::MTL_FORMAT_BGRA8_UNORM_SRGB,
                 // The packed 32-bit colour family, whose channel boundaries are
-                // not byte boundaries — so the CPU rung could not have served
-                // them at all and the refusal was the whole loss. `BGR10A2Unorm`
-                // is the member a guest was measured binding.
+                // not byte boundaries — so the CPU rung could serve at most an
+                // eight-bit reading of them, and `RG11B10Float` not even that.
+                // `BGR10A2Unorm` is the member a guest was measured binding.
                 p::MTL_FORMAT_RGB10A2_UNORM,
                 p::MTL_FORMAT_RG11B10_FLOAT,
                 p::MTL_FORMAT_BGR10A2_UNORM,
@@ -1982,6 +1982,13 @@ mod tests {
                 p::MTL_FORMAT_RGBA8_UNORM_SRGB,
                 p::MTL_FORMAT_BGRA8_UNORM,
                 p::MTL_FORMAT_BGRA8_UNORM_SRGB,
+                // The packed ten-bit pair macOS 26 and 27 render into:
+                // buffer-backed `RGB10A2Unorm` textures and `BGR10A2Unorm`
+                // IOSurfaces. `A2B10G10R10_UNORM_PACK32` is a required colour
+                // attachment; `A2R10G10B10_UNORM_PACK32` is not, so the draw
+                // asks the host before it attaches one.
+                p::MTL_FORMAT_RGB10A2_UNORM,
+                p::MTL_FORMAT_BGR10A2_UNORM,
                 // Admitted since the two arms became one answer. The contract
                 // has said a half-float render target is renderable since one
                 // could be created at that format; only this side still refused
@@ -1990,6 +1997,34 @@ mod tests {
                 p::MTL_FORMAT_RGBA16_FLOAT,
             ]
         );
+    }
+
+    /// The packed ten-bit render targets attach, sample and land through one
+    /// Vulkan word each: `RGB10A2Unorm` through `A2B10G10R10_UNORM_PACK32` and
+    /// `BGR10A2Unorm` through `A2R10G10B10_UNORM_PACK32`, the same bits in the
+    /// same order as the guest's. A byte copy out of the resident therefore is
+    /// the guest's texel, and so is a sample of it.
+    #[test]
+    fn a_ten_bit_render_target_is_its_guest_word_on_every_rail() {
+        for (mtl, vk_format, layout) in [
+            (
+                p::MTL_FORMAT_RGB10A2_UNORM,
+                vk::Format::A2B10G10R10_UNORM_PACK32,
+                TexelLayout::Rgb10a2Unorm,
+            ),
+            (
+                p::MTL_FORMAT_BGR10A2_UNORM,
+                vk::Format::A2R10G10B10_UNORM_PACK32,
+                TexelLayout::Bgr10a2Unorm,
+            ),
+        ] {
+            assert_eq!(color_attachment(mtl), Ok((vk_format, None)), "{mtl:#x}");
+            assert_eq!(texel_layout_of(vk_format), Some(layout), "{mtl:#x}");
+            assert_eq!(sampled_pixels(mtl).unwrap().0, layout, "{mtl:#x}");
+            assert_eq!(p::store_texel_order(mtl), Some(layout), "{mtl:#x}");
+            assert_eq!(vk_texel_layout(layout), vk_format, "{mtl:#x}");
+            assert!(!has_bgra_order(vk_format), "{mtl:#x} is not an eight-bit order");
+        }
     }
 
     /// An integer texel is declared, translates, and is refused by every rail

@@ -2598,11 +2598,10 @@ pub(super) fn load_type5_view_rgba<M: HostMemory + HostOps>(
     // fires, not before.
     //
     // The packed 32-bit colour formats take the native rail for the same
-    // reason and a sharper one: their channel boundaries are not byte
-    // boundaries, so `TexelLayout::Rgba8` would not merely quantize them, it
-    // would read the word as four unrelated bytes. Four bytes wide is exactly
-    // what the default arm below tests for and exactly what makes that wrong,
-    // which is why they are named here rather than left to it.
+    // reason: the default arm below would cut each ten- or eleven-bit channel
+    // down to eight (or, for `RG11B10Float`, find no converter at all). Four
+    // bytes wide is exactly what the default arm tests for, which is why they
+    // are named here rather than left to it.
     // The layout is the view's own; the transfer function travels with it,
     // because the default arm below converts to RGBA8 order and decodes nothing.
     let byte_format = SampledByteFormat::from_source(
@@ -5022,11 +5021,11 @@ fn native_scratch_to_upload(
 /// **Keyed on the format so the common one never asks an irrelevant question.**
 /// The host capability is a lock-free device-lifetime snapshot, but this sits
 /// on the rung carrying essentially all of the pathway's sampled traffic and
-/// only two guest formats can make use of the answer.
+/// only four guest formats can make use of the answer.
 /// [`pixel_format::narrows_to_unorm8`] is exactly the set of formats whose CPU
-/// arm is lossy, which is exactly the set the half-float flag can change the
-/// answer for — so keying on it is the same rule stated once, not a fast path
-/// that could disagree with the slow one.
+/// arm is lossy, which is exactly the set the half-float and ten-bit flags can
+/// change the answer for — so keying on it is the same rule stated once, not a
+/// fast path that could disagree with the slow one.
 fn native_uploads_for(sample_format: u16) -> NativeUploads {
     if !pixel_format::narrows_to_unorm8(sample_format) {
         return NativeUploads::BGRA8;
@@ -5050,6 +5049,11 @@ fn native_uploads_asking_host() -> NativeUploads {
         // would be two fields nobody could point at a host that needed them.
         float16: engine::supports_sampled_layout_linear_filter(TexelLayout::Rgba16Float)
             && engine::supports_sampled_layout_linear_filter(TexelLayout::Rg16Float),
+        // The same conjunction for the two ten-bit orders. Vulkan requires the
+        // filter for `A2B10G10R10_UNORM_PACK32` and not for its sibling, so the
+        // answer is asked rather than assumed.
+        ten_bit: engine::supports_sampled_layout_linear_filter(TexelLayout::Rgb10a2Unorm)
+            && engine::supports_sampled_layout_linear_filter(TexelLayout::Bgr10a2Unorm),
         ..NativeUploads::BGRA8
     }
 }
@@ -6303,7 +6307,7 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
         // Unknown wire format stays unknown — never guess a secondary layout —
         // and a known format whose sRGB qualifier this attachment cannot carry
         // says so instead of folding silently.
-        let format = match translate::pixel::color_attachment(c.format) {
+        let format = match host_color_attachment(c.format) {
             Ok((format, decline)) => {
                 if decline.is_some() {
                     srgb_census::note_downgrade(
@@ -8988,7 +8992,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         resources.vertex_count = vertex_count;
         if let Some(c0) = req.colors.first() {
             resources.color_attachment_format = Some(
-                translate::pixel::color_attachment(c0.format)
+                host_color_attachment(c0.format)
                     .map_err(|reason| {
                         DrawError::Unsupported(
                             crate::backend::vulkan::engine::reason::DrawReason::ColorAttachmentFormat(reason),
@@ -10159,6 +10163,29 @@ pub(crate) fn gva_chain_identity(
         generation: req.gva_alloc_gen,
         format: gva_resident_format(c0.format),
     })
+}
+
+/// The colour attachment a pass declaring `format` renders through, or the
+/// reason this host cannot create one.
+///
+/// [`translate::pixel::color_attachment`] answers the contract half — may a
+/// colour attachment be this format at all. The attachment image is created at
+/// that answer, so the host half is asked here, before anything is created:
+/// Vulkan leaves colour-attachment support optional for some renderable
+/// formats, and `A2R10G10B10_UNORM_PACK32` (`BGR10A2Unorm`) is one. A host that
+/// published no such support refuses the pass by name instead of being handed
+/// an image it cannot render to.
+fn host_color_attachment(
+    format: u16,
+) -> Result<(ash::vk::Format, Option<translate::TranslateReason>), translate::TranslateReason> {
+    let resolved = translate::pixel::color_attachment(format)?;
+    let allocation = translate::pixel::ResidentFormat::of(resolved.0).allocation();
+    if translate::pixel::texel_layout_of(allocation)
+        .is_some_and(crate::backend::vulkan::engine::render_target_layout_declined)
+    {
+        return Err(translate::TranslateReason::NoColorAttachmentFormat(format));
+    }
+    Ok(resolved)
 }
 
 /// The format the resident behind a GVA render target must hold: the one the
