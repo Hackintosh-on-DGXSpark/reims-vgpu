@@ -395,6 +395,11 @@ pub struct DrawRequest {
     /// lifecycle is enabled. Vulkan still compares the complete variant key;
     /// this identity only chooses the object's exact front entry.
     pub pipeline_object: Option<PipelineObjectIdentity>,
+    /// The ticket this draw waited on before it was resumed, if it waited.
+    /// Read once, by the pipeline lookup: a compile that failed is this draw's
+    /// refusal rather than a reason to compile again. See
+    /// [`super::pipeline_compiler`].
+    pub pipeline_wait: Option<super::pipeline_compiler::PipelineTicket>,
     /// Shared from the runtime translation cache — the engine never mutates
     /// module words; `Arc` avoids a full-module copy per draw.
     pub vert_spirv: std::sync::Arc<Vec<u32>>,
@@ -747,6 +752,17 @@ pub struct SecondaryColorTarget {
     /// This slot's own `MTLColorWriteMask`, for the same reason the primary
     /// carries one: it is not part of the blend state.
     pub color_write_mask: ColorWriteMask,
+}
+
+/// What a draw request came to: drawn, or waiting for its pipeline.
+///
+/// `PipelinePending` changed nothing — no slot claimed, nothing acquired or
+/// recorded — so the caller runs the same draw again once the ticket is
+/// answered. It is not a refusal and is never logged or cached as one.
+#[derive(Debug)]
+pub enum DrawAnswer {
+    Drawn(DrawOutput),
+    PipelinePending(super::pipeline_compiler::PipelineTicket),
 }
 
 #[derive(Debug, Default)]

@@ -958,6 +958,13 @@ pub struct DrawEncodeRequest {
     /// 0 means "no allocation named": color0 is not a GVA target, or the span
     /// does not fully walk. Vulkan rail only; the Metal arm never reads it.
     pub gva_alloc_gen: u64,
+    /// The pipeline ticket this draw waits on, both ways: set by the Vulkan rail
+    /// when the encode answers `EncodeStatus::PipelinePending`, and handed back
+    /// in when the draw is resumed, so the engine can give the draw the answer
+    /// its wait ended in exactly once. See
+    /// `backend::vulkan::engine::pipeline_compiler`.
+    #[cfg(feature = "backend-vulkan")]
+    pub pipeline_wait: Option<crate::backend::vulkan::engine::PipelineTicket>,
 }
 
 /// Compact command-level MRT census for the always-on draw proxy.
@@ -1190,6 +1197,11 @@ fn degrade_log_first(pipeline_ref: u32, slug: &'static str) -> bool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EncodeStatus {
     Ok,
+    /// Nothing was encoded because the draw's pipeline is still being built
+    /// (Vulkan only). Not a refusal: the draw's request carries the ticket in
+    /// `pipeline_wait`, and the caller runs the same draw again once the ticket
+    /// is answered. See `backend::vulkan::engine::pipeline_compiler`.
+    PipelinePending,
     #[cfg(all(feature = "backend-metal", target_os = "macos"))]
     MetalBackend(crate::backend::metal::error::Status),
     MissingPipeline(&'static str),
@@ -1210,9 +1222,10 @@ pub enum EncodeStatus {
 impl crate::observe::Refusal for EncodeStatus {
     fn refusal(&self) -> Option<&'static str> {
         match self {
-            // The only non-refusal, and the reason this is a `Refusal` rather
-            // than a `Decline`: `Emit::refusal` cannot render a line for it.
-            Self::Ok => None,
+            // The two non-refusals, and the reason this is a `Refusal` rather
+            // than a `Decline`: `Emit::refusal` cannot render a line for them.
+            // A pending pipeline has not run yet, which is not a loss.
+            Self::Ok | Self::PipelinePending => None,
             #[cfg(all(feature = "backend-metal", target_os = "macos"))]
             Self::MetalBackend(status) => status.refusal(),
             Self::MissingPipeline(slug)
@@ -1245,6 +1258,7 @@ impl EncodeStatus {
     pub fn class(&self) -> &'static str {
         match self {
             Self::Ok => "ok",
+            Self::PipelinePending => "pipeline_pending",
             #[cfg(all(feature = "backend-metal", target_os = "macos"))]
             Self::MetalBackend(status) => {
                 if status.is_args() {

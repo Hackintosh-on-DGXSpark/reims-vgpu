@@ -76,11 +76,28 @@ fn note_translation_order_hold(state: &mut DeviceState, held_mask: u32) {
     // that never releases is caught at `DeviceState::reset` instead, where the
     // guest's own teardown is the deadline and no age or depth has to be invented.
     crate::observe::off(format!(
-        "translation_order_hold reason=air_loading held_mask={:#x} new_mask={new_mask:#x} producer_mask={:#x} count={}",
+        "translation_order_hold reason={} held_mask={:#x} new_mask={new_mask:#x} producer_mask={:#x} count={}",
+        exec_deferral_reason(state),
         state.translation_order_hold_mask,
         state.translation_deferred_mask,
         state.translation_order_holds
     ));
+}
+
+/// What the deferred EXEC packets in `translation_deferred_mask` are waiting
+/// for: an AIR translation, a pipeline compile (the channels holding a
+/// continuation), or some of each.
+fn exec_deferral_reason(state: &DeviceState) -> &'static str {
+    let deferred = state.translation_deferred_mask;
+    let compiling = (1..MAX_CHANNELS as u32)
+        .filter(|&ch| deferred & (1u32 << ch) != 0)
+        .filter(|&ch| state.exec_continuations.holds(ch))
+        .count();
+    match (compiling, deferred.count_ones() as usize) {
+        (0, _) => "air_loading",
+        (c, d) if c == d => "pipeline_compiling",
+        _ => "air_loading_and_pipeline_compiling",
+    }
 }
 
 fn release_translation_order_holds(state: &mut DeviceState) {
@@ -2474,6 +2491,7 @@ fn process_root_packet<H: HostMemory + HostOps>(
                 if is_child_channel(ch) {
                     let bit = 1u32 << ch;
                     state.active_child_mask |= bit;
+                    state.exec_continuations.drop_channel(ch, "fifo_redefined");
                     state.translation_deferred_mask &= !bit;
                     state.translation_order_hold_mask &= !bit;
                     state.present_translation_hold_mask &= !bit;
@@ -2489,6 +2507,7 @@ fn process_root_packet<H: HostMemory + HostOps>(
                     let bit = 1u32 << ch;
                     state.active_child_mask &= !bit;
                     state.pending.child_mask &= !bit;
+                    state.exec_continuations.drop_channel(ch, "fifo_freed");
                     state.translation_deferred_mask &= !bit;
                     state.translation_order_hold_mask &= !bit;
                     state.present_translation_hold_mask &= !bit;
@@ -3319,12 +3338,22 @@ fn present_named_mapping<H: HostMemory + HostOps>(
         if state.present_translation_hold_mask & current_bit == 0 {
             state.present_translation_holds = state.present_translation_holds.saturating_add(1);
             state.present_translation_hold_mask |= current_bit;
-            crate::observe::fail(format!(
-                "present_order_hold reason=translation_deferred ch={channel_id} mid={mapping} pending_mask={deferred_other:#x} frame_mapping={} early_front={} count={}",
+            let waiting_for = exec_deferral_reason(state);
+            let line = format!(
+                "present_order_hold reason=translation_deferred waiting_for={waiting_for} ch={channel_id} mid={mapping} pending_mask={deferred_other:#x} frame_mapping={} early_front={} count={}",
                 state.present.frame_mapping,
                 state.present.early_front_mapping,
                 state.present_translation_holds
-            ));
+            );
+            // Every cold pipeline stops its packet for the length of its
+            // compile, so a present held behind one is the scheduler working,
+            // not a fault; only a hold behind an AIR load stays on the fail
+            // channel it has always been on.
+            if waiting_for == "pipeline_compiling" {
+                crate::observe::off(line);
+            } else {
+                crate::observe::fail(line);
+            }
         }
         return ChildPacketDisposition::Deferred;
     }
@@ -4228,6 +4257,15 @@ fn process_child_packet<H: HostMemory + HostOps>(
     channel_id: u32,
     packet: &Packet,
 ) -> ChildPacketDisposition {
+    // A packet that stopped at a draw waiting for its pipeline is this
+    // channel's head until it finishes. Something else here means the ring
+    // moved under it, and it can neither finish nor run again from the top.
+    if packet.opcode != CHILD_OP_EXEC_INDIRECT2 && state.exec_continuations.holds(channel_id) {
+        state
+            .exec_continuations
+            .drop_channel(channel_id, "head_replaced");
+        state.translation_deferred_mask &= !1u32.checked_shl(channel_id).unwrap_or(0);
+    }
     match packet.opcode {
         CHILD_OP_DEFINE_TASK2 => {
             apply_define_task2(state, host, &packet.payload, Some(channel_id));
@@ -4455,10 +4493,15 @@ fn process_child_packet<H: HostMemory + HostOps>(
                 // Process this channel's exec packet. Archive does not drain
                 // other child FIFOs here; surface RAW is render_wait_surface on
                 // the specific type-11/GVA key at sample/Load/swap sites.
+                let slot = crate::runtime::exec::ExecSlot {
+                    channel: channel_id,
+                    next_head: packet.next_head,
+                    completion_stamp: packet.completion_stamp,
+                };
                 let result =
-                    crate::runtime::exec::process_exec_indirect2(state, host, &packet.payload);
+                    crate::runtime::exec::process_exec_indirect2(state, host, slot, &packet.payload);
                 let channel_bit = 1u32.checked_shl(channel_id).unwrap_or(0);
-                if result.deferred {
+                if let Some(deferral) = result.deferred {
                     if channel_bit != 0 && state.translation_deferred_mask & channel_bit == 0 {
                         state.translation_deferred_mask |= channel_bit;
                         // Census for the same reason as `translation_order_hold`:
@@ -4467,8 +4510,10 @@ fn process_child_packet<H: HostMemory + HostOps>(
                         // `exec_translation_ready` below is already `off`. Boot 87:
                         // 55 deferrals, 56 readies.
                         crate::observe::off(format!(
-                            "exec_translation_deferred reason=air_loading ch={channel_id} task={} pending_mask={:#x}",
-                            result.task_id, state.translation_deferred_mask
+                            "exec_translation_deferred reason={} ch={channel_id} task={} pending_mask={:#x}",
+                            deferral.reason(),
+                            result.task_id,
+                            state.translation_deferred_mask
                         ));
                     }
                     return ChildPacketDisposition::Deferred;

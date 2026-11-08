@@ -28,6 +28,7 @@ mod guest_scatter;
 mod host_ram;
 pub mod init_decline;
 mod linear_target_import;
+mod pipeline_compiler;
 mod pools;
 mod queue_owner;
 mod scatter_shader;
@@ -57,6 +58,7 @@ pub use context::MAX_DEVICE_RECREATES;
 pub(crate) use counters::{CounterSnapshot, EngineCounters};
 pub(crate) use draw_phase::take_window as draw_phase_window;
 pub(crate) use draw_preparation::DrawPreparationDecline;
+pub(crate) use pipeline_compiler::{PipelineOutcome, PipelineTicket};
 pub(crate) use facade_decline::EngineFacadeDecline;
 pub(crate) use host_ram::GuestWriteDecline;
 pub use types::viewport_slot_count;
@@ -64,7 +66,7 @@ pub use types::{
     BlendFactor, BlendOp, BlendStateResource, BufferContent, ColorWriteMask, ComputeBufferResource,
     ComputeOutput, ComputeRequest, ComputeResidentSampleBind, ComputeSampledImageResource,
     ComputeStorageImageResource, ComputeStorageResidency, CullMode, DepthClipMode, DepthState,
-    DrawError, DrawOutput, DrawRequest, DrawScratchStorageImage, FillMode, GuestRun,
+    DrawAnswer, DrawError, DrawOutput, DrawRequest, DrawScratchStorageImage, FillMode, GuestRun,
     GuestRunSource, GuestSampledBacking,
     GuestTargetBacking, GuestTargetMemory, GuestTargetSeed, IndexType, IndexedDrawResource,
     PipelineObjectIdentity, PrimitiveTopology, SampledByteOrigin, SampledContentIdentity,
@@ -297,7 +299,12 @@ impl EngineState {
                 if let Some(mut presenter) = presenter {
                     presenter.destroy(ctx, Some(&mut self.pools));
                 }
-                self.caches.destroy_all(&ctx.device);
+                // Not `destroy_all`: a graphics compile may still be inside the
+                // driver with this cache's layouts and passes, and the engine
+                // lock must not wait for it. Its tickets are answered
+                // `DeviceRebuilt` here, and whatever it names is destroyed when
+                // it lets go of the device.
+                self.caches.retire_into(&ctx.life);
                 self.pools.destroy_all(&ctx.device);
             }
         } else {
@@ -1009,7 +1016,10 @@ pub fn window_present_detach() {
 }
 
 /// Execute one draw against the persistent engine.
-pub fn execute_draw_request(req: &DrawRequest) -> Result<DrawOutput, DrawError> {
+///
+/// `DrawAnswer::PipelinePending` means the draw did nothing and waits for a
+/// pipeline the compiler is building; see [`pipeline_ticket_settled`].
+pub fn execute_draw_request(req: &DrawRequest) -> Result<DrawAnswer, DrawError> {
     let mut guard = lock_engine();
     let EngineState {
         ref mut owner,
@@ -1037,19 +1047,81 @@ pub fn execute_draw_request(req: &DrawRequest) -> Result<DrawOutput, DrawError> 
         }
     }
     match result {
-        Ok(out) => {
+        Ok(DrawAnswer::Drawn(out)) => {
             // Guest work reached the GPU, so any recreate that got us here did
             // its job and the storm budget starts over. See
             // `ContextOwner::note_work_completed`.
             guard.owner.note_work_completed();
-            Ok(out)
+            Ok(DrawAnswer::Drawn(out))
         }
+        Ok(pending) => Ok(pending),
         Err(DrawError::DeviceLost(decline)) => {
             guard.on_device_lost();
             Err(DrawError::DeviceLost(decline))
         }
         Err(e) => Err(e),
     }
+}
+
+/// Whether `ticket` has been answered, publishing finished compiles first if
+/// its own is among them.
+///
+/// The waiting packet asks this on every retry, so the unanswered case takes
+/// no lock: a ticket the compiler has not finished is answered `false` from
+/// two atomics. Only a finished, unpublished one takes the engine lock, for as
+/// long as filing the finished results takes.
+/// A ticket for no compile, for tests of what waits on one. Answer it with
+/// [`PipelineTicket::settle`].
+#[cfg(test)]
+pub(crate) fn test_ticket(seed: u32) -> PipelineTicket {
+    PipelineTicket::new(caches::test_pipeline_key(seed))
+}
+
+pub(crate) fn pipeline_ticket_settled(ticket: &PipelineTicket) -> bool {
+    if ticket.outcome().is_some() {
+        return true;
+    }
+    if !ticket.compiled() {
+        return false;
+    }
+    let mut guard = lock_engine();
+    let EngineState {
+        ref owner,
+        ref mut caches,
+        ref mut pools,
+        ref counters,
+        ..
+    } = &mut *guard;
+    unsafe { caches.publish_compiled(owner.ctx.as_ref(), pools, counters) };
+    ticket.outcome().is_some()
+}
+
+/// [`execute_draw_request`], waiting out a pipeline that is still being built.
+///
+/// For callers that hold no lock and have nothing else to do meanwhile: tests
+/// and tools. The drain must never call it — a draw there waits by leaving its
+/// packet at the FIFO head, not by blocking — and nothing on a guest path does.
+/// A wait that ends in a refusal returns that refusal rather than drawing again.
+pub fn execute_draw_request_blocking(req: &DrawRequest) -> Result<DrawOutput, DrawError> {
+    loop {
+        match execute_draw_request(req)? {
+            DrawAnswer::Drawn(out) => return Ok(out),
+            DrawAnswer::PipelinePending(ticket) => {
+                while !pipeline_ticket_settled(&ticket) {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                if let Some(PipelineOutcome::Failed(error)) = ticket.outcome() {
+                    return Err(error.clone());
+                }
+            }
+        }
+    }
+}
+
+/// The pipeline compiler's census line for the window just ended. See
+/// [`pipeline_compiler::take_census`].
+pub(crate) fn take_pipeline_compile_census(win_ms: u64) -> Option<String> {
+    pipeline_compiler::take_census(win_ms)
 }
 
 /// Submit any open deferred draw batch (draw batching increment 1). Called at
@@ -4786,6 +4858,9 @@ pub fn test_reset_engine() {
     // replacement.
     let poisoned = g.owner.poisoned;
     if let Some(mut ctx) = g.owner.ctx.take() {
+        // A compile still running names this cache's layouts and passes,
+        // which `destroy_all` is about to destroy on a device that stays up.
+        pipeline_compiler::wait_idle();
         // A healthy test reset reuses the device after destroying every pool.
         // Settle both the owner's FIFO and the GPU before those handles go.
         if !poisoned {

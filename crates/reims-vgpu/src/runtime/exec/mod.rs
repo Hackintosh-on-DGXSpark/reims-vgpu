@@ -506,13 +506,82 @@ impl StreamDrawDrop {
     }
 }
 
+/// Why an `EXEC_INDIRECT2` packet stays at its channel head.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExecDeferral {
+    /// A shader's AIR is still being translated. Nothing in the packet ran.
+    AirLoading,
+    /// A draw's pipeline is being compiled. The packet ran up to that draw and
+    /// continues from it; see [`ExecContinuations`].
+    PipelineCompiling,
+}
+
+impl ExecDeferral {
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::AirLoading => "air_loading",
+            Self::PipelineCompiling => "pipeline_compiling",
+        }
+    }
+}
+
+/// Which ring entry an `EXEC_INDIRECT2` packet is: its channel, the head the
+/// ring moves to once it is consumed, and its completion stamp.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExecSlot {
+    pub channel: u32,
+    pub next_head: u32,
+    pub completion_stamp: u32,
+}
+
+/// Where a stream's draw list stopped, and the chain state the draws after it
+/// need. The default is the start of the list.
+#[derive(Debug, Default)]
+struct ChainCursor {
+    draw_index: usize,
+    chain_rgba: Option<Vec<u8>>,
+    resident_chain: bool,
+    saw_nometal: bool,
+    visibility_counts: std::collections::BTreeMap<u64, u64>,
+    template: Option<draw::DrawEncodeRequest>,
+    /// The ticket the draw at `draw_index` waited on, handed back to it when
+    /// the list resumes.
+    #[cfg(feature = "backend-vulkan")]
+    pipeline_wait: Option<crate::backend::vulkan::engine::PipelineTicket>,
+}
+
+/// A draw list stopped at a draw whose pipeline is being built.
+#[derive(Debug)]
+#[cfg_attr(
+    not(feature = "backend-vulkan"),
+    allow(dead_code, reason = "only the Vulkan rail builds pipelines off the drain")
+)]
+struct Suspension {
+    cursor: ChainCursor,
+    #[cfg(feature = "backend-vulkan")]
+    ticket: crate::backend::vulkan::engine::PipelineTicket,
+}
+
+/// Where a packet's streams stopped: which stream, its walked state, and the
+/// draw inside it.
+#[derive(Debug)]
+#[cfg_attr(
+    not(feature = "backend-vulkan"),
+    allow(dead_code, reason = "only the Vulkan rail builds pipelines off the drain")
+)]
+struct StreamStop {
+    stream: usize,
+    acc: StreamAccum,
+    suspension: Suspension,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct ExecResult {
     pub task_id: u32,
     pub streams_loaded: u32,
-    /// Immutable shader translation is still running off the FIFO scheduler.
-    /// The caller must keep this packet at the channel head and retry it.
-    pub deferred: bool,
+    /// Why the packet is not finished: the caller must keep it at the channel
+    /// head, write no stamp for it, and retry it. `None` once it has run.
+    pub deferred: Option<ExecDeferral>,
     pub texture_refs: Vec<u32>,
     pub type11_mappings: Vec<u32>,
     pub saw_draw: bool,
@@ -544,12 +613,19 @@ pub struct ExecResult {
     pub total_us: u64,
 }
 
+/// Run one `EXEC_INDIRECT2` packet, or continue the one that stopped at
+/// `slot` waiting for a pipeline.
 pub fn process_exec_indirect2<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
+    slot: ExecSlot,
     payload: &[u8],
 ) -> ExecResult {
     let exec_started = std::time::Instant::now();
+    #[cfg(feature = "backend-vulkan")]
+    if let Some(parked) = state.exec_continuations.take(slot.channel) {
+        return continuation::resume(state, host, slot, payload, parked, exec_started);
+    }
     let mut out = ExecResult::default();
     if payload.len() < CHILD_EXEC_INDIRECT_HEADER_LEN as usize {
         return out;
@@ -685,7 +761,7 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
     #[cfg(all(feature = "backend-metal", target_os = "macos"))]
     let translation_pending = false;
     if translation_pending {
-        out.deferred = true;
+        out.deferred = Some(ExecDeferral::AirLoading);
         note_exec_header(exec_started, measured_ns);
         return out;
     }
@@ -697,22 +773,67 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
     // stale.
     consume_resource_table(state, task_id, &resource_descs);
 
-    for stream in streams {
-        let mut acc = StreamAccum::default();
-        let walk_started = std::time::Instant::now();
-        walk_stream(state, host, task_id, &stream, &mut out, &mut acc);
-        let walk_ns = walk_started.elapsed().as_nanos() as u64;
-        measured_ns += walk_ns;
-        crate::runtime::drain::note_exec_phase(crate::runtime::drain::ExecPhase::Walk, walk_ns);
-        let finish_started = std::time::Instant::now();
-        finish_stream(state, host, task_id, &mut out, &acc);
-        let finish_ns = finish_started.elapsed().as_nanos() as u64;
-        measured_ns += finish_ns;
-        crate::runtime::drain::note_exec_phase(crate::runtime::drain::ExecPhase::Finish, finish_ns);
+    let stopped = run_streams(state, host, task_id, &streams, 0, None, &mut out, &mut measured_ns);
+    #[cfg(feature = "backend-vulkan")]
+    if let Some(stop) = stopped {
+        continuation::park(state, slot, payload, task_id, streams, stop, &mut out);
     }
+    #[cfg(not(feature = "backend-vulkan"))]
+    let _ = stopped;
     note_exec_header(exec_started, measured_ns);
     out.total_us = elapsed_us(exec_started);
     out
+}
+
+/// Walk and finish `streams[start..]`, the first of them resumed at `resume`'s
+/// draw instead of walked when given.
+///
+/// Stops at the first draw whose pipeline is still being built and says where;
+/// everything before it has run, nothing after it has.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the packet's streams, where to start, and the two accumulators the caller keeps"
+)]
+fn run_streams<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    streams: &[Vec<u8>],
+    start: usize,
+    mut resume: Option<(StreamAccum, ChainCursor)>,
+    out: &mut ExecResult,
+    measured_ns: &mut u64,
+) -> Option<StreamStop> {
+    for (index, stream) in streams.iter().enumerate().skip(start) {
+        let (acc, cursor) = match resume.take() {
+            Some((acc, cursor)) => (acc, Some(cursor)),
+            None => {
+                let mut acc = StreamAccum::default();
+                let walk_started = std::time::Instant::now();
+                walk_stream(state, host, task_id, stream, out, &mut acc);
+                let walk_ns = walk_started.elapsed().as_nanos() as u64;
+                *measured_ns += walk_ns;
+                crate::runtime::drain::note_exec_phase(
+                    crate::runtime::drain::ExecPhase::Walk,
+                    walk_ns,
+                );
+                (acc, None)
+            }
+        };
+        let finish_started = std::time::Instant::now();
+        let suspended = finish_stream_from(state, host, task_id, out, &acc, cursor);
+        let finish_ns = finish_started.elapsed().as_nanos() as u64;
+        *measured_ns += finish_ns;
+        crate::runtime::drain::note_exec_phase(crate::runtime::drain::ExecPhase::Finish, finish_ns);
+        if let Some(suspension) = suspended {
+            return Some(StreamStop {
+                stream: index,
+                acc,
+                suspension,
+            });
+        }
+    }
+    None
 }
 
 /// Close the [`ExecPhase`] tiling of `process_exec_indirect2` at one of its
@@ -3111,17 +3232,52 @@ fn apply_binds<T: Copy, B: Clone>(
     cleared
 }
 
+/// [`finish_stream_from`] from the top of the pass, for tests that drive one
+/// walked stream directly.
+#[cfg(test)]
 fn finish_stream<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
     out: &mut ExecResult,
     acc: &StreamAccum,
-) {
+) -> Option<Suspension> {
+    finish_stream_from(state, host, task_id, out, acc, None)
+}
+
+/// Run a walked stream's pass: its clears and ICB executes, then its draws.
+///
+/// With `resume`, everything before the draw it names has already run — the
+/// clears, the ICB executes and the draws ahead of it — and only the draw list
+/// from there on runs. Returns where the list stopped if a draw's pipeline is
+/// still being built.
+fn finish_stream_from<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    out: &mut ExecResult,
+    acc: &StreamAccum,
+    resume: Option<ChainCursor>,
+) -> Option<Suspension> {
     // Opens in `Prelude` and is charged to whichever part is open until it
     // drops, so the six tile this function rather than sampling it. See
     // [`finish_phase`] for what the split is for.
     let mut fin = finish_phase::FinishTimer::open();
+    if resume.is_none() {
+        finish_stream_prelude(state, host, task_id, out, acc);
+    }
+    finish_stream_draws(state, host, task_id, out, acc, &mut fin, resume.unwrap_or_default())
+}
+
+/// The part of a pass that runs before its draw list: the clear-only case and
+/// every render ICB execute.
+fn finish_stream_prelude<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    out: &mut ExecResult,
+    acc: &StreamAccum,
+) {
     note_stream_draw_drops(task_id, acc);
     // Archive ApplePVGPUDrawJob: clear/load seed is private initial_rgba for the
     // async job; guest pages are written once at completion. Apply clear-to-guest
@@ -3330,7 +3486,22 @@ fn finish_stream<M: HostMemory + HostOps>(
         }
         // ICB execute is the primary work; still allow a co-recorded draw below if present.
     }
+}
 
+/// A pass's draw list, from `cursor.draw_index` on.
+///
+/// Stops at a draw whose pipeline is still being built and hands back
+/// everything the draws after it need. Nothing of that draw has run, so it is
+/// where the list resumes.
+fn finish_stream_draws<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    out: &mut ExecResult,
+    acc: &StreamAccum,
+    fin: &mut finish_phase::FinishTimer,
+    mut cursor: ChainCursor,
+) -> Option<Suspension> {
     if acc.saw_draw && !acc.color_slots.is_empty() && !acc.draws.is_empty() {
         // Archive multi-draw (apple-pv-gpu-exec DrawJob): every honorable draw of
         // one exec packet targets one surface in decode order; the worker threads
@@ -3344,7 +3515,7 @@ fn finish_stream<M: HostMemory + HostOps>(
             .iter()
             .filter(|pd| pd.pipeline_ref != 0 && pd.draw.vertex_count > 0)
             .collect();
-        let mut chain_rgba: Option<Vec<u8>> = None;
+        let mut chain_rgba: Option<Vec<u8>> = cursor.chain_rgba.take();
         // Occlusion counts, keyed by the guest byte offset each lands at.
         //
         // Summed rather than replaced because one Metal counter can span
@@ -3353,14 +3524,20 @@ fn finish_stream<M: HostMemory + HostOps>(
         // of what each draw passed. Several offsets in one pass are legal and
         // independent, which is why this is a map and not a scalar.
         let mut visibility_counts: std::collections::BTreeMap<u64, u64> =
-            std::collections::BTreeMap::new();
+            std::mem::take(&mut cursor.visibility_counts);
         // Resident render-pass chain: intermediate records keep their content
         // on the engine target (no CPU chain buffer); records 2+ LoadFromTarget.
-        let mut resident_chain = false;
-        let mut saw_nometal = false;
+        let mut resident_chain = cursor.resident_chain;
+        let mut saw_nometal = cursor.saw_nometal;
         let first_draw = draw_list.first().copied();
-        let mut first_req = first_draw.and_then(|pd| {
+        // A list resumed past its first draw already resolved the attachment
+        // set; the template it kept is the one every later record is built from.
+        let mut first_req = first_draw.filter(|_| cursor.draw_index == 0).and_then(|pd| {
             out.render_attachment_resolves = out.render_attachment_resolves.saturating_add(1);
+            #[cfg(all(test, feature = "backend-vulkan"))]
+            if let Some(req) = scripted_draws::request(pd.pipeline_ref) {
+                return Some(req);
+            }
             draw::mrt_draw_request(
                 state,
                 host,
@@ -3376,8 +3553,11 @@ fn finish_stream<M: HostMemory + HostOps>(
         // change per record. Keep a seedless template so records 2+ do not
         // re-walk the same guest object list/page tables (or clone a full-frame
         // GVA LOAD seed). The resident target itself preserves record order.
-        let attachment_template = first_req.as_ref().map(render_pass_attachment_template);
-        if first_draw.is_some() && first_req.is_none() {
+        let attachment_template = cursor
+            .template
+            .take()
+            .or_else(|| first_req.as_ref().map(render_pass_attachment_template));
+        if cursor.draw_index == 0 && first_draw.is_some() && first_req.is_none() {
             let refs: Vec<u32> = acc.color_slots.iter().map(|(_, a)| a.texture_ref).collect();
             crate::observe::fail(format!(
                 "metal_draw mrt_request fail task={task_id} pipe={} slots={refs:?} di=0/{}",
@@ -3387,7 +3567,7 @@ fn finish_stream<M: HostMemory + HostOps>(
             out.metal_draws_fail = out.metal_draws_fail.saturating_add(1);
             dirty_color_targets(state, host, task_id, &acc.color_targets);
         }
-        for (di, pd) in draw_list.iter().enumerate() {
+        for (di, pd) in draw_list.iter().enumerate().skip(cursor.draw_index) {
             fin.enter(crate::runtime::drain::FinishPhase::Retarget);
             let mut req = if di == 0 {
                 let Some(req) = first_req.take() else {
@@ -3405,6 +3585,13 @@ fn finish_stream<M: HostMemory + HostOps>(
                 fill_draw_binds_from_pending(&mut req, pd);
                 (req.continues_render_pass, req.render_pass_continues) =
                     render_pass_chain_position(di, draw_list.len());
+                // The draw that waited for its pipeline carries the ticket back
+                // in, once, so a compile that failed is its answer rather than a
+                // reason to compile again.
+                #[cfg(feature = "backend-vulkan")]
+                if di == cursor.draw_index {
+                    req.pipeline_wait = cursor.pipeline_wait.take();
+                }
                 // A resident type-11 target carries attachment contents between
                 // records without a CPU chain buffer. Like a native Metal render
                 // pass, only the final record performs the guest-visible Store;
@@ -3456,6 +3643,14 @@ fn finish_stream<M: HostMemory + HostOps>(
                 }
                 let draw_started = std::time::Instant::now();
                 fin.enter(crate::runtime::drain::FinishPhase::Encode);
+                #[cfg(all(test, feature = "backend-vulkan"))]
+                let encode = match scripted_draws::encode(&mut req) {
+                    Some(answer) => answer,
+                    None => {
+                        draw::encode_draw_chain(state, host, &mut req, do_writeback, force_full_store)
+                    }
+                };
+                #[cfg(not(all(test, feature = "backend-vulkan")))]
                 let encode =
                     draw::encode_draw_chain(state, host, &mut req, do_writeback, force_full_store);
                 fin.enter(crate::runtime::drain::FinishPhase::Result);
@@ -3551,6 +3746,38 @@ fn finish_stream<M: HostMemory + HostOps>(
                             break;
                         }
                     }
+                    #[cfg(feature = "backend-vulkan")]
+                    (EncodeStatus::PipelinePending, _) => {
+                        // Nothing of this draw ran. Keep what the draws after it
+                        // need and stop: the packet stays at its FIFO head, and
+                        // this draw runs again from the top once its pipeline
+                        // is answered.
+                        if do_writeback {
+                            out.render_guest_stores = out.render_guest_stores.saturating_sub(1);
+                        }
+                        if di > 0 && chain_rgba.is_none() {
+                            chain_rgba = req
+                                .colors
+                                .first_mut()
+                                .and_then(|c0| c0.target_seed_rgba.take());
+                        }
+                        let ticket = req
+                            .pipeline_wait
+                            .take()
+                            .expect("a pending encode hands its ticket back on the request");
+                        return Some(Suspension {
+                            cursor: ChainCursor {
+                                draw_index: di,
+                                chain_rgba,
+                                resident_chain,
+                                saw_nometal,
+                                visibility_counts,
+                                template: attachment_template,
+                                pipeline_wait: None,
+                            },
+                            ticket,
+                        });
+                    }
                     (st @ EncodeStatus::NoMetal(_), _) => {
                         saw_nometal = true;
                         out.metal_draws_fail += 1;
@@ -3619,6 +3846,7 @@ fn finish_stream<M: HostMemory + HostOps>(
             }
         }
     }
+    None
 }
 
 /// Land this stream's occlusion counts in the guest's `visibilityResultBuffer`.
@@ -4202,7 +4430,11 @@ fn apply_clear<M: HostMemory + HostOps>(
 
 pub(crate) mod finish_phase;
 
+mod continuation;
+#[cfg(all(test, feature = "backend-vulkan"))]
+pub(crate) mod scripted_draws;
 mod report;
+pub use continuation::{take_census as take_pipeline_wait_census, ExecContinuations};
 use report::{
     is_indexed_draw_opcode, note_clear_dropped, note_color_subresource_unsupported,
     note_compute_refusal, note_depth_stencil_unsupported, note_draw_encode_fail,
@@ -4222,3 +4454,60 @@ use report::{
 
 #[cfg(test)]
 mod tests;
+
+/// Run one pass whose draws name `pipeline_refs` against the installed
+/// [`scripted_draws`] answers, as the first run of the packet at `slot` would,
+/// and park the packet where it stops. `trailing_streams` empty streams follow
+/// the pass, so a test can see the streams after a resumed one run too.
+#[cfg(all(test, feature = "backend-vulkan"))]
+#[allow(clippy::too_many_arguments, reason = "one packet's identity and its pass")]
+pub(crate) fn test_run_and_park<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    slot: ExecSlot,
+    payload: &[u8],
+    task_id: u32,
+    pipeline_refs: &[u32],
+    trailing_streams: usize,
+) -> ExecResult {
+    let mut acc = StreamAccum {
+        saw_draw: true,
+        ..Default::default()
+    };
+    acc.color_slots.push((
+        0,
+        ColorAttachment {
+            texture_ref: 5,
+            load_action: MTL_LOAD_ACTION_CLEAR,
+            store_action: MTL_STORE_ACTION_STORE,
+            ..Default::default()
+        },
+    ));
+    for &pipeline_ref in pipeline_refs {
+        acc.draws.push(PendingDraw {
+            pipeline_ref,
+            draw: DrawArgs {
+                vertex_count: 3,
+                instance_count: 1,
+                primitive_type: 3,
+                first_vertex: 0,
+                base_instance: 0,
+            },
+            ..Default::default()
+        });
+    }
+    let mut out = ExecResult {
+        task_id,
+        ..Default::default()
+    };
+    let streams = vec![Vec::new(); 1 + trailing_streams];
+    if let Some(suspension) = finish_stream_from(state, host, task_id, &mut out, &acc, None) {
+        let stop = StreamStop {
+            stream: 0,
+            acc,
+            suspension,
+        };
+        continuation::park(state, slot, payload, task_id, streams, stop, &mut out);
+    }
+    out
+}

@@ -2315,10 +2315,16 @@ pub struct DeviceState {
     pub iosfc: IosfcRegs,
     pub active_child_mask: u32,
     /// Child channels whose head `EXEC_INDIRECT2` packet is held while an
-    /// immutable AIR translation is still loading. The packet head and stamp
-    /// remain untouched until retry, so this is scheduler state rather than a
+    /// immutable AIR translation is still loading, or while a pipeline one of
+    /// its draws needs is being compiled (that channel then also has an entry
+    /// in [`Self::exec_continuations`]). The packet head and stamp remain
+    /// untouched until retry, so this is scheduler state rather than a
     /// submitted async GPU job.
     pub translation_deferred_mask: u32,
+    /// Head packets that stopped at a draw waiting for its pipeline, by
+    /// channel, with what they need to continue from that draw. See
+    /// `runtime::exec::continuation`.
+    pub exec_continuations: crate::runtime::exec::ExecContinuations,
     /// FIFO timelines whose head packet is held on an unmet stamp wait. Bit 0
     /// is the root FIFO and child channel N uses bit N, the same convention as
     /// [`Self::translation_order_hold_mask`].
@@ -2757,6 +2763,7 @@ impl DeviceState {
             gva_store_witness: Default::default(),
             active_child_mask: 0,
             translation_deferred_mask: 0,
+            exec_continuations: Default::default(),
             stamp_deferred_mask: 0,
             translation_order_hold_mask: 0,
             translation_order_holds: 0,
@@ -3123,10 +3130,12 @@ impl DeviceState {
         if self.translation_order_hold_mask != 0 || self.translation_deferred_mask != 0 {
             crate::observe::fail(format!(
                 "translation_hold_unreleased held_mask={:#x} producer_mask={:#x} episodes={} \
-                 (device reset with guest packets still parked behind an AIR load)",
+                 pipeline_waits={} (device reset with guest packets still parked behind an AIR \
+                 load or a pipeline compile)",
                 self.translation_order_hold_mask,
                 self.translation_deferred_mask,
-                self.translation_order_holds
+                self.translation_order_holds,
+                self.exec_continuations.len()
             ));
         }
         let id = self.id;

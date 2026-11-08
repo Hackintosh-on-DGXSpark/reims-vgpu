@@ -7,8 +7,8 @@ use std::collections::BTreeSet;
 use std::sync::atomic::Ordering;
 
 use super::caches::{
-    canonicalize_layout_bindings, AttrKey, BindingSig, LayoutKey, ObjectCaches, PassKey,
-    PipelineKey, SecondaryAttachKey, MAX_SECONDARY_ATTACH,
+    canonicalize_layout_bindings, AttrKey, BindingSig, GraphicsPipelineAsk, LayoutKey,
+    ObjectCaches, PassKey, PipelineKey, PipelineReady, SecondaryAttachKey, MAX_SECONDARY_ATTACH,
 };
 use super::context::ContextOwner;
 use super::counters::{CreateSite, EngineCounters};
@@ -20,7 +20,7 @@ use super::pools::{
 };
 use super::stage_phase;
 use super::types::{
-    BufferContent, ColorWriteMask, DrawError, DrawOutput, DrawRequest, ResidentReclaim,
+    BufferContent, ColorWriteMask, DrawAnswer, DrawError, DrawOutput, DrawRequest, ResidentReclaim,
     SampledSource, ScissorResource, SeedOrder, TargetIdentity, VertexStepFunction,
     ViewportResource, VisibilityResultMode,
 };
@@ -2591,7 +2591,7 @@ pub(crate) unsafe fn execute_draw_inner(
     pools: &mut ResourcePools,
     counters: &EngineCounters,
     req: &DrawRequest,
-) -> Result<DrawOutput, DrawError> {
+) -> Result<DrawAnswer, DrawError> {
     // Charges this draw's wall clock to one phase at a time; commits from
     // `Drop`, so the `?` returns below keep their time.
     let mut phase = super::draw_phase::DrawTimer::start();
@@ -2671,6 +2671,360 @@ pub(crate) unsafe fn execute_draw_inner(
         height: req.height,
         bgra: output_bgra,
     });
+    phase.enter(super::draw_phase::Phase::Pipeline);
+
+    // Build layout key from storage / sampled / sampler bindings. Sized up
+    // front: this grew from empty on every draw, so a draw with the eight or so
+    // descriptors a Maps chain binds paid three reallocations to reach a width
+    // its inputs already state.
+    let mut layout_bindings = Vec::with_capacity(
+        req.storage_buffers.len()
+            + req.sampled_images.len()
+            + req.samplers.len()
+            + req.color_inputs.count_ones() as usize,
+    );
+    for b in &req.storage_buffers {
+        layout_bindings.push(BindingSig {
+            binding: b.binding,
+            ty: vk::DescriptorType::STORAGE_BUFFER.as_raw() as u32,
+            stages: (vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT).as_raw(),
+            count: 1,
+        });
+    }
+    for b in &req.sampled_images {
+        layout_bindings.push(BindingSig {
+            binding: b.binding,
+            ty: vk::DescriptorType::SAMPLED_IMAGE.as_raw() as u32,
+            stages: (vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT).as_raw(),
+            count: b.descriptor_count,
+        });
+    }
+    for b in &req.samplers {
+        layout_bindings.push(BindingSig {
+            binding: b.binding,
+            ty: vk::DescriptorType::SAMPLER.as_raw() as u32,
+            stages: (vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT).as_raw(),
+            count: 1,
+        });
+    }
+    for image in &req.scratch_storage_images {
+        layout_bindings.push(BindingSig {
+            binding: image.binding,
+            ty: vk::DescriptorType::STORAGE_IMAGE.as_raw() as u32,
+            stages: vk::ShaderStageFlags::FRAGMENT.as_raw(),
+            count: 1,
+        });
+    }
+    for index in (0..8u32).filter(|index| req.color_inputs & (1 << index) != 0) {
+        layout_bindings.push(BindingSig {
+            binding: super::types::COLOR_INPUT_BINDING + index,
+            ty: vk::DescriptorType::INPUT_ATTACHMENT.as_raw() as u32,
+            stages: vk::ShaderStageFlags::FRAGMENT.as_raw(),
+            count: 1,
+        });
+    }
+    let layout_bindings = canonicalize_layout_bindings(layout_bindings)?;
+    if let Some(binding) = layout_bindings.iter().find(|binding| binding.count > 1) {
+        let dynamic_indexing = ctx.features.sampled_image_array_dynamic_indexing;
+        let required_descriptors = layout_bindings
+            .iter()
+            .filter(|candidate| {
+                vk::DescriptorType::from_raw(candidate.ty as i32)
+                    == vk::DescriptorType::SAMPLED_IMAGE
+            })
+            .fold(0u32, |total, candidate| {
+                total.saturating_add(candidate.count)
+            });
+        let descriptor_limit = ctx.features.sampled_image_descriptor_limit;
+        if !ctx.features.sampled_descriptor_arrays(required_descriptors) {
+            return Err(DrawError::Unsupported(
+                super::reason::DrawReason::DescriptorArrayUnsupported {
+                    binding: binding.binding,
+                    count: binding.count,
+                    required_descriptors,
+                    descriptor_limit,
+                    partially_bound: ctx.features.descriptor_binding_partially_bound,
+                    dynamic_indexing,
+                },
+            ));
+        }
+    }
+    // The backstop the compute path has carried since `25051457` and this one
+    // did not. Both of a draw's modules are checked, because either can name a
+    // binding the layout above omits and the divide-by-zero is in the driver's
+    // shared layout scoring rather than in anything stage-specific.
+    if let Some((binding, fragment)) =
+        used_binding_absent_from_layout(&req.vert_spirv, &req.frag_spirv, &layout_bindings)
+    {
+        return Err(DrawError::Unsupported(
+            super::reason::DrawReason::UsedBindingAbsentFromLayout { binding, fragment },
+        ));
+    }
+    let layout_key = LayoutKey {
+        bindings: layout_bindings,
+    };
+    // Resolve load action: resident > guest/host seed > Clear black.
+    let mut load_uses_gpu_content = req.load_from_target;
+    // output_bgra (computed with the batch decision above): BGRA output only
+    // on the resident path (pooled targets stay RGBA); the whole
+    // pass/pipeline/image chain then agrees on B8G8R8A8 so a raw image→buffer
+    // copy lands guest scanout order with no CPU swizzle.
+    // The seed is borrowed from `req`, never copied to the heap. It is a whole
+    // frame, and `engine_delta` measures ~430 MB/s of seed uploads under a
+    // browser workload — so a `Vec` here is ~430 MB/s of memcpy plus ~240
+    // multi-MiB allocations a second on the drain worker that `drain_duty`
+    // shows pinned at duty 0.9+. The only thing that copy bought was a buffer
+    // the `output_bgra` arm could swizzle in place; that swizzle now happens
+    // during the single copy into the mapped staging span, so the pixels are
+    // touched once either way.
+    let seed_bytes: Option<&[u8]> = if load_uses_gpu_content {
+        None
+    } else {
+        req.target_rgba8.as_ref().map(|v| v.as_slice())
+    };
+    let mut pass_key = PassKey::single(
+        load_uses_gpu_content
+            || seed_bytes.is_some()
+            || req.target_guest_seed.is_some()
+            || req.seed_from_target.is_some(),
+        color0_format,
+    );
+    pass_key.host_accessible_color0 = req.guest_target_memory.is_some();
+    for (i, sec) in req.secondary_targets.iter().enumerate() {
+        if i >= MAX_SECONDARY_ATTACH {
+            return Err(DrawError::Unsupported(
+                super::reason::DrawReason::SecondaryAttachmentCap {
+                    requested: req.secondary_targets.len(),
+                    cap: MAX_SECONDARY_ATTACH,
+                },
+            ));
+        }
+        pass_key.secondary[i] = SecondaryAttachKey {
+            format: sec.format,
+            load: sec.load,
+        };
+    }
+    pass_key.secondary_count = req.secondary_targets.len() as u8;
+    pass_key.color_inputs = req.color_inputs;
+    for resource in &req.sampled_images {
+        if let Some(index) =
+            feedback_color_index(req, resource, ctx.features.attachment_feedback_loop_layout)
+        {
+            pass_key.feedback_colors |= 1u8 << index;
+        }
+    }
+    // Whether this draw has a depth attachment, and whether it carries stencil,
+    // is part of the pipeline's pass compatibility; how it loads is not, and
+    // the attachment itself is acquired after the pipeline exists (below).
+    pass_key.depth = req.depth.as_ref().map(|d| super::caches::DepthAttachKey {
+        load: false,
+        stencil: d.stencil.is_some(),
+    });
+    let raster_sample_count = req.raster_sample_count.max(1);
+    let color_sample_count = req.color_sample_count.max(1);
+    if color_sample_count != raster_sample_count {
+        return Err(DrawError::Unsupported(
+            super::reason::DrawReason::MultisampleAttachmentSampleCountMismatch {
+                attachment: color_sample_count,
+                raster: raster_sample_count,
+            },
+        ));
+    }
+    if req.multisample_resolve && raster_sample_count == 1 {
+        return Err(DrawError::Unsupported(
+            super::reason::DrawReason::MultisampleSampleCountUnsupported {
+                requested: raster_sample_count,
+                limit: ctx.features.max_sample_count,
+            },
+        ));
+    }
+    if raster_sample_count > 1 {
+        if !raster_sample_count.is_power_of_two()
+            || raster_sample_count > ctx.features.max_sample_count
+        {
+            return Err(DrawError::Unsupported(
+                super::reason::DrawReason::MultisampleSampleCountUnsupported {
+                    requested: raster_sample_count,
+                    limit: ctx.features.max_sample_count,
+                },
+            ));
+        }
+        if !req.secondary_targets.is_empty() || req.color_inputs != 0 {
+            return Err(DrawError::Unsupported(
+                super::reason::DrawReason::MultisampleResolveShapeUnsupported {
+                    color_targets: 1u32.saturating_add(req.secondary_targets.len() as u32),
+                    depth: req.depth.is_some(),
+                    color_input: req.color_inputs != 0,
+                },
+            ));
+        }
+        if !req.multisample_resolve {
+            if req.target_identity.is_none() {
+                return Err(DrawError::Unsupported(
+                    super::reason::DrawReason::MultisampleResidentTargetMissing {
+                        sample_count: raster_sample_count,
+                    },
+                ));
+            }
+            if !req.skip_readback
+                || req.target_rgba8.is_some()
+                || req.target_guest_seed.is_some()
+                || req.load_guest_target_backing
+            {
+                return Err(DrawError::Unsupported(
+                    super::reason::DrawReason::MultisampleLinearTransferUnsupported {
+                        sample_count: raster_sample_count,
+                    },
+                ));
+            }
+        }
+    }
+    pass_key.sample_count = raster_sample_count;
+    pass_key.multisample_resolve = req.multisample_resolve;
+    let attr_keys: Vec<AttrKey> = req
+        .vertex_attributes
+        .iter()
+        .map(|a| AttrKey {
+            location: a.location,
+            binding: a.binding,
+            format: a.format,
+            offset: a.offset,
+            stride: a.stride,
+            step_function: a.step_function,
+            step_rate: a.step_rate,
+        })
+        .collect();
+
+    phase.enter(super::draw_phase::Phase::PipelineShader);
+    let shader_caps = super::caches::SpirvStorageCaps::of(ctx);
+    let vert_digest = caches.graphics_shader_digest(shader_caps, &req.vert_spirv, counters)?;
+    let frag_digest = caches.graphics_shader_digest(shader_caps, &req.frag_spirv, counters)?;
+    phase.enter(super::draw_phase::Phase::PipelineLayoutPass);
+    let (dsl, pipeline_layout) = caches.get_or_create_layout(ctx, &layout_key, counters, pools)?;
+    // The pipeline is built against a pass with only this draw's
+    // compatibility state in it. The pass the draw records into also says how
+    // each attachment loads, and the depth half of that is known only once the
+    // depth attachment is acquired, which waits until the pipeline exists.
+    let compatible_pass =
+        caches.get_or_create_pass(ctx, pass_key.compatibility().pass_key(), counters, pools)?;
+    phase.enter(super::draw_phase::Phase::Pipeline);
+    // How many viewport slots this draw rasterizes into, checked against the
+    // host before it is baked into a pipeline. Refused rather than clamped:
+    // clamping would silently drop the viewports past the host's limit, which
+    // is the loss this list was widened to stop, and a `viewportCount` above
+    // `maxViewports` — or above 1 without `multiViewport` — makes the pipeline
+    // invalid rather than merely unsupported.
+    let slot_count = super::viewport_slot_count(req);
+    let slot_count_u32 = u32::try_from(slot_count).unwrap_or(u32::MAX);
+    let max_slots = if ctx.features.multi_viewport {
+        ctx.features.max_viewports
+    } else {
+        1
+    };
+    if slot_count_u32 > max_slots {
+        return Err(DrawError::Unsupported(
+            super::reason::DrawReason::ViewportSlotsUnsupported {
+                requested: slot_count_u32,
+                limit: max_slots,
+                multi_viewport: ctx.features.multi_viewport,
+            },
+        ));
+    }
+    // Resolve the occlusion query before anything is recorded, so a host that
+    // cannot count refuses the draw rather than recording one it must throw
+    // away. `Boolean` needs nothing: an imprecise Vulkan occlusion query is
+    // that mode exactly.
+    let occlusion_flags = match req.occlusion_query {
+        None => None,
+        Some(VisibilityResultMode::Counting) if !ctx.features.occlusion_query_precise => {
+            return Err(DrawError::Unsupported(
+                super::reason::DrawReason::VisibilityCountingUnsupported {
+                    occlusion_query_precise: ctx.features.occlusion_query_precise,
+                },
+            ));
+        }
+        Some(mode) => Some(crate::backend::vulkan::translate::raster::vk_query_control_flags(mode)),
+    };
+    let pipeline_key =
+        PipelineKey {
+            vert: vert_digest,
+            frag: frag_digest,
+            attrs: attr_keys,
+            topology: req.primitive_topology,
+            blend: req.blend.map(|b| b.key()),
+            secondary_blend: {
+                let mut per_slot = [None; MAX_SECONDARY_ATTACH];
+                for (slot, target) in req
+                    .secondary_targets
+                    .iter()
+                    .take(MAX_SECONDARY_ATTACH)
+                    .enumerate()
+                {
+                    per_slot[slot] = target.blend.map(|b| b.key());
+                }
+                per_slot
+            },
+            color_write_mask: {
+                let mut per_slot = [ColorWriteMask::default(); 1 + MAX_SECONDARY_ATTACH];
+                per_slot[0] = req.color_write_mask;
+                for (slot, target) in req
+                    .secondary_targets
+                    .iter()
+                    .take(MAX_SECONDARY_ATTACH)
+                    .enumerate()
+                {
+                    per_slot[slot + 1] = target.color_write_mask;
+                }
+                per_slot
+            },
+            pass: pass_key.compatibility(),
+            // Taken from the pass key this draw built, not from `pass`, which
+            // erases it once feedback stops changing the render pass.
+            feedback_colors: pass_key.feedback_colors,
+            cull_mode: req.cull_mode,
+            front_face_ccw: req.front_face_ccw,
+            fill_mode: req.fill_mode,
+            depth_clip: req.depth_clip,
+            depth_test: req.depth.as_ref().map(|d| d.test_enable).unwrap_or(false),
+            depth_write: req.depth.as_ref().map(|d| d.write_enable).unwrap_or(false),
+            depth_compare: req
+                .depth
+                .as_ref()
+                .map(|d| d.compare)
+                .unwrap_or(super::types::SamplerCompareFunction::Always),
+            stencil: req.depth.as_ref().and_then(|d| d.stencil).map(|s| {
+                super::caches::StencilKey {
+                    front: s.front,
+                    back: s.back,
+                }
+            }),
+            viewport_slots: slot_count_u32,
+            layout: layout_key.clone(),
+        };
+    // One cache, consulted once, and before anything is claimed, acquired or
+    // recorded for this draw: a pipeline that is not built yet is handed to the
+    // compiler and the draw returns `PipelinePending` having changed nothing,
+    // so the runtime can run it again from the top once the ticket is
+    // answered. See `super::pipeline_compiler`.
+    phase.enter(super::draw_phase::Phase::PipelineCompile);
+    let ask = GraphicsPipelineAsk {
+        key: &pipeline_key,
+        pipeline_object: req.pipeline_object.as_ref(),
+        wait: req.pipeline_wait.as_ref(),
+        vert: &req.vert_spirv,
+        frag: &req.frag_spirv,
+        pipeline_layout,
+        render_pass: compatible_pass,
+    };
+    let pipeline = match caches.resolve_graphics_pipeline(ctx, pools, counters, ask)? {
+        PipelineReady::Built(pipeline) => pipeline,
+        PipelineReady::Pending(ticket) => {
+            counters.pipeline_pending.fetch_add(1, Ordering::Relaxed);
+            super::draw_phase::note_pending();
+            return Ok(DrawAnswer::PipelinePending(ticket));
+        }
+    };
+    phase.enter(super::draw_phase::Phase::Prep);
     // Why this draw does not append to the open batch, named by its first
     // refusing term.
     //
@@ -2841,148 +3195,6 @@ pub(crate) unsafe fn execute_draw_inner(
         // been submitted, so nothing may free one out from under it.
         _ => pools.begin_entry(ctx, counters)?,
     };
-    phase.enter(super::draw_phase::Phase::Pipeline);
-
-    // Build layout key from storage / sampled / sampler bindings. Sized up
-    // front: this grew from empty on every draw, so a draw with the eight or so
-    // descriptors a Maps chain binds paid three reallocations to reach a width
-    // its inputs already state.
-    let mut layout_bindings = Vec::with_capacity(
-        req.storage_buffers.len()
-            + req.sampled_images.len()
-            + req.samplers.len()
-            + req.color_inputs.count_ones() as usize,
-    );
-    for b in &req.storage_buffers {
-        layout_bindings.push(BindingSig {
-            binding: b.binding,
-            ty: vk::DescriptorType::STORAGE_BUFFER.as_raw() as u32,
-            stages: (vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT).as_raw(),
-            count: 1,
-        });
-    }
-    for b in &req.sampled_images {
-        layout_bindings.push(BindingSig {
-            binding: b.binding,
-            ty: vk::DescriptorType::SAMPLED_IMAGE.as_raw() as u32,
-            stages: (vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT).as_raw(),
-            count: b.descriptor_count,
-        });
-    }
-    for b in &req.samplers {
-        layout_bindings.push(BindingSig {
-            binding: b.binding,
-            ty: vk::DescriptorType::SAMPLER.as_raw() as u32,
-            stages: (vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT).as_raw(),
-            count: 1,
-        });
-    }
-    for image in &req.scratch_storage_images {
-        layout_bindings.push(BindingSig {
-            binding: image.binding,
-            ty: vk::DescriptorType::STORAGE_IMAGE.as_raw() as u32,
-            stages: vk::ShaderStageFlags::FRAGMENT.as_raw(),
-            count: 1,
-        });
-    }
-    for index in (0..8u32).filter(|index| req.color_inputs & (1 << index) != 0) {
-        layout_bindings.push(BindingSig {
-            binding: super::types::COLOR_INPUT_BINDING + index,
-            ty: vk::DescriptorType::INPUT_ATTACHMENT.as_raw() as u32,
-            stages: vk::ShaderStageFlags::FRAGMENT.as_raw(),
-            count: 1,
-        });
-    }
-    let layout_bindings = canonicalize_layout_bindings(layout_bindings)?;
-    if let Some(binding) = layout_bindings.iter().find(|binding| binding.count > 1) {
-        let dynamic_indexing = ctx.features.sampled_image_array_dynamic_indexing;
-        let required_descriptors = layout_bindings
-            .iter()
-            .filter(|candidate| {
-                vk::DescriptorType::from_raw(candidate.ty as i32)
-                    == vk::DescriptorType::SAMPLED_IMAGE
-            })
-            .fold(0u32, |total, candidate| {
-                total.saturating_add(candidate.count)
-            });
-        let descriptor_limit = ctx.features.sampled_image_descriptor_limit;
-        if !ctx.features.sampled_descriptor_arrays(required_descriptors) {
-            return Err(DrawError::Unsupported(
-                super::reason::DrawReason::DescriptorArrayUnsupported {
-                    binding: binding.binding,
-                    count: binding.count,
-                    required_descriptors,
-                    descriptor_limit,
-                    partially_bound: ctx.features.descriptor_binding_partially_bound,
-                    dynamic_indexing,
-                },
-            ));
-        }
-    }
-    // The backstop the compute path has carried since `25051457` and this one
-    // did not. Both of a draw's modules are checked, because either can name a
-    // binding the layout above omits and the divide-by-zero is in the driver's
-    // shared layout scoring rather than in anything stage-specific.
-    if let Some((binding, fragment)) =
-        used_binding_absent_from_layout(&req.vert_spirv, &req.frag_spirv, &layout_bindings)
-    {
-        return Err(DrawError::Unsupported(
-            super::reason::DrawReason::UsedBindingAbsentFromLayout { binding, fragment },
-        ));
-    }
-    let layout_key = LayoutKey {
-        bindings: layout_bindings,
-    };
-    // Resolve load action: resident > guest/host seed > Clear black.
-    let mut load_uses_gpu_content = req.load_from_target;
-    // output_bgra (computed with the batch decision above): BGRA output only
-    // on the resident path (pooled targets stay RGBA); the whole
-    // pass/pipeline/image chain then agrees on B8G8R8A8 so a raw image→buffer
-    // copy lands guest scanout order with no CPU swizzle.
-    // The seed is borrowed from `req`, never copied to the heap. It is a whole
-    // frame, and `engine_delta` measures ~430 MB/s of seed uploads under a
-    // browser workload — so a `Vec` here is ~430 MB/s of memcpy plus ~240
-    // multi-MiB allocations a second on the drain worker that `drain_duty`
-    // shows pinned at duty 0.9+. The only thing that copy bought was a buffer
-    // the `output_bgra` arm could swizzle in place; that swizzle now happens
-    // during the single copy into the mapped staging span, so the pixels are
-    // touched once either way.
-    let seed_bytes: Option<&[u8]> = if load_uses_gpu_content {
-        None
-    } else {
-        req.target_rgba8.as_ref().map(|v| v.as_slice())
-    };
-    let mut pass_key = PassKey::single(
-        load_uses_gpu_content
-            || seed_bytes.is_some()
-            || req.target_guest_seed.is_some()
-            || req.seed_from_target.is_some(),
-        color0_format,
-    );
-    pass_key.host_accessible_color0 = req.guest_target_memory.is_some();
-    for (i, sec) in req.secondary_targets.iter().enumerate() {
-        if i >= MAX_SECONDARY_ATTACH {
-            return Err(DrawError::Unsupported(
-                super::reason::DrawReason::SecondaryAttachmentCap {
-                    requested: req.secondary_targets.len(),
-                    cap: MAX_SECONDARY_ATTACH,
-                },
-            ));
-        }
-        pass_key.secondary[i] = SecondaryAttachKey {
-            format: sec.format,
-            load: sec.load,
-        };
-    }
-    pass_key.secondary_count = req.secondary_targets.len() as u8;
-    pass_key.color_inputs = req.color_inputs;
-    for resource in &req.sampled_images {
-        if let Some(index) =
-            feedback_color_index(req, resource, ctx.features.attachment_feedback_loop_layout)
-        {
-            pass_key.feedback_colors |= 1u8 << index;
-        }
-    }
     // Depth is opt-in per draw (only a non-trivial MTLDepthStencilState reaches
     // here) and composes with MRT: the pass appends its attachment after the
     // secondaries, `clear_values` appends its clear after theirs, and the ad-hoc
@@ -3018,199 +3230,8 @@ pub(crate) unsafe fn execute_draw_inner(
             stencil: d.stencil.is_some(),
         });
     }
-    let raster_sample_count = req.raster_sample_count.max(1);
-    let color_sample_count = req.color_sample_count.max(1);
-    if color_sample_count != raster_sample_count {
-        return Err(DrawError::Unsupported(
-            super::reason::DrawReason::MultisampleAttachmentSampleCountMismatch {
-                attachment: color_sample_count,
-                raster: raster_sample_count,
-            },
-        ));
-    }
-    if req.multisample_resolve && raster_sample_count == 1 {
-        return Err(DrawError::Unsupported(
-            super::reason::DrawReason::MultisampleSampleCountUnsupported {
-                requested: raster_sample_count,
-                limit: ctx.features.max_sample_count,
-            },
-        ));
-    }
-    if raster_sample_count > 1 {
-        if !raster_sample_count.is_power_of_two()
-            || raster_sample_count > ctx.features.max_sample_count
-        {
-            return Err(DrawError::Unsupported(
-                super::reason::DrawReason::MultisampleSampleCountUnsupported {
-                    requested: raster_sample_count,
-                    limit: ctx.features.max_sample_count,
-                },
-            ));
-        }
-        if !req.secondary_targets.is_empty() || req.color_inputs != 0 {
-            return Err(DrawError::Unsupported(
-                super::reason::DrawReason::MultisampleResolveShapeUnsupported {
-                    color_targets: 1u32.saturating_add(req.secondary_targets.len() as u32),
-                    depth: req.depth.is_some(),
-                    color_input: req.color_inputs != 0,
-                },
-            ));
-        }
-        if !req.multisample_resolve {
-            if req.target_identity.is_none() {
-                return Err(DrawError::Unsupported(
-                    super::reason::DrawReason::MultisampleResidentTargetMissing {
-                        sample_count: raster_sample_count,
-                    },
-                ));
-            }
-            if !req.skip_readback
-                || req.target_rgba8.is_some()
-                || req.target_guest_seed.is_some()
-                || req.load_guest_target_backing
-            {
-                return Err(DrawError::Unsupported(
-                    super::reason::DrawReason::MultisampleLinearTransferUnsupported {
-                        sample_count: raster_sample_count,
-                    },
-                ));
-            }
-        }
-    }
-    pass_key.sample_count = raster_sample_count;
-    pass_key.multisample_resolve = req.multisample_resolve;
-    let attr_keys: Vec<AttrKey> = req
-        .vertex_attributes
-        .iter()
-        .map(|a| AttrKey {
-            location: a.location,
-            binding: a.binding,
-            format: a.format,
-            offset: a.offset,
-            stride: a.stride,
-            step_function: a.step_function,
-            step_rate: a.step_rate,
-        })
-        .collect();
-
-    phase.enter(super::draw_phase::Phase::PipelineShader);
-    let (vert_digest, vert_module) =
-        caches.get_or_create_shader_memoized(ctx, &req.vert_spirv, counters, pools)?;
-    let (frag_digest, frag_module) =
-        caches.get_or_create_shader_memoized(ctx, &req.frag_spirv, counters, pools)?;
     phase.enter(super::draw_phase::Phase::PipelineLayoutPass);
-    let (dsl, pipeline_layout) = caches.get_or_create_layout(ctx, &layout_key, counters, pools)?;
     let render_pass = caches.get_or_create_pass(ctx, pass_key, counters, pools)?;
-    phase.enter(super::draw_phase::Phase::Pipeline);
-    // How many viewport slots this draw rasterizes into, checked against the
-    // host before it is baked into a pipeline. Refused rather than clamped:
-    // clamping would silently drop the viewports past the host's limit, which
-    // is the loss this list was widened to stop, and a `viewportCount` above
-    // `maxViewports` — or above 1 without `multiViewport` — makes the pipeline
-    // invalid rather than merely unsupported.
-    let slot_count = super::viewport_slot_count(req);
-    let slot_count_u32 = u32::try_from(slot_count).unwrap_or(u32::MAX);
-    let max_slots = if ctx.features.multi_viewport {
-        ctx.features.max_viewports
-    } else {
-        1
-    };
-    if slot_count_u32 > max_slots {
-        return Err(DrawError::Unsupported(
-            super::reason::DrawReason::ViewportSlotsUnsupported {
-                requested: slot_count_u32,
-                limit: max_slots,
-                multi_viewport: ctx.features.multi_viewport,
-            },
-        ));
-    }
-    // Resolve the occlusion query before anything is recorded, so a host that
-    // cannot count refuses the draw rather than recording one it must throw
-    // away. `Boolean` needs nothing: an imprecise Vulkan occlusion query is
-    // that mode exactly.
-    let occlusion_flags = match req.occlusion_query {
-        None => None,
-        Some(VisibilityResultMode::Counting) if !ctx.features.occlusion_query_precise => {
-            return Err(DrawError::Unsupported(
-                super::reason::DrawReason::VisibilityCountingUnsupported {
-                    occlusion_query_precise: ctx.features.occlusion_query_precise,
-                },
-            ));
-        }
-        Some(mode) => Some(crate::backend::vulkan::translate::raster::vk_query_control_flags(mode)),
-    };
-    let pipeline_key =
-        PipelineKey {
-            vert: vert_digest,
-            frag: frag_digest,
-            attrs: attr_keys,
-            topology: req.primitive_topology,
-            blend: req.blend.map(|b| b.key()),
-            secondary_blend: {
-                let mut per_slot = [None; MAX_SECONDARY_ATTACH];
-                for (slot, target) in req
-                    .secondary_targets
-                    .iter()
-                    .take(MAX_SECONDARY_ATTACH)
-                    .enumerate()
-                {
-                    per_slot[slot] = target.blend.map(|b| b.key());
-                }
-                per_slot
-            },
-            color_write_mask: {
-                let mut per_slot = [ColorWriteMask::default(); 1 + MAX_SECONDARY_ATTACH];
-                per_slot[0] = req.color_write_mask;
-                for (slot, target) in req
-                    .secondary_targets
-                    .iter()
-                    .take(MAX_SECONDARY_ATTACH)
-                    .enumerate()
-                {
-                    per_slot[slot + 1] = target.color_write_mask;
-                }
-                per_slot
-            },
-            pass: pass_key.compatibility(),
-            // Taken from the pass key this draw built, not from `pass`, which
-            // erases it once feedback stops changing the render pass.
-            feedback_colors: pass_key.feedback_colors,
-            cull_mode: req.cull_mode,
-            front_face_ccw: req.front_face_ccw,
-            fill_mode: req.fill_mode,
-            depth_clip: req.depth_clip,
-            depth_test: req.depth.as_ref().map(|d| d.test_enable).unwrap_or(false),
-            depth_write: req.depth.as_ref().map(|d| d.write_enable).unwrap_or(false),
-            depth_compare: req
-                .depth
-                .as_ref()
-                .map(|d| d.compare)
-                .unwrap_or(super::types::SamplerCompareFunction::Always),
-            stencil: req.depth.as_ref().and_then(|d| d.stencil).map(|s| {
-                super::caches::StencilKey {
-                    front: s.front,
-                    back: s.back,
-                }
-            }),
-            viewport_slots: slot_count_u32,
-            layout: layout_key.clone(),
-        };
-    // One cache, consulted once. `get_or_create_pipeline` already counts the hit
-    // and already checks the negative entry for a key that failed to compile.
-    phase.enter(super::draw_phase::Phase::PipelineCompile);
-    let pipeline = caches.get_or_create_pipeline(
-        ctx,
-        &pipeline_key,
-        req.pipeline_object.as_ref(),
-        vert_module,
-        &req.vert_spirv,
-        frag_module,
-        &req.frag_spirv,
-        pipeline_layout,
-        render_pass,
-        counters,
-        pools,
-    )?;
 
     // Samplers
     phase.enter(super::draw_phase::Phase::PipelineSampler);
@@ -5838,7 +5859,7 @@ pub(crate) unsafe fn execute_draw_inner(
         counters
             .render_post_wait_skips
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        return Ok(DrawOutput {
+        return Ok(DrawAnswer::Drawn(DrawOutput {
             pixels: Vec::new(),
             storage_pixels: Vec::new(),
             target_guest_backed,
@@ -5851,7 +5872,7 @@ pub(crate) unsafe fn execute_draw_inner(
             // that exclusion is ever relaxed — a deferred draw genuinely has no
             // count yet.
             occlusion_samples: None,
-        });
+        }));
     }
 
     // Park the owed cleanup (descriptor set, transient pool slots, cache
@@ -5918,7 +5939,7 @@ pub(crate) unsafe fn execute_draw_inner(
     if readback.is_none() && !storage_readbacks.is_empty() {
         phase.enter(super::draw_phase::Phase::Wait);
         pools.wait_entry_fence(ctx, counters, fence)?;
-        return Ok(DrawOutput {
+        return Ok(DrawAnswer::Drawn(DrawOutput {
             pixels: Vec::new(),
             storage_pixels: read_storage(ctx)?,
             target_guest_backed,
@@ -5926,7 +5947,7 @@ pub(crate) unsafe fn execute_draw_inner(
             guest_store_footprint: guest_store_footprint.clone(),
             pixels_bgra: output_bgra,
             occlusion_samples: read_occlusion_samples(ctx, occlusion)?,
-        });
+        }));
     }
     let Some(ref rb) = readback else {
         // A queried draw has no pixels to read back and still cannot take this
@@ -5938,7 +5959,7 @@ pub(crate) unsafe fn execute_draw_inner(
         if occlusion.is_some() {
             phase.enter(super::draw_phase::Phase::Wait);
             pools.wait_entry_fence(ctx, counters, fence)?;
-            return Ok(DrawOutput {
+            return Ok(DrawAnswer::Drawn(DrawOutput {
                 pixels: Vec::new(),
                 storage_pixels: Vec::new(),
                 target_guest_backed,
@@ -5946,12 +5967,12 @@ pub(crate) unsafe fn execute_draw_inner(
                 guest_store_footprint: guest_store_footprint.clone(),
                 pixels_bgra: output_bgra,
                 occlusion_samples: read_occlusion_samples(ctx, occlusion)?,
-            });
+            }));
         }
         counters
             .render_post_wait_skips
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        return Ok(DrawOutput {
+        return Ok(DrawAnswer::Drawn(DrawOutput {
             pixels: Vec::new(),
             storage_pixels: Vec::new(),
             target_guest_backed,
@@ -5959,7 +5980,7 @@ pub(crate) unsafe fn execute_draw_inner(
             guest_store_footprint: guest_store_footprint.clone(),
             pixels_bgra: output_bgra,
             occlusion_samples: None,
-        });
+        }));
     };
 
     // Wait ONLY this draw's fence, not the whole ring. The readback copy is the
@@ -6000,7 +6021,7 @@ pub(crate) unsafe fn execute_draw_inner(
         output_bgra,
     )?;
 
-    Ok(DrawOutput {
+    Ok(DrawAnswer::Drawn(DrawOutput {
         pixels,
         storage_pixels: read_storage(ctx)?,
         target_guest_backed,
@@ -6008,7 +6029,7 @@ pub(crate) unsafe fn execute_draw_inner(
         guest_store_footprint,
         pixels_bgra,
         occlusion_samples: read_occlusion_samples(ctx, occlusion)?,
-    })
+    }))
 }
 
 /// Read the sample count a queried draw produced, and destroy its pool.

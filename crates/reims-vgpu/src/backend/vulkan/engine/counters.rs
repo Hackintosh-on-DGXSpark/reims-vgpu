@@ -245,6 +245,15 @@ engine_counters! {
         /// attached to this retained guest pipeline object's identity.
         pipeline_object_hits,
         pipeline_misses,
+        /// Draws answered `PipelinePending`: their pipeline was handed to the
+        /// compiler, or was already being compiled, and the draw ran nothing.
+        /// Each one runs again once its ticket is answered, so these are also
+        /// counted in `pipeline_misses` or `pipeline_flight_joins` and are not
+        /// lost draws.
+        pipeline_pending,
+        /// Asks for a pipeline the compiler was already building, answered
+        /// with that compile's ticket instead of a second compile.
+        pipeline_flight_joins,
         sampler_hits,
         sampler_misses,
 

@@ -2,13 +2,14 @@
 //!
 //! # The failure this exists for
 //!
-//! A shader compile inside `vkCreateGraphicsPipelines` runs on the drain thread,
-//! and the drain thread holds the device lock for the whole call. Nothing else
-//! takes that lock: every FIFO, every present, every doorbell the guest rings
-//! waits behind it. So a driver that does not come back does not degrade this
-//! device, it stops it — and it stops it in the one shape no census can report,
-//! because every census line in the crate is emitted at the *end* of a drain
-//! tranche that is never going to end.
+//! A driver call made on the drain thread — a shader module, a compute
+//! pipeline, and until graphics pipelines moved to their own compiler thread
+//! every `vkCreateGraphicsPipelines` too — holds the device lock for the whole
+//! call. Nothing else takes that lock: every FIFO, every present, every doorbell
+//! the guest rings waits behind it. So a driver that does not come back does not
+//! degrade this device, it stops it — and it stops it in the one shape no census
+//! can report, because every census line in the crate is emitted at the *end* of
+//! a drain tranche that is never going to end.
 //!
 //! That is not a hypothetical. A macOS 15 guest's CoreAnimation uber fragment
 //! shader reaches this device as a 1 MB SPIR-V module whose dispatch loop has
@@ -41,6 +42,15 @@
 //! already brackets exactly the calls that can end or hang the process. It
 //! writes the module to disk for the crash case; this watches the clock for the
 //! hang case. One arming, two failure modes.
+//!
+//! # One slot per thread that makes these calls
+//!
+//! Graphics pipelines are compiled on their own thread
+//! ([`crate::backend::vulkan::engine`]'s pipeline compiler), which holds no lock,
+//! while the drain thread still makes the shader-module and compute-pipeline
+//! calls itself. The two can be inside the driver at the same time, so each has
+//! its own [`WatchLane`]: one slot would let the second call go unwatched, and a
+//! shared line would blame the device lock for a compile that holds none.
 
 use std::sync::Mutex;
 use std::time::Instant;
@@ -64,6 +74,48 @@ pub const DRIVER_CALL_DEADLINE_S: u64 = 10;
 /// hour costs sixty lines.
 pub const DRIVER_CALL_REPORT_PERIOD_S: u64 = 60;
 
+/// The thread a watched driver call is running on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WatchLane {
+    /// The drain worker, which holds the device lock for the whole call.
+    Drain,
+    /// The pipeline compiler, which holds no lock.
+    Compiler,
+}
+
+impl WatchLane {
+    pub const ALL: [Self; 2] = [Self::Drain, Self::Compiler];
+
+    fn index(self) -> usize {
+        match self {
+            Self::Drain => 0,
+            Self::Compiler => 1,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Drain => "drain",
+            Self::Compiler => "compiler",
+        }
+    }
+
+    /// What a call that does not return costs the guest from this thread.
+    fn consequence(self) -> &'static str {
+        match self {
+            Self::Drain => {
+                "the drain thread holds the device lock inside this call, so no FIFO, present \
+                 or doorbell can make progress until it returns"
+            }
+            Self::Compiler => {
+                "the pipeline compiler holds no lock inside this call; the packet whose draw \
+                 needs this pipeline stays at its FIFO head, and the FIFOs held behind it with \
+                 it, until the call returns"
+            }
+        }
+    }
+}
+
 /// One outstanding call, and when it was last reported on.
 ///
 /// Kept as a plain struct with a pure [`Self::tick`] so the reporting rule is
@@ -71,6 +123,7 @@ pub const DRIVER_CALL_REPORT_PERIOD_S: u64 = 60;
 /// use, and for the same reason.
 #[derive(Debug)]
 struct Outstanding {
+    lane: WatchLane,
     what: String,
     started: Instant,
     /// Elapsed seconds at which the next line is due.
@@ -85,37 +138,42 @@ impl Outstanding {
         }
         self.next_report_s = elapsed_s.saturating_add(DRIVER_CALL_REPORT_PERIOD_S);
         Some(format!(
-            "driver_call reason=driver_call_outstanding what={} elapsed_s={elapsed_s} \
-             deadline_s={DRIVER_CALL_DEADLINE_S} (the drain thread holds the device lock \
-             inside this call, so no FIFO, present or doorbell can make progress until it \
-             returns)",
-            self.what
+            "driver_call reason=driver_call_outstanding lane={} what={} elapsed_s={elapsed_s} \
+             deadline_s={DRIVER_CALL_DEADLINE_S} ({})",
+            self.lane.name(),
+            self.what,
+            self.lane.consequence()
         ))
     }
 }
 
-/// The one slot. A single slot rather than a stack because the calls that arm it
-/// are leaf driver entry points that do not nest; [`enter`] declining to
-/// displace an existing owner is what keeps that assumption from silently
-/// becoming false.
-static OUTSTANDING: Mutex<Option<Outstanding>> = Mutex::new(None);
+/// One slot per lane. A single slot rather than a stack within a lane because
+/// the calls that arm it are leaf driver entry points that do not nest;
+/// [`enter`] declining to displace an existing owner is what keeps that
+/// assumption from silently becoming false.
+static OUTSTANDING: [Mutex<Option<Outstanding>>; WatchLane::ALL.len()] =
+    [Mutex::new(None), Mutex::new(None)];
 
-fn lock() -> std::sync::MutexGuard<'static, Option<Outstanding>> {
-    OUTSTANDING.lock().unwrap_or_else(|e| e.into_inner())
+fn lock(lane: WatchLane) -> std::sync::MutexGuard<'static, Option<Outstanding>> {
+    OUTSTANDING[lane.index()]
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
 }
 
-/// Start watching a driver call. Returns whether this caller owns the slot.
+/// Start watching a driver call on `lane`. Returns whether this caller owns
+/// the lane's slot.
 ///
 /// A caller that does not own it must not [`leave`]: an inner call clearing an
 /// outer one's entry would stop the watch on the very call whose duration
 /// covers both, which is the one that matters.
 #[must_use]
-pub fn enter(what: String) -> bool {
-    let mut slot = lock();
+pub fn enter(lane: WatchLane, what: String) -> bool {
+    let mut slot = lock(lane);
     if slot.is_some() {
         return false;
     }
     *slot = Some(Outstanding {
+        lane,
         what,
         started: Instant::now(),
         next_report_s: DRIVER_CALL_DEADLINE_S,
@@ -124,11 +182,11 @@ pub fn enter(what: String) -> bool {
 }
 
 /// The call returned. Only the owner from [`enter`] may call this.
-pub fn leave() {
-    *lock() = None;
+pub fn leave(lane: WatchLane) {
+    *lock(lane) = None;
 }
 
-/// What the device is inside right now, if anything.
+/// What `lane` is inside right now, if anything.
 ///
 /// The read side of the slot. The arming is one line inside
 /// [`crate::backend::vulkan::engine::driver_breadcrumb::DriverBreadcrumb::arm`]
@@ -136,27 +194,30 @@ pub fn leave() {
 /// modules has no test — and a lost arming is invisible exactly the way the
 /// wedge it reports is.
 #[must_use]
-pub fn watching() -> Option<String> {
-    lock().as_ref().map(|o| o.what.clone())
+pub fn watching(lane: WatchLane) -> Option<String> {
+    lock(lane).as_ref().map(|o| o.what.clone())
 }
 
-/// Emit a line if the outstanding call is past its deadline.
+/// Emit a line for every outstanding call past its deadline.
 ///
-/// Called from the device poll, which is not the stuck thread. Cheap enough for
-/// a display-timer cadence: one uncontended mutex and one `Instant::elapsed`.
+/// Called from the device poll, which is not a thread that makes these calls.
+/// Cheap enough for a display-timer cadence: one uncontended mutex and one
+/// `Instant::elapsed` per lane.
 pub fn note_tick() {
-    let line = {
-        let mut slot = lock();
-        match slot.as_mut() {
-            Some(o) => {
-                let elapsed_s = o.started.elapsed().as_secs();
-                o.tick(elapsed_s)
+    for lane in WatchLane::ALL {
+        let line = {
+            let mut slot = lock(lane);
+            match slot.as_mut() {
+                Some(o) => {
+                    let elapsed_s = o.started.elapsed().as_secs();
+                    o.tick(elapsed_s)
+                }
+                None => None,
             }
-            None => None,
+        };
+        if let Some(line) = line {
+            crate::observe::fail(line);
         }
-    };
-    if let Some(line) = line {
-        crate::observe::fail(line);
     }
 }
 
@@ -166,6 +227,7 @@ mod tests {
 
     fn outstanding(what: &str) -> Outstanding {
         Outstanding {
+            lane: WatchLane::Drain,
             what: what.to_string(),
             started: Instant::now(),
             next_report_s: DRIVER_CALL_DEADLINE_S,
@@ -229,15 +291,55 @@ mod tests {
     fn an_inner_call_does_not_displace_the_outer_one() {
         // Serialized against the other global-slot test by running the whole
         // suite with `--test-threads=1`, which this crate requires anyway.
-        leave();
-        assert!(enter("outer".into()), "an empty slot admits the first caller");
-        assert!(!enter("inner".into()), "a taken slot refuses the second");
+        let lane = WatchLane::Drain;
+        leave(lane);
+        assert!(enter(lane, "outer".into()), "an empty slot admits the first caller");
+        assert!(!enter(lane, "inner".into()), "a taken slot refuses the second");
         assert_eq!(
-            lock().as_ref().map(|o| o.what.clone()),
+            lock(lane).as_ref().map(|o| o.what.clone()),
             Some("outer".to_string()),
             "the slot still names the outer call"
         );
-        leave();
-        assert!(lock().is_none());
+        leave(lane);
+        assert!(lock(lane).is_none());
+    }
+
+    /// The drain thread and the pipeline compiler can each be inside the driver
+    /// at once. Each keeps its own slot, so neither call goes unwatched and
+    /// neither one's return stops the other's watch.
+    #[test]
+    fn the_two_lanes_watch_concurrent_calls_independently() {
+        for lane in WatchLane::ALL {
+            leave(lane);
+        }
+        assert!(enter(WatchLane::Compiler, "create_graphics_pipelines".into()));
+        assert!(
+            enter(WatchLane::Drain, "create_compute_pipelines".into()),
+            "a compile on the compiler lane must not refuse the drain's call"
+        );
+        assert_eq!(
+            watching(WatchLane::Compiler).as_deref(),
+            Some("create_graphics_pipelines")
+        );
+        leave(WatchLane::Drain);
+        assert_eq!(
+            watching(WatchLane::Compiler).as_deref(),
+            Some("create_graphics_pipelines"),
+            "the drain call returning must not stop the compiler's watch"
+        );
+        leave(WatchLane::Compiler);
+
+        let mut late = Outstanding {
+            lane: WatchLane::Compiler,
+            what: "create_graphics_pipelines".to_string(),
+            started: Instant::now(),
+            next_report_s: DRIVER_CALL_DEADLINE_S,
+        };
+        let line = late.tick(DRIVER_CALL_DEADLINE_S).expect("the deadline reports");
+        assert!(line.contains("lane=compiler"), "{line}");
+        assert!(
+            !line.contains("holds the device lock"),
+            "a compile off every lock must not be reported as holding one: {line}"
+        );
     }
 }

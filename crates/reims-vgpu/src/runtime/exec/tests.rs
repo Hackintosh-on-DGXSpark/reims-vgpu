@@ -15,6 +15,14 @@ use crate::runtime::decode::render::{
 };
 use crate::runtime::host::FakeHost;
 
+/// Where the tests that call `process_exec_indirect2` directly say their packet
+/// sits. None of them stops at a pipeline, so the slot is only a name.
+const TEST_SLOT: ExecSlot = ExecSlot {
+    channel: 1,
+    next_head: 0,
+    completion_stamp: 0,
+};
+
 #[test]
 fn render_pass_chain_edges_follow_the_decoded_encoder() {
     assert_eq!(render_pass_chain_position(0, 1), (false, false));
@@ -63,7 +71,7 @@ fn chain_abandon_reports_how_many_draws_were_lost() {
 fn short_payload_noop() {
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
-    let r = process_exec_indirect2(&mut state, &mut host, &[0u8; 4]);
+    let r = process_exec_indirect2(&mut state, &mut host, TEST_SLOT, &[0u8; 4]);
     assert_eq!(r.streams_loaded, 0);
 }
 
@@ -96,7 +104,7 @@ fn an_exec_packet_naming_a_dead_slot_is_refused_not_aimed_at_its_neighbour() {
     st32(&mut payload[CHILD_EXEC_INDIRECT_TASK_ID as usize..], 6);
     st32(&mut payload[CHILD_EXEC_INDIRECT_CMDBUF_COUNT as usize..], 1);
 
-    let r = process_exec_indirect2(&mut state, &mut host, &payload);
+    let r = process_exec_indirect2(&mut state, &mut host, TEST_SLOT, &payload);
     assert_eq!(
         r.task_id, 6,
         "the refusal must name the word the guest sent, not the slot we \
@@ -167,7 +175,7 @@ fn a_resource_record_that_populates_its_unrecovered_tail_says_so() {
     );
 
     let cap = crate::observe::sink::FailCapture::start();
-    let r = process_exec_indirect2(&mut state, &mut host, &payload);
+    let r = process_exec_indirect2(&mut state, &mut host, TEST_SLOT, &payload);
     assert_eq!(r.task_id, 3);
     assert_eq!(r.streams_loaded, 0, "no page table backs the cmdbuf gva");
     let line = cap.one("exec_res_table");
@@ -4451,7 +4459,7 @@ fn every_declared_command_buffer_is_visited_not_just_the_first_sixteen() {
     }
 
     let cap = crate::observe::sink::FailCapture::start();
-    let r = process_exec_indirect2(&mut state, &mut host, &payload);
+    let r = process_exec_indirect2(&mut state, &mut host, TEST_SLOT, &payload);
     assert_eq!(r.task_id, 3);
     let visited: Vec<String> = cap
         .lines()

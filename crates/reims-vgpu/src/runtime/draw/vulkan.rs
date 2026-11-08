@@ -382,6 +382,11 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                     }
                 }
             }
+            Ok(M2vDrawSpan::PipelinePending) => {
+                // Before any Store routing below: there is nothing to store, and
+                // the caller keeps this record for when its pipeline is ready.
+                return (EncodeStatus::PipelinePending, None);
+            }
             Ok(M2vDrawSpan::None) => {
                 crate::observe::line(format!(
                     "linux_m2v_draw skip pipe={} (no color0 geom)",
@@ -6026,6 +6031,9 @@ pub(crate) fn host_cache_store_gva_layer<M: HostMemory + HostOps>(
 enum M2vDrawSpan {
     /// No drawable color0 geom.
     None,
+    /// Nothing ran: the pipeline is still being built and the ticket to wait
+    /// on is in the request's `pipeline_wait`.
+    PipelinePending,
     /// CPU-side pixels (readback path), in the order the engine reports.
     ///
     /// The order is carried rather than normalized because a type-11 composite
@@ -9033,7 +9041,17 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // the boundary below names the engine's specific check as the primary
         // `reason=` rather than flattening it into a `vk_engine: {e}` blob.
         crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Engine);
-        let out = crate::backend::vulkan::engine::execute_draw_request(&resources)?;
+        resources.pipeline_wait = req.pipeline_wait.take();
+        let out = match crate::backend::vulkan::engine::execute_draw_request(&resources)? {
+            crate::backend::vulkan::engine::DrawAnswer::Drawn(out) => out,
+            // Nothing ran: the engine stopped before claiming, acquiring or
+            // recording anything, and everything above this line only read
+            // state, so the caller runs this draw again from the top later.
+            crate::backend::vulkan::engine::DrawAnswer::PipelinePending(ticket) => {
+                req.pipeline_wait = Some(ticket);
+                return Ok(M2vDrawSpan::PipelinePending);
+            }
+        };
         // Carried back on the request so `runtime::exec` can sum the chain's
         // draws into the guest's buffer. The engine reports per draw because a
         // Metal pass whose counter spans several draws is several Vulkan

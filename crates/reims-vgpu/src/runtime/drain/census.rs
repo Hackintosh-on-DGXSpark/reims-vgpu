@@ -2802,6 +2802,13 @@ pub fn note_drain_tranche(drain_us: u64, publish_us: u64) {
         if let Some(exec) = DRAIN_DUTY.take_exec_phases() {
             crate::observe::off(exec);
         }
+        // Also under `exec_phase`: the packets that stopped at a draw waiting for
+        // its pipeline, and how long the longest of them held every FIFO.
+        if let Some(wait) =
+            crate::runtime::exec::take_pipeline_wait_census(DRAIN_DUTY.last_window_ms())
+        {
+            crate::observe::off(wait);
+        }
         // Under `exec_phase`, dividing its `preflight_us`.
         if let Some(pre) = DRAIN_DUTY.take_preflight_parts() {
             crate::observe::off(pre);
@@ -3206,7 +3213,7 @@ fn emit_draw_phase() {
          descriptors_us={} \
          record_us={} rec_begin_us={} rec_barrier_us={} rec_pass_us={} rec_state_us={} \
          rec_draw_us={} submit_us={} post_target_us={} post_store_us={} post_sampled_us={} \
-         post_park_us={} wait_us={} readback_us={} max_us={} stalls={}",
+         post_park_us={} wait_us={} readback_us={} max_us={} stalls={} pl_pending={}",
         w.draws,
         w.prep_us,
         w.slot_us,
@@ -3243,6 +3250,7 @@ fn emit_draw_phase() {
         w.readback_us,
         w.max_us,
         w.stalls,
+        w.pending,
     ));
     emit_stage_phase();
     emit_gather_phase();
@@ -3398,6 +3406,12 @@ fn emit_object_cache_levels() {}
 #[cfg(feature = "backend-vulkan")]
 fn emit_engine_lock(win_ms: u64) {
     if let Some(line) = crate::backend::vulkan::engine::take_engine_lock_census(win_ms) {
+        crate::observe::off(line);
+    }
+    // Beside the engine lock it used to hold: the graphics compile time this
+    // window spent on the compiler thread instead, and the compute compiles
+    // still made under it.
+    if let Some(line) = crate::backend::vulkan::engine::take_pipeline_compile_census(win_ms) {
         crate::observe::off(line);
     }
 }
