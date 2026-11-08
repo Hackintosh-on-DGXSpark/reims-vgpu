@@ -1770,12 +1770,14 @@ mod tests {
         assert!(sampled_pixels(p::MTL_FORMAT_R8_UNORM).is_ok());
         // `R8_UNORM` is renderable as of the macos-26 coverage-layer reading, so
         // the "sampled but not a colour attachment" case is carried by a format
-        // that still is one. `R32_FLOAT` has a sampled layout (the colour-LUT
-        // rail) and no render-target width, which is the pair this asserts:
-        // having a layout is not being a colour attachment.
+        // that still is one. `R32_FLOAT` carried it until macOS 26 and 27 were
+        // seen attaching one; `RG8_UNORM` has a sampled layout and no
+        // render-target width, which is the pair this asserts: having a layout
+        // is not being a colour attachment.
+        assert!(sampled_pixels(p::MTL_FORMAT_RG8_UNORM).is_ok());
         assert_eq!(
-            color_attachment(p::MTL_FORMAT_R32_FLOAT).unwrap_err(),
-            TranslateReason::NoColorAttachmentFormat(p::MTL_FORMAT_R32_FLOAT)
+            color_attachment(p::MTL_FORMAT_RG8_UNORM).unwrap_err(),
+            TranslateReason::NoColorAttachmentFormat(p::MTL_FORMAT_RG8_UNORM)
         );
         assert_eq!(
             color_attachment(0xffff).unwrap_err(),
@@ -1977,6 +1979,11 @@ mod tests {
                 // one-byte texel had never been a render target here.
                 p::MTL_FORMAT_R8_UNORM,
                 p::MTL_FORMAT_R16_FLOAT,
+                // The single-channel float32 attachment macOS 26 and 27 put
+                // beside a window pass's colour target, memoryless. Required as
+                // a colour attachment, its blending is not, so the draw asks
+                // the host.
+                p::MTL_FORMAT_R32_FLOAT,
                 p::MTL_FORMAT_RG16_FLOAT,
                 p::MTL_FORMAT_RGBA8_UNORM,
                 p::MTL_FORMAT_RGBA8_UNORM_SRGB,

@@ -10172,9 +10172,11 @@ pub(crate) fn gva_chain_identity(
 /// colour attachment be this format at all. The attachment image is created at
 /// that answer, so the host half is asked here, before anything is created:
 /// Vulkan leaves colour-attachment support optional for some renderable
-/// formats, and `A2R10G10B10_UNORM_PACK32` (`BGR10A2Unorm`) is one. A host that
-/// published no such support refuses the pass by name instead of being handed
-/// an image it cannot render to.
+/// formats, and `A2R10G10B10_UNORM_PACK32` (`BGR10A2Unorm`) is one; blending
+/// into `R32_SFLOAT` (`R32Float`) is optional too, and the probe behind this
+/// asks for attachment and blend together. A host that published no such
+/// support refuses the pass by name instead of being handed an image it cannot
+/// render to.
 fn host_color_attachment(
     format: u16,
 ) -> Result<(ash::vk::Format, Option<translate::TranslateReason>), translate::TranslateReason> {
