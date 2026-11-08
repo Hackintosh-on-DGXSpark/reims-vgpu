@@ -1033,11 +1033,18 @@ pub(crate) fn load_compute_pipeline<M: HostMemory + HostOps>(
                 return None;
             }
         };
-    let Ok(decoded) = decode_type7_descriptor(&desc) else {
-        return miss(
-            crate::observe::ladder_slug!("", desc_decode),
-            format!("desc_len={}", desc.len()),
-        );
+    let decoded = match decode_type7_descriptor(&desc) {
+        Ok(decoded) => decoded,
+        Err(status) => {
+            return miss(
+                crate::observe::ladder_slug!("", desc_decode),
+                format!(
+                    "desc_len={} decode={}",
+                    desc.len(),
+                    crate::observe::Decline::slug(&status)
+                ),
+            )
+        }
     };
     match decoded {
         ResourceDescriptor::ComputePipeline(cp) if cp.kernel_func_ref != 0 => {
