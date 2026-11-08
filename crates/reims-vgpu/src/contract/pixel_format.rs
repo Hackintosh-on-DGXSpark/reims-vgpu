@@ -1346,13 +1346,11 @@ pub fn render_target_bpp(format: u16) -> Option<u32> {
 /// requires an admitted format to have a [`sampled_class`] naming the same
 /// texel, and `RG16_FLOAT` has none.
 ///
-/// The packed ten-bit pair is here for more than speed. A type-11 surface's
-/// resident identity takes its format from this answer
-/// (`present_identity::surface_format`), while the attachment image is created
-/// at the format the pass declares; a `BGR10A2Unorm` surface answered `None`
-/// would claim a BGRA8 resident over an `A2R10G10B10` image, and the next
-/// pass sampling that surface would bind a view of the wrong texel. Both words
-/// are their Vulkan twins bit for bit, so the copy is exact.
+/// The packed ten-bit pair is here because both words are their Vulkan twins
+/// bit for bit, so the copy is exact and keeps all ten bits. A type-11
+/// surface's resident identity does not ask this function: it names the image
+/// its colour attachment is created in (`present_identity::surface_format`),
+/// whether or not a byte copy can land it.
 ///
 /// sRGB folds onto its linear sibling for the same reason [`sampled_class`]
 /// folds it: the qualifier describes how a sampler interprets the bytes, not

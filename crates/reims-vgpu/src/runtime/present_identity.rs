@@ -29,19 +29,31 @@ use ash::vk;
 /// The image format a resident for this mapping is created with.
 ///
 /// The guest's own declaration, taken from the single place the writeback also
-/// reads it. A declaration with no linear Vulkan texel — a compressed or planar
-/// plane, which nothing renders into — falls back to guest scanout order, which
-/// is what this namespace answered for every mapping before it could answer at
-/// all; the GPU writeback rail then refuses that pair by name and the copying
-/// rail converts, exactly as it did.
+/// reads it, and folded onto the allocation a colour attachment of that format
+/// is created in — `draw::vulkan::gva_resident_format`'s rule, for the same
+/// reason. The attachment image follows the pass's declared format, so an
+/// identity that names any other format describes an image that does not exist:
+/// this used to ask `store_texel_order`, which answers only for the byte-copy
+/// formats, and every other renderable surface (`R8Unorm`, `R16Float`,
+/// `RG16Float`, `RG16Uint`, `RG32Float`, `R32Float`) claimed a BGRA8 resident
+/// over an image of its own width, and a pass sampling the surface bound a
+/// BGRA8 view of it.
+///
+/// A declaration this device does not render — a compressed or planar plane —
+/// falls back to guest scanout order, which is what this namespace answered for
+/// every mapping before it could answer at all; the GPU writeback rail then
+/// refuses that pair by name and the copying rail converts, exactly as it did.
+/// No capability is asked here: a host that cannot render the format refuses
+/// the pass before any image is created (`host_color_attachment`).
 fn surface_format(state: &DeviceState, mapping_id: u32) -> vk::Format {
+    use crate::backend::vulkan::translate::pixel;
     state
         .mappings
         .get(&mapping_id)
         .map(crate::runtime::mapping_write::mapping_store_format)
-        .and_then(crate::contract::pixel_format::store_texel_order)
-        .map(crate::backend::vulkan::translate::pixel::vk_texel_layout)
-        .unwrap_or(crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT)
+        .and_then(|format| pixel::color_attachment(format).ok())
+        .map(|(attachment, _)| pixel::ResidentFormat::of(attachment).allocation())
+        .unwrap_or(pixel::SCANOUT_FORMAT)
 }
 
 pub fn surface_identity(
@@ -181,6 +193,56 @@ mod tests {
         assert_eq!(
             surface_identity(&state, 999, 64, 32).resident_format(),
             SCANOUT_FORMAT
+        );
+    }
+
+    /// A surface the guest renders into names the image its attachment is
+    /// created in, for every renderable format and not only the byte-copy ones.
+    ///
+    /// The attachment image follows `color_attachment`; the identity used to
+    /// follow `store_texel_order`, which answers for fewer formats. An
+    /// `R32Float` surface therefore claimed a BGRA8 resident over an
+    /// `R32_SFLOAT` image, and a later pass sampling it bound a BGRA8 view.
+    #[test]
+    fn a_rendered_surface_names_the_image_its_attachment_is_created_in() {
+        use crate::backend::vulkan::translate::pixel;
+        use crate::contract::pixel_format::{
+            render_target_bpp, MTL_FORMAT_BGRA8_UNORM_SRGB, MTL_FORMAT_R32_FLOAT,
+        };
+
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        assert!(state.map_surface(7));
+        let mut renderable = 0;
+        for format in 1..=u16::MAX {
+            let Ok((attachment, _)) = pixel::color_attachment(format) else {
+                continue;
+            };
+            assert!(render_target_bpp(format).is_some(), "{format:#x}");
+            renderable += 1;
+            {
+                let m = state.mappings.get_mut(&7).unwrap();
+                m.has_geom = true;
+                m.width = 64;
+                m.height = 32;
+                m.format = format;
+            }
+            assert_eq!(
+                surface_identity(&state, 7, 64, 32).resident_format(),
+                pixel::ResidentFormat::of(attachment).allocation(),
+                "{format:#x}"
+            );
+        }
+        assert!(renderable > 10, "the sweep must reach the renderable set");
+
+        let declare = |state: &mut DeviceState, format: u16| {
+            state.mappings.get_mut(&7).unwrap().format = format;
+            surface_identity(state, 7, 64, 32).resident_format()
+        };
+        assert_eq!(declare(&mut state, MTL_FORMAT_R32_FLOAT), vk::Format::R32_SFLOAT);
+        // sRGB still folds onto the allocation it shares with its linear sibling.
+        assert_eq!(
+            declare(&mut state, MTL_FORMAT_BGRA8_UNORM_SRGB),
+            pixel::SCANOUT_FORMAT
         );
     }
 
