@@ -728,9 +728,6 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
     if let Some(import) = retired_import {
         state.retired_guest_imports.push(import);
     }
-    // A rebind seen for a quarantined id is confirmed only by adopting a table
-    // other than the quarantined one; see `runtime::surface_quarantine`.
-    crate::runtime::surface_quarantine::confirm_new_backing(state, mapping_id);
     if incarnation_changed {
         // The condemned backing really died and the id now carries a new
         // surface: drop the prior incarnation's deferred windows before any
@@ -775,6 +772,11 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
     if pages_changed && !surface_pages_are_exclusively_owned(state, mapping_id, "rewire") {
         return false;
     }
+    // Only now, with the adopted table past every check above: a quarantined id
+    // whose new backing is proven lifts here, and a table that failed a check
+    // returned before it could lift anything or drop its frame. See
+    // `runtime::surface_quarantine::confirm_new_backing`.
+    crate::runtime::surface_quarantine::confirm_new_backing(state, mapping_id);
     // Resolved: re-arm the fail latch so a later genuine failure (a re-map that
     // goes bad, a corrupted descriptor) is logged again rather than swallowed.
     clear_resolve_fail(mapping_id);

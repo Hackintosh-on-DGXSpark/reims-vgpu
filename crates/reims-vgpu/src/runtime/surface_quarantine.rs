@@ -22,11 +22,11 @@
 //! ledger and are not written: the collision alone does not say whose they are.
 //!
 //! A quarantine is lifted only by protocol evidence about that mapping itself:
-//! its UNMAP, or a new MAP or MappingInternal for its id *followed by* a resolve
-//! that adopts a page table different from the one it was quarantined with. A
-//! MAP notification alone is not that: it can trail the resolve that already
-//! adopted the stale table, and a delete that only condemns the table can be
-//! reprieved by re-reading it.
+//! its UNMAP, or a new MappingInternal incarnation for its id whose table, once
+//! adopted and past every check, shares no valid page with the quarantined one.
+//! A MAP notification is not that: it can trail the resolve that already adopted
+//! the stale table. Neither is any change to the table, nor a delete that only
+//! condemns it, which a reprieve re-reads.
 //! A partner's release is not such evidence: it says the partner no longer owns
 //! the pages, not that this mapping owns them again — the stale side of a
 //! collision whose new surfaces are later unmapped stays quarantined. Re-reading
@@ -254,18 +254,28 @@ pub fn note_rebind(state: &mut DeviceState, mapping_id: u32, what: &'static str)
     else {
         return;
     };
-    if q.rebind_seen.is_none() {
+    // A new MappingInternal outranks a MAP: it is the one that can confirm.
+    if q.rebind_seen.is_none() || what == "new_internal" {
         q.rebind_seen = Some(what);
         crate::observe::fail(format!(
             "surface_quarantine_rebind_seen mid={mapping_id} evidence={what} (held until a \
-             resolve adopts a page table other than the quarantined one)"
+             resolve adopts a new MappingInternal's table that shares no valid page with the \
+             quarantined one)"
         ));
     }
 }
 
-/// A resolve has just adopted `mapping_id`'s page table. If a rebind was seen
-/// and the table is not the one quarantined, the guest has given the id a new
-/// backing: lift. The same table re-announced lifts nothing.
+/// A resolve has just adopted `mapping_id`'s page table and passed every check
+/// on it. The quarantine lifts only for a new backing incarnation: a new
+/// MappingInternal for the id since the quarantine, whose table has valid
+/// pages and shares none with the quarantined table's.
+///
+/// A table merely different is not that. A late MAP re-announces the stale
+/// table; filling a hole, shortening the list or changing an invalid entry
+/// keeps the old pages; and one changed page says nothing about the rest of a
+/// window whose pages the guest may already have given away. Without the
+/// stronger signal the mapping stays quarantined: refusing a write costs a
+/// frame, and a wrong lift costs guest memory.
 pub fn confirm_new_backing(state: &mut DeviceState, mapping_id: u32) {
     let Some(m) = state.mappings.get(&mapping_id) else {
         return;
@@ -273,20 +283,22 @@ pub fn confirm_new_backing(state: &mut DeviceState, mapping_id: u32) {
     let Some(q) = m.quarantine.as_ref() else {
         return;
     };
-    let Some(what) = q.rebind_seen else {
-        return;
-    };
-    if m.page_entries.is_empty() || m.page_entries == q.entries {
+    if q.rebind_seen != Some("new_internal") {
         return;
     }
-    lift(
-        state,
-        mapping_id,
-        match what {
-            "new_internal" => "new_internal_new_backing",
-            _ => "map_new_backing",
-        },
-    );
+    let shift = state.page_shift;
+    let valid = |entries: &[u32]| -> std::collections::BTreeSet<u64> {
+        entries
+            .iter()
+            .filter_map(|&e| crate::contract::iosurface_pages::entry_gpa_shift(e, shift))
+            .collect()
+    };
+    let (old, new) = (valid(&q.entries), valid(&m.page_entries));
+    if new.is_empty() || !old.is_disjoint(&new) {
+        crate::runtime::drain::note_store_route("surface_quarantine_rebind_rejected");
+        return;
+    }
+    lift(state, mapping_id, "new_internal_disjoint_backing");
 }
 
 /// What a payment whose store wrote nothing owes afterwards.

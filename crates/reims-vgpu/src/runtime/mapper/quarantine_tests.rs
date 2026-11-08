@@ -191,11 +191,14 @@ fn each_side_is_lifted_only_by_its_own_lifecycle() {
 
     assert!(state.map_surface(NEW));
     assert!(is_quarantined(&state, NEW), "a MAP alone lifts nothing");
-    // What a resolve does after adopting a table: the same one lifts nothing,
-    // another one does.
-    state.mappings.get_mut(&NEW).unwrap().page_entries = vec![entry(P1)];
+    // What a resolve does once a table passed its checks: after a MAP only,
+    // even a different table lifts nothing.
+    state.mappings.get_mut(&NEW).unwrap().page_entries = vec![entry(P0)];
     crate::runtime::surface_quarantine::confirm_new_backing(&mut state, NEW);
-    assert!(is_quarantined(&state, NEW), "the quarantined table again");
+    assert!(is_quarantined(&state, NEW), "a MAP and a changed table");
+    // A new MappingInternal whose table shares no page with the quarantined
+    // one is a new backing.
+    assert!(state.attach_mapping_internal(NEW, 2));
     state.mappings.get_mut(&NEW).unwrap().page_entries = vec![entry(P0)];
     crate::runtime::surface_quarantine::confirm_new_backing(&mut state, NEW);
     assert!(!is_quarantined(&state, NEW));
@@ -268,92 +271,168 @@ mod through_resolve {
     };
     use crate::model::{PAGE_SHIFT_ARM64E, PAGE_SIZE_ARM64E};
 
+    /// MappingInternal objects, each with its page object and table, one per
+    /// 64 KiB of this kernel range.
     const KVA: u64 = 0xfffffe00_2000_0000;
-    const TABLE: u64 = KVA + 0x3000;
+    const MAPPER: u64 = KVA - 0x1000;
     const A: u32 = 0x3_1000;
     const B: u32 = 0x3_2000;
+    const C: u32 = 0x3_3000;
+    const D: u32 = 0x3_4000;
+    const E: u32 = 0x3_5000;
+    /// An entry with no valid bit, which the table holds for an unwired page.
+    const HOLE: u32 = 0;
 
     fn put(host: &mut FakeHost, at: u64, bytes: &[u8]) {
         host.map_range(at, bytes.len(), 0);
         host.write_gpa(at, bytes).unwrap();
     }
 
-    fn entry16(pfn: u32) -> u32 {
+    fn e(pfn: u32) -> u32 {
         (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID
     }
 
-    /// Mapping `OLD` with a MappingInternal whose one-page table names `A`.
-    fn resolvable() -> (FakeHost, DeviceState) {
-        let mut host = FakeHost::new();
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        let (internal, mapper, page_obj) = (KVA, KVA + 0x1000, KVA + 0x2000);
+    fn gpa(pfn: u32) -> u64 {
+        u64::from(pfn) << PAGE_SHIFT_ARM64E
+    }
+
+    /// Write MappingInternal number `n` for `OLD` with this table.
+    fn internal(host: &mut FakeHost, n: u64, entries: &[u32]) -> u64 {
+        let base = KVA + n * 0x1_0000;
+        let (page_obj, table) = (base + 0x2000, base + 0x3000);
+        put(host, base + MAPPING_INTERNAL_BACKPTR, &MAPPER.to_le_bytes());
+        put(host, base + MAPPING_INTERNAL_ID, &OLD.to_le_bytes());
         put(
-            &mut host,
-            internal + MAPPING_INTERNAL_BACKPTR,
-            &mapper.to_le_bytes(),
-        );
-        put(
-            &mut host,
-            internal + MAPPING_INTERNAL_ID,
-            &OLD.to_le_bytes(),
-        );
-        put(
-            &mut host,
-            internal + MAPPING_INTERNAL_SIZE,
+            host,
+            base + MAPPING_INTERNAL_SIZE,
             &MAPPING_INTERNAL_EXPECTED_SIZE.to_le_bytes(),
         );
         put(
-            &mut host,
-            internal + MAPPING_INTERNAL_PAGE_FIELD_48,
+            host,
+            base + MAPPING_INTERNAL_PAGE_FIELD_48,
             &page_obj.to_le_bytes(),
         );
         put(
-            &mut host,
-            internal + MAPPING_INTERNAL_PAGE_COUNT,
-            &1u64.to_le_bytes(),
+            host,
+            base + MAPPING_INTERNAL_PAGE_COUNT,
+            &(entries.len() as u64).to_le_bytes(),
         );
         put(
-            &mut host,
+            host,
             page_obj + MAPPING_PAGE_TABLE_FROM_F48,
-            &TABLE.to_le_bytes(),
+            &table.to_le_bytes(),
         );
-        put(&mut host, TABLE, &entry16(A).to_le_bytes());
-        for pfn in [A, B] {
-            host.map_range(
-                u64::from(pfn) << PAGE_SHIFT_ARM64E,
-                PAGE_SIZE_ARM64E as usize,
-                0,
-            );
+        let bytes: Vec<u8> = entries.iter().flat_map(|e| e.to_le_bytes()).collect();
+        put(host, table, &bytes);
+        base
+    }
+
+    /// `OLD` resolved from MappingInternal 0 with `first`, owing a frame, then
+    /// quarantined by `NEW` claiming `A`.
+    fn quarantined(first: &[u32]) -> (FakeHost, DeviceState) {
+        let mut host = FakeHost::new();
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        for pfn in [A, B, C, D, E] {
+            host.map_range(gpa(pfn), PAGE_SIZE_ARM64E as usize, 0);
         }
-        state.mapper_device_kva = mapper;
-        assert!(state.attach_mapping_internal(OLD, internal));
+        let base = internal(&mut host, 0, first);
+        state.mapper_device_kva = MAPPER;
+        assert!(state.attach_mapping_internal(OLD, base));
         assert!(resolve_mapping_backing(&mut state, &host, OLD));
+        assert_eq!(state.mappings[&OLD].page_entries, first);
+        owe_a_frame(&mut state, OLD);
+        state.map_surface(NEW);
+        state.mappings.get_mut(&NEW).unwrap().page_entries = vec![e(A)];
+        fail_closed_surface_page_collision(&mut state, NEW, gpa(A), OLD, 1, "rewire");
+        assert!(is_quarantined(&state, OLD));
         (host, state)
     }
 
-    /// The 27 sequence with a MAP for the old id: the MAP arms nothing but a
-    /// re-check, the resolve that re-reads the same stale table keeps the
-    /// quarantine, and only a resolve adopting a different table lifts it.
-    #[test]
-    fn a_map_with_the_same_stale_table_lifts_nothing_and_a_new_table_does() {
-        let (mut host, mut state) = resolvable();
-        let gpa = u64::from(A) << PAGE_SHIFT_ARM64E;
-        state.map_surface(NEW);
-        state.mappings.get_mut(&NEW).unwrap().page_entries = vec![entry16(A)];
-        fail_closed_surface_page_collision(&mut state, NEW, gpa, OLD, 1, "rewire");
-        assert!(is_quarantined(&state, OLD));
+    /// Give `OLD` MappingInternal `n` with `entries` and resolve it.
+    fn rebind(host: &mut FakeHost, state: &mut DeviceState, n: u64, entries: &[u32]) -> bool {
+        let base = internal(host, n, entries);
+        assert!(state.attach_mapping_internal(OLD, base));
+        resolve_mapping_backing(state, host, OLD)
+    }
 
+    /// A MAP re-announcing the stale table, and a MAP followed by a different
+    /// table on the same MappingInternal, lift nothing.
+    #[test]
+    fn a_map_lifts_nothing_whatever_table_follows() {
+        let (mut host, mut state) = quarantined(&[e(A)]);
         assert!(state.map_surface(OLD));
         let _ = resolve_mapping_backing(&mut state, &host, OLD);
-        assert_eq!(state.mappings[&OLD].page_entries, vec![entry16(A)]);
+        assert!(is_quarantined(&state, OLD), "the same stale table");
+
+        let table = KVA + 0x3000;
+        put(&mut host, table, &e(B).to_le_bytes());
+        assert!(resolve_mapping_backing(&mut state, &host, OLD));
+        assert_eq!(state.mappings[&OLD].page_entries, vec![e(B)]);
         assert!(
             is_quarantined(&state, OLD),
-            "the same stale table re-announced"
+            "a different table, no new backing"
         );
+        assert!(state.pending_writebacks.get(OLD).is_some());
+    }
 
-        put(&mut host, TABLE, &entry16(B).to_le_bytes());
-        assert!(resolve_mapping_backing(&mut state, &host, OLD));
-        assert_eq!(state.mappings[&OLD].page_entries, vec![entry16(B)]);
-        assert!(!is_quarantined(&state, OLD), "a new backing");
+    /// A new MappingInternal whose table only fills a hole, shortens the list
+    /// or changes an invalid entry keeps the old pages, and lifts nothing,
+    /// after a late MAP or not.
+    #[test]
+    fn hole_fill_shortening_and_invalid_changes_do_not_lift() {
+        let first = [e(A), HOLE, e(B)];
+        for (n, candidate) in [
+            (1, vec![e(A), e(C), e(B)]),
+            (2, vec![e(A), HOLE]),
+            (3, vec![e(A), C << PAGE_ENTRY_PFN_SHIFT, e(B)]),
+            (4, vec![e(A), HOLE, e(D)]),
+        ] {
+            let (mut host, mut state) = quarantined(&first);
+            assert!(state.map_surface(OLD), "a late MAP first");
+            let _ = rebind(&mut host, &mut state, n, &candidate);
+            assert!(
+                is_quarantined(&state, OLD),
+                "candidate {candidate:x?} keeps an old page"
+            );
+            assert!(state.pending_writebacks.get(OLD).is_some());
+        }
+    }
+
+    /// A new table that shares no page with the old one but collides with
+    /// another live mapping fails its resolve before anything is lifted: the
+    /// quarantine, its frame, and the guest's pages are all as they were.
+    #[test]
+    fn a_new_table_that_collides_again_lifts_nothing_and_keeps_the_frame() {
+        let (mut host, mut state) = quarantined(&[e(A)]);
+        // The new surface has since resolved and holds C as well.
+        state.mappings.get_mut(&NEW).unwrap().page_entries = vec![e(A), e(C)];
+        let epoch = state.host_writes.epoch();
+        let cap = crate::observe::sink::FailCapture::start();
+
+        assert!(!rebind(&mut host, &mut state, 1, &[e(C)]));
+        assert!(is_quarantined(&state, OLD));
+        assert!(
+            state.pending_writebacks.get(OLD).is_some(),
+            "the frame is still owed"
+        );
+        assert!(!cap
+            .lines()
+            .iter()
+            .any(|l| l.contains("surface_quarantine_lifted mid=2")));
+        assert_eq!(
+            state.host_writes.wrote_any_since(epoch, &[gpa(A), gpa(C)]),
+            HostWriteVerdict::Quiet
+        );
+    }
+
+    /// The evidence that does lift: a new MappingInternal whose table shares
+    /// no page with the quarantined one and passes every check. The old frame
+    /// is dropped unwritten.
+    #[test]
+    fn a_new_internal_with_disjoint_pages_lifts_and_drops_the_old_frame() {
+        let (mut host, mut state) = quarantined(&[e(A), HOLE, e(B)]);
+        assert!(rebind(&mut host, &mut state, 1, &[e(D), e(E)]));
+        assert!(!is_quarantined(&state, OLD));
+        assert!(state.pending_writebacks.get(OLD).is_none());
     }
 }
