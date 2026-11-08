@@ -87,6 +87,19 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
     // ever reaches the pipeline scissor rect, never the Store extent.
     _force_full_store: bool,
 ) -> (EncodeStatus, Option<Vec<u8>>) {
+    // A heap texture has no guest pages to write back, and its LOAD is the
+    // content its resident already holds; with none yet it starts undefined.
+    let heap_primary = heap_primary_identity(state, req);
+    let writeback_guest = writeback_guest && heap_primary.is_none();
+    if let Some(identity) = heap_primary.as_ref() {
+        if req.colors[0].load_action == crate::contract::pass_action::MTL_LOAD_ACTION_LOAD {
+            if crate::backend::vulkan::engine::resident_content_ready(identity) {
+                req.chain_from_resident = true;
+            } else {
+                req.colors[0].load_action = MTL_LOAD_ACTION_DONT_CARE;
+            }
+        }
+    }
     // Charges this chain to one phase at a time all the way down, including the
     // parts of it that live inside `try_metal2vulkan_draw`. Held here rather
     // than there because the Store routing below the engine is on the same
@@ -1141,6 +1154,34 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                 SampledByteFormat::from_source(TexelLayout::Rgba8, source),
                 crate::backend::vulkan::engine::SampledByteOrigin::BufferBackedTexture,
             ),
+        ));
+    }
+
+    // A heap texture is sampled from the resident a pass rendered it into; one
+    // nothing has rendered yet has no content anywhere this device can reach.
+    if let Some(heap) = resource
+        .as_deref()
+        .map(|resource| (resource.entry.object_type, resource.descriptor.clone()))
+        .or_else(|| {
+            objects::resolve_resource(state, host, task_id, texture_ref)
+                .ok()
+                .map(|resource| (resource.entry.object_type, resource.descriptor.clone()))
+        })
+        .filter(|(object_type, _)| *object_type == OBJECT_TYPE_TEXTURE_VIEW)
+        .and_then(|(_, desc)| heap_texture_of(&desc))
+    {
+        let identity = heap_target_identity(texture_ref, heap.width, heap.height);
+        if !crate::backend::vulkan::engine::resident_content_ready(&identity) {
+            crate::runtime::drain::note_store_route("heap_sample_unrendered");
+            return None;
+        }
+        let format = translate::pixel::translate(heap.format).ok()?.vk;
+        crate::runtime::drain::note_store_route("heap_sample_resident");
+        return Some((
+            heap.width,
+            heap.height,
+            0,
+            SampledSourceRequest::Target(identity, format),
         ));
     }
 
@@ -6305,6 +6346,11 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
                 c.width,
                 c.height,
             )
+        } else if let Some(&base) = (c.mapping_id == 0 && !c.memoryless)
+            .then(|| state.heap_texture_targets.get(&(task_id, c.texture_ref)))
+            .flatten()
+        {
+            heap_target_identity(base, c.width, c.height)
         } else if c.memoryless {
             // No guest destination to follow, so the texture ref names it, as
             // it names a depth attachment. Its content never outlives the pass.
@@ -9079,6 +9125,41 @@ pub(super) fn depth_chain_identity(
     })
 }
 
+/// Generation of every heap texture's resident. Memoryless attachments take 0
+/// at the same reference namespace, and the two must never share a resident.
+pub(crate) const HEAP_TARGET_GENERATION: u64 = 1;
+
+/// The engine resident a heap-placed texture lives in, named by the heap
+/// texture's own reference. It persists across passes, unlike a memoryless
+/// attachment's, because a heap texture is a real texture the guest renders
+/// into once and samples later.
+pub(crate) fn heap_target_identity(
+    texture_ref: u32,
+    width: u32,
+    height: u32,
+) -> crate::backend::vulkan::engine::TargetIdentity {
+    crate::backend::vulkan::engine::TargetIdentity::Texture {
+        ref_: texture_ref,
+        width,
+        height,
+        generation: HEAP_TARGET_GENERATION,
+        stencil: false,
+    }
+}
+
+/// Colour0's heap resident, when colour0 is a heap texture.
+fn heap_primary_identity(
+    state: &DeviceState,
+    req: &DrawEncodeRequest,
+) -> Option<crate::backend::vulkan::engine::TargetIdentity> {
+    let c0 = req.colors.first()?;
+    if c0.mapping_id != 0 || c0.target_gva != 0 || c0.memoryless {
+        return None;
+    }
+    let base = *state.heap_texture_targets.get(&(req.task_id, c0.texture_ref))?;
+    Some(heap_target_identity(base, c0.width, c0.height))
+}
+
 pub(crate) fn render_chain_identity(
     state: &DeviceState,
     req: &DrawEncodeRequest,
@@ -9087,6 +9168,9 @@ pub(crate) fn render_chain_identity(
     let (width, height) = (c0.width, c0.height);
     if width == 0 || height == 0 {
         return None;
+    }
+    if let Some(identity) = heap_primary_identity(state, req) {
+        return Some(identity);
     }
     if c0.mapping_id != 0 {
         return Some(crate::runtime::present_identity::surface_identity(

@@ -478,6 +478,10 @@ pub(super) enum RenderTargetCause {
     MemorylessDescDecode { len: usize },
     /// The memoryless texture's format is not one Metal can render into.
     MemorylessFormat { fmt: u16 },
+    /// A heap texture this device renders only at level 0 of a 2D texture.
+    HeapShape { level: u32, texture_type: u8 },
+    /// The heap texture's format is not one Metal can render into.
+    HeapFormat { fmt: u16 },
     /// A mip>0 view of a buffer-backed texture, which has one level.
     BufferTextureMipView { level: u32 },
     /// The buffer-backed texture's format is not one Metal can render into.
@@ -574,6 +578,8 @@ impl crate::observe::Decline for RenderTargetRefusal {
             C::MemorylessDescRead => "rt_memoryless_desc_read",
             C::MemorylessDescDecode { .. } => "rt_memoryless_desc_decode",
             C::MemorylessFormat { .. } => "rt_memoryless_format",
+            C::HeapShape { .. } => "rt_heap_shape",
+            C::HeapFormat { .. } => "rt_heap_format",
             C::BufferTextureMipView { .. } => "rt_buffer_texture_mip_view",
             C::BufferTextureFormat { .. } => "rt_buffer_texture_format",
             C::BufferTextureBacking { .. } => "rt_buffer_texture_backing",
@@ -680,6 +686,14 @@ impl crate::observe::Decline for RenderTargetRefusal {
                 v.push(("dims", format!("{width}x{height}")));
                 v.push(("bpr", row_stride.to_string()));
             }
+            C::HeapShape {
+                level,
+                texture_type,
+            } => {
+                v.push(("level", level.to_string()));
+                v.push(("type", texture_type.to_string()));
+            }
+            C::HeapFormat { fmt } => v.push(("fmt", format!("{fmt:#x}"))),
             C::BufferTextureMipView { level } => v.push(("level", level.to_string())),
             C::BufferTextureBacking { buffer_ref } => v.push(("buf", buffer_ref.to_string())),
             C::BufferTextureSpan { end, size } => {
@@ -842,6 +856,7 @@ fn resolve_render_target<M: HostMemory + HostOps>(
     //    descriptor, not prefer the latch. Preferring latch routed dual-mid
     //    full-screen desktop composites onto only one mid (mid=3 nz=6M vs
     //    mid=4 stuck logo nz=1.97M; damage rects then preserved logo via Load).
+    state.heap_texture_targets.remove(&(task_id, texture_ref));
     let live = objects::lookup_list_entry(state, host, task_id, resolved_ref);
     let live_type = live.as_ref().map(|e| e.object_type);
     if let Some(ot) = live_type {
@@ -1049,6 +1064,55 @@ fn resolve_render_target<M: HostMemory + HostOps>(
             sample_count: tex.sample_count,
             memoryless: true,
         });
+    }
+    // Type-8 heap texture: no guest storage at all, so it renders into an engine
+    // resident that later passes load from and sample. 26 and 27 place their
+    // Liquid Glass shapes and shadows in heaps.
+    if entry.object_type == OBJECT_TYPE_TEXTURE_VIEW {
+        if let Some(heap) = objects::read_descriptor(state, host, task_id, &entry)
+            .as_deref()
+            .and_then(super::heap_texture_of)
+        {
+            if level != 0 || heap.texture_type != 2 {
+                return Err(C::HeapShape {
+                    level,
+                    texture_type: heap.texture_type,
+                }
+                .at(resolved_ref));
+            }
+            let fmt = effective_view_sample_format(heap.format, view_fmt_override)
+                .unwrap_or(heap.format);
+            if pixel_format::render_target_bpp(fmt).is_none() {
+                return Err(C::HeapFormat { fmt }.at(resolved_ref));
+            }
+            if heap.width == 0 || heap.height == 0 {
+                return Err(C::ZeroExtent {
+                    width: heap.width,
+                    height: heap.height,
+                }
+                .at(resolved_ref));
+            }
+            let row_stride = pixel_format::tight_row_bytes(heap.width, fmt).ok_or(
+                C::LinearTightRow {
+                    width: heap.width,
+                    fmt,
+                }
+                .at(resolved_ref),
+            )?;
+            state
+                .heap_texture_targets
+                .insert((task_id, texture_ref), resolved_ref);
+            return Ok(ResolvedRenderTarget {
+                mapping_id: 0,
+                target_gva: 0,
+                width: heap.width,
+                height: heap.height,
+                row_stride,
+                format: fmt,
+                sample_count: heap.sample_count,
+                memoryless: false,
+            });
+        }
     }
     // Type-8 buffer-backed texture: rows of a type-1 buffer from an offset, so a
     // linear GVA target at the buffer's address. macOS 27's Setup Assistant

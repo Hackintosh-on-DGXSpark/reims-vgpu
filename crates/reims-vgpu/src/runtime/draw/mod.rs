@@ -63,6 +63,9 @@ use crate::runtime::decode::resource::{
     OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_VARIANT, OBJECT_TYPE_TEXTURE_VIEW, OBJECT_TYPE_TYPE7,
     TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE, TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE_WIDE,
 };
+use crate::runtime::decode::resource::{
+    decode_heap_texture, HEAP_TEXTURE_OPCODE, HEAP_TEXTURE_WIDE_OPCODE,
+};
 use crate::runtime::gva_mem;
 use crate::runtime::host::{HostMemory, HostOps};
 use crate::runtime::mapper;
@@ -1666,6 +1669,44 @@ fn load_buffer_bytes<M: HostMemory + HostOps>(
     read_buffer_bytes_resolved(state, host, task_id, buffer_ref, &backing, offset, None)
 }
 
+/// A texture placed in a heap (type 8, opcode 0x15 or 0x38).
+///
+/// Heaps are host memory the guest never maps, so such a texture has no bytes
+/// this device can read: it lives only in an engine resident, rendered into and
+/// sampled by passes (see `vulkan::heap_target_identity`).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct HeapTexture {
+    pub width: u32,
+    pub height: u32,
+    pub format: u16,
+    pub sample_count: u32,
+    pub texture_type: u8,
+    pub mipmap_level_count: u16,
+}
+
+/// The heap texture a type-8 descriptor creates, or `None` for any other record.
+pub(crate) fn heap_texture_of(desc: &[u8]) -> Option<HeapTexture> {
+    let opcode = texture_type8_opcode(desc)?;
+    if opcode != HEAP_TEXTURE_OPCODE && opcode != HEAP_TEXTURE_WIDE_OPCODE {
+        return None;
+    }
+    let record = decode_heap_texture(desc).ok()?;
+    let body = if record.wide {
+        crate::runtime::heap_query::decode_wide_serialized_texture_descriptor(record.descriptor)
+    } else {
+        crate::runtime::heap_query::decode_serialized_texture_descriptor(record.descriptor)
+    }
+    .ok()?;
+    Some(HeapTexture {
+        width: body.width,
+        height: body.height,
+        format: body.pixel_format,
+        sample_count: u32::from(body.sample_count.max(1)),
+        texture_type: body.texture_type,
+        mipmap_level_count: body.mipmap_level_count,
+    })
+}
+
 /// If `texture_ref` is a type-8 object whose descriptor is a buffer-backed
 /// texture (view_opcode 9, `newTextureWithDescriptor:offset:bytesPerRow:`, or
 /// its `TextureDescriptor2` form), return its decoded descriptor. `None` for a
@@ -1822,7 +1863,9 @@ fn load_buffer_texture_rgba<M: HostMemory + HostOps>(
     for y in 0..h as usize {
         let src = &raw[y * bpr..y * bpr + tight];
         let dst = &mut rgba[y * dst_row..(y + 1) * dst_row];
-        if !pixel_format::convert_row_to_rgba8(fmt, src, w, dst) {
+        if !pixel_format::convert_row_to_rgba8(fmt, src, w, dst)
+            && !ten_bit_row_to_rgba8(fmt, src, dst)
+        {
             crate::observe::fail(format!(
                 "buftex convert_fail ref={texture_ref} buf={} fmt={fmt:#x} row={y} {w}x{h}",
                 bt.buffer_ref
@@ -1831,6 +1874,28 @@ fn load_buffer_texture_rgba<M: HostMemory + HostOps>(
         }
     }
     Some((w, h, rgba))
+}
+
+/// One row of RGB10A2 or BGR10A2 texels narrowed to RGBA8, for the buffer-texture
+/// loader alone. 26 and 27 draw their Setup Assistant icons from buffer textures
+/// in these formats; the shared converters decline them on purpose, because
+/// everywhere else the ten bits are kept by sampling the format natively.
+fn ten_bit_row_to_rgba8(format: u16, src: &[u8], dst: &mut [u8]) -> bool {
+    use crate::contract::pixel_format::{MTL_FORMAT_BGR10A2_UNORM, MTL_FORMAT_RGB10A2_UNORM};
+    if format != MTL_FORMAT_RGB10A2_UNORM && format != MTL_FORMAT_BGR10A2_UNORM {
+        return false;
+    }
+    for (texel, out) in src.chunks_exact(4).zip(dst.chunks_exact_mut(4)) {
+        let word = u32::from_le_bytes([texel[0], texel[1], texel[2], texel[3]]);
+        let (low, high) = ((word >> 2) as u8, (word >> 22) as u8);
+        let (r, b) = if format == MTL_FORMAT_RGB10A2_UNORM {
+            (low, high)
+        } else {
+            (high, low)
+        };
+        out.copy_from_slice(&[r, (word >> 12) as u8, b, ((word >> 30) as u8) * 85]);
+    }
+    true
 }
 
 fn index_elem_size(index_type: u32) -> Option<usize> {
@@ -4363,6 +4428,10 @@ pub fn writeback_chain_rgba<M: HostMemory + HostOps>(
             }
         };
     }
+    if mapping_id == 0 && state.heap_texture_targets.contains_key(&(task_id, att.texture_ref)) {
+        // A heap texture's frame is its resident; there is nothing to land.
+        return true;
+    }
     if mapping_id == 0 {
         return lost("no_mapping_and_no_gva");
     }
@@ -4634,7 +4703,21 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
         let mut load_action = att.load_action;
         let mut clear_color = att.clear_color;
         let mut seed = None;
-        if memoryless {
+        let heap = mapping_id == 0
+            && gva == 0
+            && !memoryless
+            && state.heap_texture_targets.contains_key(&(task_id, target_ref));
+        if heap {
+            // A heap texture's content lives in its engine resident. Colour0's
+            // LOAD is honoured from there by `encode_draw_chain`; a secondary
+            // has no way to load one, so it starts undefined.
+            if let Some(cl) = clears.iter().find(|a| a.texture_ref == att.texture_ref) {
+                load_action = MTL_LOAD_ACTION_CLEAR;
+                clear_color = cl.clear_color;
+            } else if load_action == MTL_LOAD_ACTION_LOAD && !colors.is_empty() {
+                load_action = MTL_LOAD_ACTION_DONT_CARE;
+            }
+        } else if memoryless {
             // Nothing to seed from: a memoryless attachment starts cleared or
             // undefined, and Metal refuses a LOAD on one.
             if let Some(cl) = clears.iter().find(|a| a.texture_ref == att.texture_ref) {

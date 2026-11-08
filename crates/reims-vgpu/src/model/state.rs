@@ -2563,6 +2563,10 @@ pub struct DeviceState {
     /// serial drain worker (dock-hover freeze). Keyed by (mapping_id, w, h).
     /// Byte-bounded LRU ([`GUEST_LINEAR_MEMO_BYTE_CAP`]).
     pub type11_memo: LruBytesMemo<(u32, u32, u32), GuestLinearMemo>,
+    /// `(task, attachment ref)` of every heap-placed texture a pass has
+    /// rendered into, naming the heap texture's own ref. Such a texture has no
+    /// guest storage this device can reach; it lives in an engine resident.
+    pub heap_texture_targets: std::collections::HashMap<(u32, u32), u32>,
     /// Reusable native BGRA read buffer for the type-11 memo re-read.
     pub type11_memo_scratch: Vec<u8>,
     /// Last guest-visible generation produced by a compute storage-image
@@ -2820,6 +2824,7 @@ impl DeviceState {
             guest_linear_scratch: Vec::new(),
             type5_view_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),
             type11_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),
+            heap_texture_targets: std::collections::HashMap::new(),
             type11_memo_scratch: Vec::new(),
             gva_host_views: Vec::new(),
             view_stale_reads: 0,
