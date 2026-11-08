@@ -140,28 +140,102 @@ fn capture_xreg_failed(
 }
 
 /// Adapter: mapper internals are KVA; page content GPAs use HostMemory.
+///
+/// A kernel address read on a vCPU goes through the CPU and, when a root has
+/// been captured, is also read through the software walk for runtime
+/// validation. Without a vCPU it is served by the walk, refused, or answered
+/// `NoCpu` as before, as [`crate::runtime::kernel_walk::WalkPolicy`] says.
 struct MapperMem<'a, H: HostMemory + HostOps> {
     host: &'a H,
     last_error: std::cell::Cell<Option<MemError>>,
+    walk: crate::runtime::kernel_walk::WalkPolicy,
+    /// The first refusal without a vCPU, and the address it was for.
+    refused: std::cell::Cell<Option<(crate::runtime::kernel_walk::Refused, u64)>>,
+    log: Option<&'a std::cell::RefCell<crate::runtime::kernel_walk::WalkLog>>,
 }
 
 impl<'a, H: HostMemory + HostOps> MapperMem<'a, H> {
+    /// A reader that only runs on a vCPU and takes no part in the walk.
     fn new(host: &'a H) -> Self {
+        Self::with_walk(host, crate::runtime::kernel_walk::WalkPolicy::OFF, None)
+    }
+
+    fn with_walk(
+        host: &'a H,
+        walk: crate::runtime::kernel_walk::WalkPolicy,
+        log: Option<&'a std::cell::RefCell<crate::runtime::kernel_walk::WalkLog>>,
+    ) -> Self {
         Self {
             host,
             last_error: std::cell::Cell::new(None),
+            walk,
+            refused: std::cell::Cell::new(None),
+            log,
         }
     }
 
     fn last_error(&self) -> Option<MemError> {
         self.last_error.get()
     }
+
+    fn refused(&self) -> Option<(crate::runtime::kernel_walk::Refused, u64)> {
+        self.refused.get()
+    }
+
+    fn read_kernel(&self, address: u64, dst: &mut [u8]) -> Result<(), MemError> {
+        use crate::runtime::kernel_walk::{self, Refused, Serve};
+        match self.host.read_kva(address, dst) {
+            Ok(()) => {
+                self.validate(address, dst);
+                Ok(())
+            }
+            Err(MemError::NoCpu) => {
+                let refusal = match self.walk.serve {
+                    Serve::Off => return Err(MemError::NoCpu),
+                    Serve::Walk(root) => match kernel_walk::read(self.host, &root, address, dst) {
+                        Ok(()) => return Ok(()),
+                        Err(why) => Refused::Walk(why),
+                    },
+                    Serve::Refuse(why) => Refused::Gate(why),
+                };
+                if self.refused.get().is_none() {
+                    self.refused.set(Some((refusal, address)));
+                }
+                Err(MemError::KernelWalkRefused)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Runtime validation: the bytes the CPU just read, read again through the
+    /// walk, and while no sample has yet crossed a page, a 16-byte read across
+    /// the end of this one through both.
+    fn validate(&self, address: u64, cpu: &[u8]) {
+        use crate::runtime::kernel_walk;
+        let (Some(root), Some(log)) = (self.walk.root, self.log) else {
+            return;
+        };
+        let mut log = log.borrow_mut();
+        log.compares
+            .push(kernel_walk::compare(self.host, &root, address, cpu));
+        if !self.walk.wants_crossing {
+            return;
+        }
+        let Some((at, len)) = kernel_walk::crossing_probe(&root, address) else {
+            return;
+        };
+        let mut probe = vec![0u8; len];
+        if self.host.read_kva(at, &mut probe).is_ok() {
+            log.compares
+                .push(kernel_walk::compare(self.host, &root, at, &probe));
+        }
+    }
 }
 
 impl<H: HostMemory + HostOps> PagesMemory for MapperMem<'_, H> {
     fn read(&self, address: u64, dst: &mut [u8]) -> bool {
         if guest_kernel_va(address) {
-            match self.host.read_kva(address, dst) {
+            match self.read_kernel(address, dst) {
                 Ok(()) => true,
                 Err(e) => {
                     self.last_error.set(Some(e));
@@ -386,10 +460,29 @@ pub fn apply_capture(state: &mut DeviceState, cap: &MapperCapture, mapping_id: u
 /// Resolve page table + device-descriptor geometry for a mapped slot.
 ///
 /// Safe to call repeatedly; refreshes pages when `mapping_internal` is set.
+/// Off a vCPU the re-read goes through [`crate::runtime::kernel_walk`] in the
+/// mode it is in, and what a vCPU read compared is folded into its runtime
+/// validation afterwards.
 pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &H,
     mapping_id: u32,
+) -> bool {
+    let walk = state
+        .kernel_walk
+        .policy(crate::runtime::kernel_walk::mode());
+    let log = std::cell::RefCell::new(crate::runtime::kernel_walk::WalkLog::default());
+    let resolved = resolve_mapping_backing_walked(state, host, mapping_id, walk, &log);
+    state.kernel_walk.fold(log.into_inner());
+    resolved
+}
+
+fn resolve_mapping_backing_walked<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &H,
+    mapping_id: u32,
+    walk: crate::runtime::kernel_walk::WalkPolicy,
+    log: &std::cell::RefCell<crate::runtime::kernel_walk::WalkLog>,
 ) -> bool {
     let Some(m) = state.mappings.get(&mapping_id) else {
         return false;
@@ -402,13 +495,21 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
     let cached_pages = m.page_entries.len();
     let cached_table = m.page_table_kva;
     let had_cached_pages = cached_pages != 0;
-    let mem = MapperMem::new(host);
+    let mem = MapperMem::with_walk(host, walk, Some(log));
 
     let fields = match read_mapper_internal(&mem, internal, mapper != 0, mapper) {
         Ok(f) => f,
         Err(status) => {
             let reason = refusal_reason(&status);
             let host_error = mem.last_error();
+            // Off a vCPU in strict mode, a page list that could not be re-read
+            // is not one to keep writing through: refuse, and say when.
+            if let Some((why, kva)) = mem.refused() {
+                state
+                    .kernel_walk
+                    .note_refusal(mapping_id, cached_pages, why, kva);
+                return false;
+            }
             let host_reason = host_error
                 .map(|error| crate::observe::Decline::slug(&error))
                 .unwrap_or("none");
@@ -558,6 +659,11 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
     let plan = match build_table_plan(&mem, mapping_id, &fields, min_size, state.page_shift) {
         Ok(p) => p,
         Err(status) => {
+            if let Some((why, kva)) = mem.refused() {
+                state
+                    .kernel_walk
+                    .note_refusal(mapping_id, cached_pages, why, kva);
+            }
             // Still latch geom / device desc if we decoded them, even without pages yet.
             if let Some(ref d) = device_desc {
                 let _ = state.set_mapping_device_desc(mapping_id, d);

@@ -274,6 +274,9 @@ pub fn iosfc_write<H: HostMemory + HostOps>(
             let producer = data as u32;
             state.iosfc.producer = producer;
             if state.iosfc.consumer != producer {
+                // The kernel translation root, on the vCPU and before anything
+                // below reads a kernel address. See `runtime::kernel_walk`.
+                crate::runtime::kernel_walk::capture(&mut state.kernel_walk, host);
                 // Capture MappingInternal* while x19/x21/x22 still hold the
                 // publishing vCPU's directed handoff.
                 if let Some(cap) = mapper::capture_at_producer(state, host, producer) {

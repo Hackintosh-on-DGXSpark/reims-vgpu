@@ -13,6 +13,9 @@ use std::collections::BTreeMap;
 pub enum MemError {
     Unmapped,
     NoCpu,
+    /// A kernel address read without a vCPU that the software walk would not,
+    /// or may not, answer. See [`crate::runtime::kernel_walk`].
+    KernelWalkRefused,
     Overflow,
     BadArgs,
     /// The QEMU host table omitted a mandatory guest-physical read callback.
@@ -108,6 +111,7 @@ impl crate::observe::Decline for MemError {
         match self {
             Self::Unmapped => "mem_unmapped",
             Self::NoCpu => "mem_no_cpu",
+            Self::KernelWalkRefused => "mem_kernel_walk_refused",
             Self::Overflow => "mem_overflow",
             Self::BadArgs => "mem_bad_args",
             Self::QemuReadGpaCallbackMissing => "mem_qemu_read_gpa_callback_missing",
@@ -677,6 +681,12 @@ pub struct FakeHost {
     bounce: Vec<BounceView>,
     /// Synthetic guest X-regs for mapper capture tests.
     pub xregs: BTreeMap<u32, u64>,
+    /// Model a thread with no vCPU: `read_kva` answers `NoCpu`.
+    pub kva_no_cpu: bool,
+    /// The CPU's own translation of kernel addresses, 16 KiB page to page,
+    /// standing in for `cpu_translate_for_debug`. A KVA with no entry reads
+    /// from the same sparse store as GPA, as before.
+    pub kva_cpu_pages: BTreeMap<u64, u64>,
     pub actions: Vec<HostAction>,
     pub mono_ns: u64,
     pub bh_scheduled: bool,
@@ -1351,8 +1361,25 @@ impl HostOps for FakeHost {
     }
 
     fn read_kva(&self, kva: u64, buf: &mut [u8]) -> Result<(), MemError> {
-        // Tests map "KVA" into the same sparse store as GPA.
-        self.read_gpa(kva, buf)
+        if self.kva_no_cpu {
+            return Err(MemError::NoCpu);
+        }
+        if self.kva_cpu_pages.is_empty() {
+            // Tests map "KVA" into the same sparse store as GPA.
+            return self.read_gpa(kva, buf);
+        }
+        const PAGE: u64 = 1 << 14;
+        let mut done = 0usize;
+        while done < buf.len() {
+            let at = kva + done as u64;
+            let Some(&gpa_page) = self.kva_cpu_pages.get(&(at & !(PAGE - 1))) else {
+                return Err(MemError::Unmapped);
+            };
+            let n = ((PAGE - (at & (PAGE - 1))) as usize).min(buf.len() - done);
+            self.read_gpa(gpa_page | (at & (PAGE - 1)), &mut buf[done..done + n])?;
+            done += n;
+        }
+        Ok(())
     }
 
     fn read_xreg(&self, index: u32) -> Result<u64, MemError> {

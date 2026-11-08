@@ -189,6 +189,16 @@ pub const PAGE_GUARDS: &str = "REIMS_VGPU_PAGE_GUARDS";
 /// the probe is trying to measure.
 pub const RANGE_COVERAGE: &str = "REIMS_VGPU_RANGE_COVERAGE";
 
+/// What a thread without a vCPU does when a type-11 mapping's page list must be
+/// re-read: `strict` (the default) re-reads it through the runtime-validated
+/// software walk of [`crate::runtime::kernel_walk`] or refuses the write;
+/// `compat` writes through the cached page list as before that module, for a
+/// QEMU without the shim that answers EL1 translation state and for baselines.
+///
+/// Not an on/off switch, so it is read by value. Any value other than `compat`
+/// is `strict`, the side that never writes through an unwitnessed page list.
+pub const KVA_WALK: &str = "REIMS_VGPU_KVA_WALK";
+
 /// `off` stops narrowing a guest buffer bind to the extent the shader's
 /// reflection proved it can read, so the bind walks the rest of the allocation
 /// exactly as it did before that rail existed.
@@ -1216,7 +1226,7 @@ pub fn switch(name: &str) -> Switch {
 /// Nothing enforces that a new `pub const` above is added to this list; the rule
 /// is stated and honestly unenforced. What keeps it small is that the list is
 /// next to the constants, and [`report_line`] is the only consumer.
-pub const ALL: [&str; 28] = [
+pub const ALL: [&str; 29] = [
     COLOR_GENERAL,
     LAZY_WRITEBACK,
     SLAB_RETAIN,
@@ -1235,6 +1245,7 @@ pub const ALL: [&str; 28] = [
     GPU_STAMP,
     PAGE_GUARDS,
     RANGE_COVERAGE,
+    KVA_WALK,
     BUFFER_EXTENT,
     BATCH_MIXED_TARGETS,
     BATCH_DEPTH,

@@ -2462,6 +2462,10 @@ pub struct DeviceState {
     /// disarms it. For the same reason it is not dropped on task teardown: the
     /// page stays released whatever happens to the task that let it go.
     pub released_pages: crate::runtime::released_pages::ReleasedPages,
+    /// The kernel translation root captured on a vCPU, and whether the software
+    /// walk over it has passed runtime validation. See
+    /// [`crate::runtime::kernel_walk`].
+    pub kernel_walk: crate::runtime::kernel_walk::KernelWalkState,
     /// Live object refs per task, as `(task_id, ref)`.
     ///
     /// This is membership for host-copy teardown. [`Self::task_resources`]
@@ -2837,6 +2841,7 @@ impl DeviceState {
             map_audit: std::collections::BTreeMap::new(),
             node_guard: std::collections::BTreeMap::new(),
             released_pages: crate::runtime::released_pages::ReleasedPages::default(),
+            kernel_walk: crate::runtime::kernel_walk::KernelWalkState::default(),
             objects: std::collections::BTreeSet::new(),
             task_resources: TaskResources::default(),
             task_sampler_states: TaskSamplerStates::default(),
@@ -3216,9 +3221,14 @@ impl DeviceState {
         // The mapper registers' read rail, kept the same way and published
         // as the reset leaves them.
         let iosfc_live = Arc::clone(&self.iosfc.live);
+        // The kernel root and its validation belong to the boot that is ending;
+        // only the count of boots survives, so a root names its own.
+        let mut kernel_walk = std::mem::take(&mut self.kernel_walk);
+        kernel_walk.reset();
         *self = Self::new(id, page_shift);
         self.iosfc.live = iosfc_live;
         self.iosfc.publish();
+        self.kernel_walk = kernel_walk;
         self.gfx.interrupt_status_disp = intr_disp;
         self.gfx.interrupt_status_gpu = intr_gpu;
         self.gfx.interrupt_fault = intr_fault;

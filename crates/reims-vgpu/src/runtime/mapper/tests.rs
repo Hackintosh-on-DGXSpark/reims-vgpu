@@ -942,9 +942,38 @@ fn assert_revalidate_error_preserves_cached_page_plan(err: MemError) {
     );
 }
 
+/// The behaviour before `runtime::kernel_walk`, which compat mode keeps.
 #[test]
-fn revalidate_no_cpu_preserves_cached_page_plan() {
-    assert_revalidate_error_preserves_cached_page_plan(MemError::NoCpu);
+fn revalidate_no_cpu_preserves_cached_page_plan_in_compat() {
+    crate::runtime::kernel_walk::with_mode(crate::runtime::kernel_walk::Mode::Compat, || {
+        assert_revalidate_error_preserves_cached_page_plan(MemError::NoCpu)
+    });
+}
+
+/// Strict mode with no root does not keep a page list it cannot re-read: the
+/// revalidation fails and the list is withdrawn, so no write goes through it.
+#[test]
+fn revalidate_no_cpu_without_a_root_withdraws_the_cached_page_plan_in_strict() {
+    crate::runtime::kernel_walk::with_mode(crate::runtime::kernel_walk::Mode::Strict, || {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let entry = (0x444u32 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
+        assert!(state.attach_mapping_internal(3, KVA));
+        {
+            let m = state.mappings.get_mut(&3).unwrap();
+            m.mapped = true;
+            m.page_entries = vec![entry];
+            m.page_table_kva = KVA + 0x3000;
+        }
+        let host = FailingKvaHost {
+            inner: FakeHost::new(),
+            err: MemError::NoCpu,
+        };
+        assert_eq!(
+            revalidate_mapping_reason(&mut state, &host, 3),
+            Some("revalidate_resolve_fail")
+        );
+        assert!(state.mappings[&3].page_entries.is_empty());
+    });
 }
 
 #[test]
@@ -1227,4 +1256,289 @@ fn a_surface_colliding_with_several_control_structures_names_the_first() {
         first_control_page_collision(&state, &all),
         Some((0x660_000, "task_directory"))
     );
+}
+
+// MARK: - Kernel addresses without a vCPU
+
+mod kernel_walk_resolve {
+    use super::*;
+    use crate::runtime::kernel_walk::tests::{map_page, G, L1, SCTLR_ON, TCR_16K_47};
+    use crate::runtime::kernel_walk::{GateRefusal, SYSREG_BASE};
+
+    /// The mapper's kernel objects over three 16 KiB kernel pages — the
+    /// MappingInternal, its page table and its page object each in their own,
+    /// so runtime validation sees three — backed by guest pages elsewhere.
+    const A: u64 = KVA;
+    const B: u64 = KVA + G;
+    const C: u64 = KVA + 2 * G;
+    const BACKING: u64 = 0x3_0000_0000;
+    const MID: u32 = 5;
+
+    fn backing(kva: u64) -> u64 {
+        BACKING + (kva - A)
+    }
+
+    /// Write through the CPU's translation, one 16 KiB page at a time.
+    fn kput(host: &mut FakeHost, kva: u64, bytes: &[u8]) {
+        let mut done = 0usize;
+        while done < bytes.len() {
+            let at = kva + done as u64;
+            let page = host.kva_cpu_pages[&(at & !(G - 1))];
+            let n = ((G - (at & (G - 1))) as usize).min(bytes.len() - done);
+            host.write_gpa(page | (at & (G - 1)), &bytes[done..done + n])
+                .unwrap();
+            done += n;
+        }
+    }
+
+    /// Map one kernel page for both the CPU and the guest's stage-1 tables.
+    fn kmap(host: &mut FakeHost, kva_page: u64, gpa_page: u64) {
+        host.map_range(gpa_page, G as usize, 0);
+        host.kva_cpu_pages.insert(kva_page, gpa_page);
+        map_page(host, kva_page, gpa_page);
+    }
+
+    fn entry(pfn: u32) -> u32 {
+        (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID
+    }
+
+    /// A one-page surface whose MappingInternal sits at `A`, page table at `B`
+    /// and page object at `C`; the CPU's translation and the guest's own
+    /// stage-1 tables agree, and the shim answers the translation root.
+    fn fixture(first_entry: u32) -> (DeviceState, FakeHost) {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut host = FakeHost::new();
+        host.map_range(BACKING, 3 * G as usize, 0);
+        for page in [A, B, C] {
+            host.kva_cpu_pages.insert(page, backing(page));
+            map_page(&mut host, page, backing(page));
+        }
+        let mapper = A + 0x1000;
+        kput(
+            &mut host,
+            A + MAPPING_INTERNAL_BACKPTR,
+            &mapper.to_le_bytes(),
+        );
+        kput(&mut host, A + MAPPING_INTERNAL_ID, &MID.to_le_bytes());
+        kput(
+            &mut host,
+            A + MAPPING_INTERNAL_SIZE,
+            &MAPPING_INTERNAL_EXPECTED_SIZE.to_le_bytes(),
+        );
+        kput(
+            &mut host,
+            A + iosurface_pages::MAPPING_INTERNAL_PAGE_FIELD_48,
+            &C.to_le_bytes(),
+        );
+        kput(
+            &mut host,
+            A + iosurface_pages::MAPPING_INTERNAL_PAGE_COUNT,
+            &1u64.to_le_bytes(),
+        );
+        kput(
+            &mut host,
+            C + iosurface_pages::MAPPING_PAGE_TABLE_FROM_F48,
+            &B.to_le_bytes(),
+        );
+        kput(&mut host, B, &first_entry.to_le_bytes());
+        // Kernel memory is rarely zero across a page boundary, and runtime
+        // validation does not count a sample that is.
+        kput(&mut host, A + G - 8, b"boundary");
+        for pfn in [0x2_1000u32, 0x2_2000] {
+            host.map_range(
+                u64::from(pfn) << PAGE_SHIFT_ARM64E,
+                PAGE_SIZE_ARM64E as usize,
+                0,
+            );
+        }
+        host.set_xreg(SYSREG_BASE, L1);
+        host.set_xreg(SYSREG_BASE + 1, TCR_16K_47);
+        host.set_xreg(SYSREG_BASE + 2, SCTLR_ON);
+        host.set_xreg(SYSREG_BASE + 3, 0);
+        state.mapper_device_kva = mapper;
+        assert!(state.attach_mapping_internal(MID, A));
+        crate::runtime::kernel_walk::capture(&mut state.kernel_walk, &host);
+        (state, host)
+    }
+
+    /// Resolve on the vCPU until runtime validation has passed.
+    fn validate_on_the_vcpu(state: &mut DeviceState, host: &FakeHost) {
+        for _ in 0..8 {
+            if state.kernel_walk.gate().is_ok() {
+                return;
+            }
+            let _ = resolve_mapping_backing(state, host, MID);
+        }
+        panic!("validation did not pass: {:?}", state.kernel_walk.gate());
+    }
+
+    #[test]
+    fn without_a_vcpu_the_walk_resolves_the_same_pages_the_cpu_did() {
+        let (mut state, mut host) = fixture(entry(0x2_1000));
+        assert!(resolve_mapping_backing(&mut state, &host, MID));
+        let on_cpu = state.mappings[&MID].page_entries.clone();
+        let generation = state.mappings[&MID].map_generation;
+        assert_eq!(on_cpu, vec![entry(0x2_1000)]);
+        validate_on_the_vcpu(&mut state, &host);
+
+        host.kva_no_cpu = true;
+        assert!(resolve_mapping_backing(&mut state, &host, MID));
+        assert_eq!(state.mappings[&MID].page_entries, on_cpu);
+        assert_eq!(state.mappings[&MID].map_generation, generation);
+    }
+
+    /// The blindness this exists to end: the guest re-points the surface and
+    /// the next resolve without a vCPU sees it, both when the mapper's own
+    /// page list changes and when the kernel page holding it is re-wired.
+    #[test]
+    fn a_rewire_is_seen_on_the_next_resolve_without_a_vcpu() {
+        let (mut state, mut host) = fixture(entry(0x2_1000));
+        validate_on_the_vcpu(&mut state, &host);
+        host.kva_no_cpu = true;
+        let generation = state.mappings[&MID].map_generation;
+
+        kput(&mut host, B, &entry(0x2_2000).to_le_bytes());
+        assert!(resolve_mapping_backing(&mut state, &host, MID));
+        assert_eq!(state.mappings[&MID].page_entries, vec![entry(0x2_2000)]);
+        assert_ne!(state.mappings[&MID].map_generation, generation);
+
+        // The kernel page holding the page table now lives elsewhere, with the
+        // first surface page in it again.
+        let moved = 0x3_1000_0000u64;
+        host.map_range(moved, G as usize, 0);
+        host.write_gpa(moved, &entry(0x2_1000).to_le_bytes())
+            .unwrap();
+        map_page(&mut host, B, moved);
+        assert!(resolve_mapping_backing(&mut state, &host, MID));
+        assert_eq!(state.mappings[&MID].page_entries, vec![entry(0x2_1000)]);
+    }
+
+    /// Runtime validation catching a walk that reads elsewhere than the CPU:
+    /// it is not used, and strict refuses rather than falling back.
+    #[test]
+    fn a_walk_that_disagrees_with_the_cpu_is_not_used() {
+        let (mut state, mut host) = fixture(entry(0x2_1000));
+        // The CPU now finds the page object somewhere the guest tables do not.
+        let elsewhere = 0x3_2000_0000u64;
+        host.map_range(elsewhere, G as usize, 0);
+        host.write_gpa(
+            elsewhere + iosurface_pages::MAPPING_PAGE_TABLE_FROM_F48,
+            &B.to_le_bytes(),
+        )
+        .unwrap();
+        host.write_gpa(elsewhere, b"cpu-only").unwrap();
+        host.kva_cpu_pages.insert(C, elsewhere);
+        let _ = resolve_mapping_backing(&mut state, &host, MID);
+        let _ = resolve_mapping_backing(&mut state, &host, MID);
+        assert_eq!(state.kernel_walk.gate(), Err(GateRefusal::Mismatched));
+
+        host.kva_no_cpu = true;
+        assert!(!resolve_mapping_backing(&mut state, &host, MID));
+    }
+
+    /// The 13.6 wallpaper's shape, from Codex's diagnostic on that boot:
+    /// `mapper_cached_holes mid=7 pages=9216 holes=4093 first_bad=3
+    /// last_bad=4095 table=0xfffffe551987c000`. The page table itself spans
+    /// three kernel pages, and the re-read without a vCPU has to walk to each
+    /// of them, not only to the surface's data pages.
+    #[test]
+    fn the_wallpapers_table_refills_its_holes_without_a_vcpu() {
+        const TABLE: u64 = 0xffff_fe55_1987_c000;
+        const PAGES: usize = 9216;
+        let (mut state, mut host) = fixture(entry(0x2_1000));
+        for i in 0..3 {
+            kmap(&mut host, TABLE + i * G, 0x3_4000_0000 + i * G);
+        }
+        kput(
+            &mut host,
+            C + iosurface_pages::MAPPING_PAGE_TABLE_FROM_F48,
+            &TABLE.to_le_bytes(),
+        );
+        kput(
+            &mut host,
+            A + iosurface_pages::MAPPING_INTERNAL_PAGE_COUNT,
+            &(PAGES as u64).to_le_bytes(),
+        );
+        let table = |holes: bool| -> Vec<u8> {
+            (0..PAGES as u32)
+                .map(|i| match holes && (3..=4095).contains(&i) {
+                    true => 0,
+                    false => entry(0x5_0000 + i),
+                })
+                .flat_map(u32::to_le_bytes)
+                .collect()
+        };
+        kput(&mut host, TABLE, &table(true));
+        let holes = |state: &DeviceState| {
+            state.mappings[&MID]
+                .page_entries
+                .iter()
+                .filter(|&&e| e & PAGE_ENTRY_VALID == 0)
+                .count()
+        };
+        validate_on_the_vcpu(&mut state, &host);
+        assert_eq!(state.mappings[&MID].page_entries.len(), PAGES);
+        assert_eq!(holes(&state), 4093);
+
+        host.kva_no_cpu = true;
+        kput(&mut host, TABLE, &table(false));
+        assert!(ensure_resolved_for_scanout(&mut state, &host, MID));
+        assert_eq!(holes(&state), 0);
+        assert_eq!(state.mappings[&MID].page_entries[3], entry(0x5_0003));
+    }
+
+    /// A page the guest had not wired at the first resolve is not a permanent
+    /// hole: once it is wired, the next resolve without a vCPU adopts it.
+    #[test]
+    fn a_hole_fills_once_the_guest_wires_it() {
+        let (mut state, mut host) = fixture(0);
+        validate_on_the_vcpu(&mut state, &host);
+        assert!(
+            state.mappings[&MID]
+                .page_entries
+                .iter()
+                .all(|&e| e & PAGE_ENTRY_VALID == 0),
+            "nothing wired yet: {:?}",
+            state.mappings[&MID].page_entries
+        );
+
+        host.kva_no_cpu = true;
+        kput(&mut host, B, &entry(0x2_1000).to_le_bytes());
+        assert!(resolve_mapping_backing(&mut state, &host, MID));
+        assert_eq!(state.mappings[&MID].page_entries, vec![entry(0x2_1000)]);
+    }
+
+    /// Strict, with no root — a shim that does not answer: the cached page list
+    /// is not written through. The re-read is refused, the mapping's pages are
+    /// withdrawn, and a write through it fails rather than being done.
+    #[test]
+    fn strict_refuses_a_write_it_cannot_reread() {
+        let (mut state, mut host) = fixture(entry(0x2_1000));
+        assert!(resolve_mapping_backing(&mut state, &host, MID));
+        state.kernel_walk = Default::default();
+        assert_eq!(state.kernel_walk.gate(), Err(GateRefusal::NoRoot));
+        let vouched = vouch_mapping_pages_verdict(&mut state, &host, MID)
+            .1
+            .expect("vouched on the vCPU");
+
+        host.kva_no_cpu = true;
+        let cap = crate::observe::sink::FailCapture::start();
+        assert!(!resolve_mapping_backing(&mut state, &host, MID));
+        assert_eq!(
+            revalidate_mapping_reason(&mut state, &host, MID),
+            Some("revalidate_resolve_fail")
+        );
+        assert!(state.mappings[&MID].page_entries.is_empty());
+        assert!(!write_mapping_bytes(
+            &mut state, &mut host, MID, 0, b"STALE", &vouched
+        ));
+        let mut page = [0u8; 5];
+        host.read_gpa(u64::from(0x2_1000u32) << PAGE_SHIFT_ARM64E, &mut page)
+            .unwrap();
+        assert_eq!(page, [0u8; 5]);
+        assert!(cap
+            .lines()
+            .iter()
+            .any(|l| l.contains("kva_walk_resolve_refused mapping=5 reason=kva_walk_no_root")));
+    }
 }
