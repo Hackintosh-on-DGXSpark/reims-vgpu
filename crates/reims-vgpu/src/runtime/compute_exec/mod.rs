@@ -4454,6 +4454,7 @@ fn spirv_image_format_to_engine_storage(
         S::Rg8Unorm => V::Rg8Unorm,
         S::Rgba32Uint => V::Rgba32Uint,
         S::R32Float => V::R32Float,
+        S::Rgba16Unorm => V::Rgba16Unorm,
         S::R32ui => V::R32Uint,
         // Format-less (`Unknown`) storage images carry no engine texel format —
         // their view format comes from the guest surface, resolved by the caller.
@@ -4554,7 +4555,8 @@ fn specialized_storage_image_format(
         | S::Rgba8Unorm
         | S::Rg16Float
         | S::R8Unorm
-        | S::Rg8Unorm => 0,
+        | S::Rg8Unorm
+        | S::Rgba16Unorm => 0,
         S::Rgba32Uint | S::Rgba16Uint | S::Rgba8Uint | S::R32ui => 1,
         S::Rgba8Sint => 2,
         // A shader that itself declared `Unknown` (format-less) storage is not a
@@ -4601,7 +4603,6 @@ fn specialized_storage_image_format(
         | V::Rgb9e5Ufloat
         | V::R16Unorm
         | V::Rg16Unorm
-        | V::Rgba16Unorm
         // The packed 32-bit colour formats join them: Vulkan mandates no
         // `STORAGE_IMAGE` support for any of the three, and one of them is not
         // in the mandatory table at all.
@@ -4612,6 +4613,7 @@ fn specialized_storage_image_format(
         }
         V::Rgba32Float => (0, S::Rgba32Float),
         V::Rgba16Float => (0, S::Rgba16Float),
+        V::Rgba16Unorm => (0, S::Rgba16Unorm),
         V::R16Float => (0, S::R16Float),
         // Bgra8Unorm normally returns above (Unknown/B8G8R8A8 view, or the
         // degraded Rgba8Unorm) before reaching here; this arm is only the

@@ -266,6 +266,9 @@ pub enum StorageImageAccess {
 pub enum ImageFormat {
     Rgba32Float,
     Rgba16Float,
+    /// SPIR-V `Rgba16` (enum value 10), the storage view of a guest
+    /// `MTLPixelFormatRGBA16Unorm` surface. An extended format.
+    Rgba16Unorm,
     R16Float,
     Rgba16Uint,
     Rgba8Uint,
@@ -310,6 +313,7 @@ impl ImageFormat {
             3 => Self::R32Float,
             4 => Self::Rgba8Unorm,
             7 => Self::Rg16Float,
+            10 => Self::Rgba16Unorm,
             9 => Self::R16Float,
             13 => Self::Rg8Unorm,
             15 => Self::R8Unorm,
@@ -330,6 +334,7 @@ impl ImageFormat {
             Self::Rgba8Unorm => 4,
             Self::Rg16Float => 7,
             Self::R16Float => 9,
+            Self::Rgba16Unorm => 10,
             Self::Rg8Unorm => 13,
             Self::R8Unorm => 15,
             Self::Rgba8Sint => 23,

@@ -592,6 +592,7 @@ pub fn storage_image_from_selector(selector: StorageImageSelector) -> StorageIma
         S::Rg8Unorm => StorageImageFormat::Rg8Unorm,
         S::Rgba32Uint => StorageImageFormat::Rgba32Uint,
         S::R32Uint => StorageImageFormat::R32Uint,
+        S::Rgba16Unorm => StorageImageFormat::Rgba16Unorm,
     }
 }
 
@@ -1072,12 +1073,9 @@ mod tests {
 
         // Sampled-only means sampled-only: none of the members this rail adds
         // over the storage one may be reached as a storage image, because Vulkan
-        // mandates none of them for `STORAGE_IMAGE`.
-        for mtl in [
-            p::MTL_FORMAT_R16_UNORM,
-            p::MTL_FORMAT_RG16_UNORM,
-            p::MTL_FORMAT_RGBA16_UNORM,
-        ] {
+        // mandates none of them for `STORAGE_IMAGE`. RGBA16Unorm is the
+        // exception macOS 26 asked for; it is an extended storage format.
+        for mtl in [p::MTL_FORMAT_R16_UNORM, p::MTL_FORMAT_RG16_UNORM] {
             assert!(
                 storage_image(mtl).is_err(),
                 "{mtl:#x} is sampled-only and must not be admitted as a storage image"

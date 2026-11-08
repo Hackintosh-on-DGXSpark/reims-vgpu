@@ -181,6 +181,7 @@ pub enum StorageImageSelector {
     Rg8Unorm = 10,
     Rgba32Uint = 11,
     R32Uint = 12,
+    Rgba16Unorm = 13,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1146,6 +1147,7 @@ pub fn storage_selector(format: u16) -> Option<StorageImageSelector> {
         MTL_FORMAT_RGBA8_UINT => StorageImageSelector::Rgba8Uint,
         MTL_FORMAT_RGBA8_SINT => StorageImageSelector::Rgba8Sint,
         MTL_FORMAT_RGBA16_UINT => StorageImageSelector::Rgba16Uint,
+        MTL_FORMAT_RGBA16_UNORM => StorageImageSelector::Rgba16Unorm,
         MTL_FORMAT_RGBA16_FLOAT => StorageImageSelector::Rgba16Float,
         MTL_FORMAT_RGBA32_UINT => StorageImageSelector::Rgba32Uint,
         MTL_FORMAT_RGBA32_FLOAT => StorageImageSelector::Rgba32Float,
@@ -2639,6 +2641,7 @@ mod tests {
             (MTL_FORMAT_RGBA8_UINT, RGBA8_BPP),
             (MTL_FORMAT_RGBA8_SINT, RGBA8_BPP),
             (MTL_FORMAT_RGBA16_UINT, RGBA16_BPP),
+            (MTL_FORMAT_RGBA16_UNORM, RGBA16_BPP),
             (MTL_FORMAT_RGBA16_FLOAT, RGBA16F_BPP),
             (MTL_FORMAT_RGBA32_UINT, RGBA32_BPP),
             (MTL_FORMAT_RGBA32_FLOAT, RGBA32F_BPP),
