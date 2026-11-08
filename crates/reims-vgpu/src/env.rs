@@ -1089,6 +1089,15 @@ pub const FULLSCREEN: &str = "REIMS_VGPU_FULLSCREEN";
 /// flight instead of the last half millisecond of a batch.
 pub const BATCH_DRAWS: &str = "REIMS_VGPU_BATCH_DRAWS";
 
+/// **Default on.** metal2vulkan translations outlive the process: each one is
+/// published under `$TMPDIR/reims-vgpu-m2v-cache` and the next boot loads it
+/// instead of translating again — see [`crate::runtime::m2v_disk`].
+///
+/// `off` keeps translations in this process only, which is what every boot did
+/// before the disk cache existed. It is the other arm of the cache's A/B: the
+/// same binary, translating every shader cold.
+pub const M2V_DISK_CACHE: &str = "REIMS_VGPU_M2V_DISK_CACHE";
+
 /// What one variable says, including the two ways it says nothing usable.
 ///
 /// Four states rather than a `bool` because "unset", "explicitly on" and
@@ -1207,7 +1216,7 @@ pub fn switch(name: &str) -> Switch {
 /// Nothing enforces that a new `pub const` above is added to this list; the rule
 /// is stated and honestly unenforced. What keeps it small is that the list is
 /// next to the constants, and [`report_line`] is the only consumer.
-pub const ALL: [&str; 27] = [
+pub const ALL: [&str; 28] = [
     COLOR_GENERAL,
     LAZY_WRITEBACK,
     SLAB_RETAIN,
@@ -1245,6 +1254,7 @@ pub const ALL: [&str; 27] = [
     PASS_CHURN,
     SHARED_TARGET,
     FULLSCREEN,
+    M2V_DISK_CACHE,
 ];
 
 /// Every variable read as a [`count`] rather than as a [`Switch`].

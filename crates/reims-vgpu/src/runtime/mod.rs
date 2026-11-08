@@ -82,6 +82,8 @@ pub mod draw;
 pub mod input;
 /// Process-global metal2vulkan SPIR-V cache (AIR content hash → SPIR-V).
 pub mod m2v_cache;
+/// metal2vulkan translations kept on disk across boots, under `m2v_cache`.
+pub mod m2v_disk;
 /// IOSurface mapper capture + page-table resolve.
 pub mod map_audit;
 pub mod mapper;

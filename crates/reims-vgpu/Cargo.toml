@@ -46,8 +46,10 @@ reims-vgpu-wire = { path = "../reims-vgpu-wire" }
 # run coalescing, window region planning. `no_std` + alloc, no host traits.
 reims-vgpu-paging = { path = "../reims-vgpu-paging" }
 ash = { version = "0.38", optional = true }
-# Always available for Linux MTLB→AIR→SPIR-V (encode path + probes).
-metal2vulkan = { path = "../../../metal2vulkan" }
+# Always available for Linux MTLB→AIR→SPIR-V (encode path + probes). `serde`
+# lets `runtime::m2v_disk` keep a translation's reflection across boots.
+metal2vulkan = { path = "../../../metal2vulkan", features = ["serde"] }
+serde_json = "1"
 winit = { version = "0.30", optional = true }
 ash-window = { version = "0.13", optional = true }
 raw-window-handle = { version = "0.6", optional = true }
@@ -59,12 +61,6 @@ objc = "0.2"
 block = "0.1"
 foreign-types = "0.5"
 libc = "0.2"
-
-[dev-dependencies]
-# Reads `reims-vgpu-wire`'s oracle fixtures — bytes Apple's own serializer
-# produced — so `wire_fixtures_reach_the_decoders` can run them through this
-# crate's decoders. Test-only: nothing here reaches the staticlib QEMU links.
-serde_json = "1"
 
 [build-dependencies]
 cc = "1"
