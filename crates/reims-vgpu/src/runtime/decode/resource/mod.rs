@@ -3,6 +3,7 @@
 use crate::contract::endian::{ld16, ld32, ld64}; // ld64: texture-view level base/count
 #[cfg(test)]
 use crate::contract::endian::{st16, st32};
+use crate::contract::pixel_format::stored_format;
 use crate::runtime::heap_query; // ICB layout fixture encoder only
 
 use core::mem::{offset_of, size_of};
@@ -76,6 +77,13 @@ impl crate::observe::Decline for DecodeStatus {
 pub const OBJECT_TYPE_BUFFER: u8 = 1;
 pub const OBJECT_TYPE_TEXTURE: u8 = 2;
 pub const OBJECT_TYPE_TEXTURE_VARIANT: u8 = 3;
+/// macOS 27's tag for a texture whose descriptor carries its level-0 layout
+/// twice. [`decode_list_object_entry`] reports it as
+/// [`OBJECT_TYPE_TEXTURE_VARIANT`] and [`reshape_twin_layout_descriptor`] gives
+/// its descriptor type 2's shape, so every texture rail serves it unchanged.
+pub const OBJECT_TYPE_TWIN_LAYOUT_TEXTURE: u8 = 12;
+/// Where the second copy of the level-0 layout sits in a type-12 descriptor.
+const TWIN_LAYOUT_COPY: std::ops::Range<usize> = 0x48..0x84;
 pub const OBJECT_TYPE_FUNCTION: u8 = 6;
 pub const OBJECT_TYPE_TYPE7: u8 = 7;
 pub const OBJECT_TYPE_TEXTURE_VIEW: u8 = 8;
@@ -1723,6 +1731,18 @@ pub struct ListObjectEntry {
     pub object_type: u8,
     pub descriptor_length: u32,
     pub descriptor_gva: u64,
+    /// The guest tagged it [`OBJECT_TYPE_TWIN_LAYOUT_TEXTURE`].
+    pub twin_layout: bool,
+}
+
+/// Give a type-12 descriptor type 2's shape: drop the second copy of its
+/// level-0 layout. The format is read where type 2's is.
+pub fn reshape_twin_layout_descriptor(bytes: &mut Vec<u8>) -> bool {
+    if bytes.len() < TEXTURE_DESC_PIXEL_FORMAT + 2 + TWIN_LAYOUT_COPY.len() {
+        return false;
+    }
+    bytes.drain(TWIN_LAYOUT_COPY);
+    true
 }
 
 /// Decode one 12-byte object-list entry (live arm Reims VGPU contract).
@@ -1731,10 +1751,17 @@ pub fn decode_list_object_entry(bytes: &[u8]) -> Result<ListObjectEntry, DecodeS
         return Err(DecodeStatus::ErrShort("res_list_entry_short"));
     }
     let first = ld32(&bytes[OBJECT_LIST_ENTRY_HEADER..]);
+    let object_type = (first & OBJECT_TYPE_MASK) as u8;
+    let twin_layout = object_type == OBJECT_TYPE_TWIN_LAYOUT_TEXTURE;
     Ok(ListObjectEntry {
-        object_type: (first & OBJECT_TYPE_MASK) as u8,
+        object_type: if twin_layout {
+            OBJECT_TYPE_TEXTURE_VARIANT
+        } else {
+            object_type
+        },
         descriptor_length: first >> OBJECT_DESC_LEN_SHIFT,
         descriptor_gva: ld64(&bytes[OBJECT_LIST_ENTRY_DESC_GVA..]),
+        twin_layout,
     })
 }
 
@@ -1788,7 +1815,7 @@ pub fn decode_memoryless_texture_descriptor(
         return Err(DecodeStatus::ErrShort("res_memoryless_desc_short"));
     }
     Ok(MemorylessTextureDescriptor {
-        pixel_format: ld16(&bytes[MEMORYLESS_DESC_PIXEL_FORMAT..]),
+        pixel_format: stored_format(ld16(&bytes[MEMORYLESS_DESC_PIXEL_FORMAT..])),
         width: ld32(&bytes[MEMORYLESS_DESC_WIDTH..]),
         height: ld32(&bytes[MEMORYLESS_DESC_HEIGHT..]),
         depth: ld32(&bytes[MEMORYLESS_DESC_DEPTH..]).max(1),
@@ -1929,7 +1956,7 @@ pub fn decode_texture_descriptor(bytes: &[u8]) -> Result<TextureDescriptor, Deco
     };
     let pf_off = TEXTURE_DESC_PIXEL_FORMAT + format_shift;
     if bytes.len() >= pf_off + 2 {
-        out.pixel_format = ld16(&bytes[pf_off..]);
+        out.pixel_format = stored_format(ld16(&bytes[pf_off..]));
     } else if crate::observe::first_sight("texture_desc_format_unreachable", levels as u64) {
         // No fallback to the unshifted offset. The fallback's own length test
         // was `TEXTURE_DESC_PIXEL_FORMAT + 2`, so for a single-mip body it
@@ -3336,7 +3363,7 @@ fn parse_one_color_entry(
     let pf = entry_tag_u32(bytes, entry, COLOR_ATTACHMENT_TAG_PIXEL_FORMAT, u32::MAX);
     if pf != u32::MAX {
         out.has_pixel_format = true;
-        out.pixel_format = pf;
+        out.pixel_format = u16::try_from(pf).map_or(pf, |pf| u32::from(stored_format(pf)));
     }
     out.blending_enabled = entry_tag_u32(bytes, entry, COLOR_ATTACHMENT_TAG_BLEND_ENABLE, 0) != 0;
     out.src_rgb = entry_tag_u32(bytes, entry, COLOR_ATTACHMENT_TAG_SRC_RGB, BLEND_FACTOR_ONE);
@@ -3659,7 +3686,7 @@ pub fn decode_texture_view_descriptor(bytes: &[u8]) -> Result<TextureViewDescrip
         TEXTURE_VIEW_OPCODE_SIMPLE => {
             let b = w_view::texture_view(&op)
                 .map_err(|_| DecodeStatus::ErrShort("res_texture_view_short"))?;
-            let pixel_format = b.pixel_format.get();
+            let pixel_format = stored_format(b.pixel_format.get());
             Ok(TextureViewDescriptor {
                 view_opcode,
                 view_texture_ref: b.object_ref.get(),
@@ -3671,7 +3698,7 @@ pub fn decode_texture_view_descriptor(bytes: &[u8]) -> Result<TextureViewDescrip
         TEXTURE_VIEW_OPCODE_RANGED => {
             let b = w_view::texture_view_ranged(&op)
                 .map_err(|_| DecodeStatus::ErrShort("res_texture_view_short"))?;
-            let pixel_format = b.pixel_format.get();
+            let pixel_format = stored_format(b.pixel_format.get());
             Ok(TextureViewDescriptor {
                 view_opcode,
                 view_texture_ref: b.object_ref.get(),
@@ -3689,7 +3716,7 @@ pub fn decode_texture_view_descriptor(bytes: &[u8]) -> Result<TextureViewDescrip
             let b = w_view::texture_view_swizzle(&op)
                 .map_err(|_| DecodeStatus::ErrShort("res_texture_view_short"))?;
             let r = &b.ranged;
-            let pixel_format = r.pixel_format.get();
+            let pixel_format = stored_format(r.pixel_format.get());
             Ok(TextureViewDescriptor {
                 view_opcode,
                 view_texture_ref: r.object_ref.get(),
@@ -3884,7 +3911,7 @@ pub fn decode_iosurface_texture_descriptor(bytes: &[u8]) -> Result<Descriptor, D
     Ok(Descriptor::IOSurfaceTexture {
         mapping_id: ld32(&bytes[IOSURFACE_TEX_MAPPING_ID..]),
         object_ref: ld32(&bytes[IOSURFACE_TEX_OBJECT_REF..]),
-        pixel_format: ld16(&bytes[IOSURFACE_TEX_PIXEL_FORMAT..]),
+        pixel_format: stored_format(ld16(&bytes[IOSURFACE_TEX_PIXEL_FORMAT..])),
         width: ld32(&bytes[IOSURFACE_TEX_WIDTH..]),
         height: ld32(&bytes[IOSURFACE_TEX_HEIGHT..]),
     })

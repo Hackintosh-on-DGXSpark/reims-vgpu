@@ -86,6 +86,21 @@ pub const MTL_FORMAT_RGBA8_UNORM_SRGB: u16 = 0x47;
 pub const MTL_FORMAT_RGBA8_UINT: u16 = 0x49;
 pub const MTL_FORMAT_RGBA8_SINT: u16 = 0x4a;
 pub const MTL_FORMAT_BGRA8_UNORM: u16 = 0x50;
+/// A private format macOS 27 declares its Setup Assistant icon, panel and
+/// memoryless textures in, and asks heap placement for. Four bytes a texel; it
+/// is only ever rendered and sampled on the GPU, so it is stored as BGRA8.
+pub const MTL_FORMAT_PRIVATE_550: u16 = 550;
+
+/// The format a texture declared in `raw` is stored and drawn in. The identity
+/// for every format but [`MTL_FORMAT_PRIVATE_550`]; every wire decode passes
+/// its pixel format through here, so no table below needs to name 550.
+pub fn stored_format(raw: u16) -> u16 {
+    if raw == MTL_FORMAT_PRIVATE_550 {
+        MTL_FORMAT_BGRA8_UNORM
+    } else {
+        raw
+    }
+}
 pub const MTL_FORMAT_BGRA8_UNORM_SRGB: u16 = 0x51;
 /// `MTLPixelFormatRGB10A2Unorm`. Ten bits per colour channel and two of alpha,
 /// packed into one 32-bit word with red in the low bits.

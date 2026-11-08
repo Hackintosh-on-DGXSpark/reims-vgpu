@@ -1515,6 +1515,11 @@ pub fn read_descriptor<M: HostMemory>(
         state.page_shift,
     )
     .ok()?;
+    if entry.twin_layout
+        && !crate::runtime::decode::resource::reshape_twin_layout_descriptor(&mut buf)
+    {
+        return None;
+    }
     Some(buf)
 }
 
