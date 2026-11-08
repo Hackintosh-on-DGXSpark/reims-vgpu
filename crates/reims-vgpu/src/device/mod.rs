@@ -107,6 +107,9 @@ struct BoundDevice {
     /// `writeFifo` producer spin must observe drain progress live, not a
     /// cached snapshot from before the tranche.
     fifo_read_live: Arc<AtomicU32>,
+    /// The IOSurface mapper registers, read by a vCPU with no lock; published
+    /// by whoever changes them under the device lock.
+    iosfc_live: Arc<crate::model::IosfcLive>,
     /// An accepted present is waiting for QEMU to consume its scanout action.
     /// Kept outside `inner` so new worker wakeups can yield without racing the
     /// main-loop copy for the same device lock.
@@ -248,6 +251,7 @@ pub fn device_create(ops: Option<ReimsVgpuHostOps>, page_shift: u32) -> Option<u
     let child_doorbell_rung = Arc::clone(&dev.state.gfx.child_doorbell_rung);
     let intr_fault = Arc::clone(&dev.state.gfx.interrupt_fault);
     let fifo_read_live = Arc::clone(&dev.state.gfx.fifo_read);
+    let iosfc_live = Arc::clone(&dev.state.iosfc.live);
     DEVICES.lock().insert(
         id,
         Arc::new(BoundDevice {
@@ -264,6 +268,7 @@ pub fn device_create(ops: Option<ReimsVgpuHostOps>, page_shift: u32) -> Option<u
             child_doorbell_rung,
             intr_fault,
             fifo_read_live,
+            iosfc_live,
             present_action_pending: AtomicBool::new(false),
             present_boundary_seen: AtomicBool::new(false),
             reset_count: AtomicU64::new(0),
@@ -501,25 +506,36 @@ fn lock_device_for_vcpu(slot: &BoundDevice, holder: Holder) -> Held<'_, DeviceIn
     held
 }
 
+/// Serve a mapper register read with no lock: see [`crate::model::IosfcLive`].
 pub fn device_iosfc_read(id: u64, offset: u64, size: u32) -> Option<u64> {
+    let started = std::time::Instant::now();
     let slot = device_slot(id)?;
-    let d = lock_device_for_vcpu(&slot, Holder::VcpuIosfcRead);
-    Some(d.device.iosfc_read(offset, size))
+    let value = crate::runtime::mmio::iosfc_read(&slot.iosfc_live, offset, size);
+    lock_hold::note_iosfc_call(lock_hold::IosfcCall::Read, started);
+    Some(value)
 }
 
+/// Apply a mapper register write on the vCPU that made it, synchronously: a
+/// producer write captures that vCPU's registers and walks guest kernel
+/// memory through its MMU (`read_xreg`, `read_kva`), and the guest finds the
+/// request done when the write returns.
 pub fn device_iosfc_write(id: u64, offset: u64, data: u64, size: u32) -> bool {
+    let started = std::time::Instant::now();
     let Some(slot) = device_slot(id) else {
         return false;
     };
-    let mut d = lock_device_for_vcpu(&slot, Holder::VcpuIosfcWrite);
-    if let Some(ops) = slot.ops {
-        let DeviceInner { device, actions } = &mut *d;
-        let mut host = QemuHost::new(&ops, actions, &slot.prompt_actions);
-        device.iosfc_write(&mut host, offset, data, size);
-    } else {
-        let mut host = NullHost;
-        d.device.iosfc_write(&mut host, offset, data, size);
+    {
+        let mut d = lock_device_for_vcpu(&slot, Holder::VcpuIosfcWrite);
+        if let Some(ops) = slot.ops {
+            let DeviceInner { device, actions } = &mut *d;
+            let mut host = QemuHost::new(&ops, actions, &slot.prompt_actions);
+            device.iosfc_write(&mut host, offset, data, size);
+        } else {
+            let mut host = NullHost;
+            d.device.iosfc_write(&mut host, offset, data, size);
+        }
     }
+    lock_hold::note_iosfc_call(lock_hold::IosfcCall::Write, started);
     true
 }
 

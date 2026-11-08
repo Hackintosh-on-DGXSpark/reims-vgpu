@@ -7,7 +7,7 @@ use crate::runtime::decode::resource::{
 #[cfg(feature = "backend-vulkan")]
 use std::collections::HashMap;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 /// Opaque device instance id (QEMU handle).
@@ -452,6 +452,57 @@ pub struct IosfcRegs {
     pub desc_table: u64,
     pub producer: u32,
     pub consumer: u32,
+    /// The five registers as a vCPU reads them, shared with the registry slot.
+    /// Every writer of the fields above publishes them here, under the device
+    /// lock, with [`IosfcRegs::publish`].
+    pub live: Arc<IosfcLive>,
+}
+
+impl IosfcRegs {
+    /// Make the registers' current values what a vCPU reads. Called by every
+    /// writer once its change is complete, and before anything the change
+    /// raises — the mapper interrupt above all — can reach the guest.
+    pub fn publish(&self) {
+        let live = &self.live;
+        live.ring_base.store(self.ring_base, Ordering::Release);
+        live.capacity.store(self.capacity, Ordering::Release);
+        live.desc_table.store(self.desc_table, Ordering::Release);
+        live.producer.store(self.producer, Ordering::Release);
+        live.consumer.store(self.consumer, Ordering::Release);
+    }
+}
+
+/// The IOSurface mapper registers, readable with no lock.
+///
+/// A vCPU reading one of them used to take the device lock, and so waited for
+/// a whole drain tranche, seconds when that tranche compiles a pipeline, while
+/// holding QEMU's BQL. All five reads are plain state queries with no side
+/// effect, so they are served from here instead.
+#[derive(Debug, Default)]
+pub struct IosfcLive {
+    ring_base: AtomicU64,
+    capacity: AtomicU32,
+    desc_table: AtomicU64,
+    producer: AtomicU32,
+    consumer: AtomicU32,
+}
+
+impl IosfcLive {
+    /// The register at `offset`, or 0 for an offset that names none.
+    pub fn register(&self, offset: u64) -> u64 {
+        use crate::model::{
+            IOSFC_REG_CAPACITY, IOSFC_REG_CONSUMER, IOSFC_REG_DESC_TABLE, IOSFC_REG_PRODUCER,
+            IOSFC_REG_RING_BASE,
+        };
+        match offset {
+            IOSFC_REG_RING_BASE => self.ring_base.load(Ordering::Acquire),
+            IOSFC_REG_CAPACITY => self.capacity.load(Ordering::Acquire) as u64,
+            IOSFC_REG_DESC_TABLE => self.desc_table.load(Ordering::Acquire),
+            IOSFC_REG_PRODUCER => self.producer.load(Ordering::Acquire) as u64,
+            IOSFC_REG_CONSUMER => self.consumer.load(Ordering::Acquire) as u64,
+            _ => 0,
+        }
+    }
 }
 
 /// Per-channel child ring cache (page list decoded from base_pfn).
@@ -3154,7 +3205,12 @@ impl DeviceState {
         // Cleared as well as kept: a reset drops every channel, so a bit rung
         // before it names a channel that no longer exists.
         child_rung.store(0, Ordering::Release);
+        // The mapper registers' read rail, kept the same way and published
+        // as the reset leaves them.
+        let iosfc_live = Arc::clone(&self.iosfc.live);
         *self = Self::new(id, page_shift);
+        self.iosfc.live = iosfc_live;
+        self.iosfc.publish();
         self.gfx.interrupt_status_disp = intr_disp;
         self.gfx.interrupt_status_gpu = intr_gpu;
         self.gfx.interrupt_fault = intr_fault;

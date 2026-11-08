@@ -16,8 +16,8 @@
 //! Every release goes through [`Held`] and is fair (`unlock_fair`): when a
 //! thread is parked on the lock, the lock passes straight to the one that
 //! parked first instead of being left free for whichever thread reaches it
-//! next. The threads that block on it — the drain worker, a vCPU on the mapper
-//! registers, the console's scanout copy, device reset — are served in the
+//! next. The threads that block on it — the drain worker, a vCPU writing a
+//! mapper register, the console's scanout copy, device reset — are served in the
 //! order they blocked. A vCPU waits for the hold in progress and the waiters
 //! ahead of it, not for a worker that comes straight back for the lock; the
 //! worker waits for the vCPUs ahead of it, not for every vCPU that arrives
@@ -75,9 +75,8 @@ pub enum Holder {
     Drain,
     /// `device_reset`.
     Reset,
-    /// A vCPU reading an IOSurface mapper register.
-    VcpuIosfcRead,
-    /// A vCPU writing one — the mapper ring publish, which drains synchronously.
+    /// A vCPU writing an IOSurface mapper register: the ring publish drains
+    /// synchronously. Reads take no lock.
     VcpuIosfcWrite,
     /// A vCPU reading a GFX register under the lock (`try_lock` only).
     VcpuGfxRead,
@@ -93,13 +92,12 @@ pub enum Holder {
     Display,
 }
 
-const HOLDERS: usize = 10;
+const HOLDERS: usize = 9;
 
 impl Holder {
     const ALL: [Holder; HOLDERS] = [
         Holder::Drain,
         Holder::Reset,
-        Holder::VcpuIosfcRead,
         Holder::VcpuIosfcWrite,
         Holder::VcpuGfxRead,
         Holder::VcpuGfxWrite,
@@ -117,7 +115,6 @@ impl Holder {
         match self {
             Self::Drain => "drain",
             Self::Reset => "reset",
-            Self::VcpuIosfcRead => "vcpu_iosfc_read",
             Self::VcpuIosfcWrite => "vcpu_iosfc_write",
             Self::VcpuGfxRead => "vcpu_gfx_read",
             Self::VcpuGfxWrite => "vcpu_gfx_write",
@@ -131,6 +128,32 @@ impl Holder {
     /// The drain worker's tranche, or a reset taking the lock the same way.
     fn is_drain(self) -> bool {
         matches!(self, Self::Drain | Self::Reset)
+    }
+}
+
+/// A vCPU's access to an IOSurface mapper register, timed from entry to
+/// return. While QEMU dispatches the region under its BQL, which it does
+/// unless the region is lockless, this is how long that vCPU held the BQL.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IosfcCall {
+    Read,
+    Write,
+}
+
+const IOSFC_CALLS: usize = 2;
+
+impl IosfcCall {
+    const ALL: [IosfcCall; IOSFC_CALLS] = [IosfcCall::Read, IosfcCall::Write];
+
+    fn index(self) -> usize {
+        self as usize
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+        }
     }
 }
 
@@ -271,6 +294,8 @@ struct Period {
     /// Drain releases made while a vCPU waited, each handing the lock on
     /// rather than leaving it to be taken again.
     drain_handoffs: AtomicU64,
+    /// Each vCPU's mapper register accesses, entry to return, by kind.
+    iosfc_calls: [[Durations; CPU_SLOTS]; IOSFC_CALLS],
 }
 
 impl Default for Period {
@@ -281,6 +306,7 @@ impl Default for Period {
             vcpu_wait_by_cpu: std::array::from_fn(|_| Durations::default()),
             drain_wait: Durations::default(),
             drain_handoffs: AtomicU64::new(0),
+            iosfc_calls: std::array::from_fn(|_| std::array::from_fn(|_| Durations::default())),
         }
     }
 }
@@ -292,6 +318,7 @@ struct PeriodSummary {
     vcpu_wait_by_cpu: Vec<(usize, Summary)>,
     drain_wait: Summary,
     drain_handoffs: u64,
+    iosfc_calls: Vec<(IosfcCall, usize, Summary)>,
 }
 
 impl Period {
@@ -310,6 +337,14 @@ impl Period {
                 true => self.drain_handoffs.swap(0, Ordering::Relaxed),
                 false => self.drain_handoffs.load(Ordering::Relaxed),
             },
+            iosfc_calls: IosfcCall::ALL
+                .iter()
+                .flat_map(|&call| {
+                    (0..CPU_SLOTS).map(move |cpu| {
+                        (call, cpu, self.iosfc_calls[call.index()][cpu].summary(take))
+                    })
+                })
+                .collect(),
         }
     }
 }
@@ -319,11 +354,20 @@ impl PeriodSummary {
         self.vcpu_wait.count == 0
             && self.drain_wait.count == 0
             && self.holds.iter().all(|(_, s)| s.count == 0)
+            && self.iosfc_calls.iter().all(|(_, _, s)| s.count == 0)
     }
 
     fn worst_us(&self) -> u64 {
         let hold = self.holds.iter().map(|(_, s)| s.max_us).max().unwrap_or(0);
-        hold.max(self.vcpu_wait.max_us).max(self.drain_wait.max_us)
+        let call = self
+            .iosfc_calls
+            .iter()
+            .map(|(_, _, s)| s.max_us)
+            .max()
+            .unwrap_or(0);
+        hold.max(call)
+            .max(self.vcpu_wait.max_us)
+            .max(self.drain_wait.max_us)
     }
 
     /// Everything after the leading vCPU wait fields.
@@ -341,6 +385,12 @@ impl PeriodSummary {
                 .iter()
                 .filter(|(_, s)| s.count != 0)
                 .map(|(cpu, s)| format!("{}_wait={s}", cpu_name(*cpu))),
+        );
+        fields.extend(
+            self.iosfc_calls
+                .iter()
+                .filter(|(_, _, s)| s.count != 0)
+                .map(|(call, cpu, s)| format!("{}_iosfc_{}_call={s}", cpu_name(*cpu), call.name())),
         );
         fields.join(" ")
     }
@@ -498,6 +548,12 @@ impl LockCensus {
     fn note_drain_handoff(&self) {
         self.interval.drain_handoffs.fetch_add(1, Ordering::Relaxed);
         self.boot.drain_handoffs.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn note_iosfc_call(&self, call: IosfcCall, cpu: usize, us: u64) {
+        for period in [&self.interval, &self.boot] {
+            period.iosfc_calls[call.index()][cpu.min(OTHER_CPU)].note(us);
+        }
     }
 
     fn vcpu_waiting(&self) -> bool {
@@ -732,6 +788,12 @@ impl<T> Drop for Held<'_, T> {
     }
 }
 
+/// Count one mapper register access by this vCPU, from `started` to now.
+pub fn note_iosfc_call(call: IosfcCall, started: Instant) {
+    let us = started.elapsed().as_micros() as u64;
+    CENSUS.note_iosfc_call(call, this_cpu(), us);
+}
+
 /// Write the boot's summary; called at device reset and destroy.
 pub fn report_boot() {
     if let Some(line) = CENSUS.boot_summary() {
@@ -816,6 +878,34 @@ mod tests {
         assert_eq!(s.count, 1);
         assert!(s.max_us >= 2_000, "{s:?}");
         assert_eq!(*m.lock(), 6);
+    }
+
+    /// Mapper register accesses are counted per vCPU and per kind, and a long
+    /// one is reason enough for a line.
+    #[test]
+    fn iosfc_calls_are_counted_per_vcpu_and_kind() {
+        let c = LockCensus::default();
+        c.note_iosfc_call(IosfcCall::Read, 3, 2);
+        assert_eq!(c.report(REPORT_INTERVAL_MS), None, "nothing reached 50 ms");
+
+        c.note_iosfc_call(IosfcCall::Write, 3, 70_000);
+        c.note_iosfc_call(IosfcCall::Read, 3, 2);
+        c.note_iosfc_call(IosfcCall::Read, 40, 5);
+        let line = c
+            .report(2 * REPORT_INTERVAL_MS + 1)
+            .expect("a 70 ms mapper write is reported");
+        assert!(
+            line.contains("vcpu3_iosfc_write_call=1/70000/70000"),
+            "{line}"
+        );
+        assert!(line.contains("vcpu3_iosfc_read_call=1/2/2"), "{line}");
+        assert!(
+            line.contains("vcpu_other_iosfc_read_call=1/5/5"),
+            "past the slots: {line}"
+        );
+
+        let boot = c.boot_summary().expect("the boot saw accesses");
+        assert!(boot.contains("vcpu3_iosfc_read_call=2/2/2"), "{boot}");
     }
 
     #[test]

@@ -5238,6 +5238,9 @@ pub fn drain_iosfc<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut 
     }
 
     state.iosfc.consumer = consumer;
+    // Published before the interrupt is queued: the guest's handler reads the
+    // consumer register without the device lock, and must find it caught up.
+    state.iosfc.publish();
     if state.iosfc.consumer == state.iosfc.producer {
         host.enqueue(HostAction::irq_iosfc());
     }

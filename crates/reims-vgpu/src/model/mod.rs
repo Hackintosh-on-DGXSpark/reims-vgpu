@@ -17,7 +17,7 @@ pub(crate) use regs::*;
 pub use state::{
     ChannelRing, ComputeStorageResidencyKey, DeviceId, DeviceState, ExecFault,
     FailEvent, GfxRegs, GuestLinearMemo, GvaBacking, GvaEvictionWitness,
-    GvaHostView, HostLinearTexture, HostSurface, MapperCapture, MappingEntry,
+    GvaHostView, HostLinearTexture, HostSurface, IosfcLive, MapperCapture, MappingEntry,
     PacketFault, PresentBacking, PresentState, RenderFlushWitness, ResourceValidity, SurfaceWriteKind, TaskEntry, TaskResource, TaskResourceLifetimeRef, TaskSamplerState, TaskTable, Type4Walk, UnimplementedCommand, FENCE_DOMAIN_BLIT,
     FENCE_DOMAIN_COMPUTE, FENCE_DOMAIN_EVENT, FENCE_DOMAIN_RENDER, GVA_ENCODE_CACHE_BYTE_CAP,
     GVA_EVICTION_WITNESS_KEYS,
@@ -84,7 +84,7 @@ impl<B: Backend> Device<B> {
     }
 
     pub fn iosfc_read(&self, offset: u64, size: u32) -> u64 {
-        runtime::mmio::iosfc_read(&self.state, offset, size)
+        runtime::mmio::iosfc_read(&self.state.iosfc.live, offset, size)
     }
 
     pub fn iosfc_write<H: runtime::host::HostMemory + HostOps>(

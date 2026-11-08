@@ -590,3 +590,44 @@ fn present_action_owns_worker_boundary_until_scanout_copy() {
     assert_eq!(slot.gfx_ingress.lock().len(), 0);
     assert!(device_destroy(id));
 }
+
+/// The IOSurface mapper registers read with no lock. A vCPU reading one while
+/// the drain worker holds the device lock answers at once, rather than waiting
+/// out the tranche, holding QEMU's BQL as it did.
+#[test]
+fn iosfc_reads_do_not_wait_for_the_device_lock() {
+    use crate::model::{
+        IOSFC_REG_CAPACITY, IOSFC_REG_CONSUMER, IOSFC_REG_PRODUCER, IOSFC_REG_RING_BASE,
+    };
+    let id = device_create(None, PAGE_SHIFT_ARM64E).expect("create");
+    assert!(device_iosfc_write(id, IOSFC_REG_CAPACITY, 0x40, 4));
+    // No ring base: the producer write catches the consumer up, the boot
+    // handshake, and publishes both.
+    assert!(device_iosfc_write(id, IOSFC_REG_PRODUCER, 5, 4));
+    let slot = device_slot(id).expect("slot");
+    let drain_guard = slot.inner.lock();
+    let (sent, reads) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let read = |offset| device_iosfc_read(id, offset, 4);
+        sent.send([
+            read(IOSFC_REG_RING_BASE),
+            read(IOSFC_REG_CAPACITY),
+            read(IOSFC_REG_PRODUCER),
+            read(IOSFC_REG_CONSUMER),
+        ])
+        .unwrap();
+    });
+    let reads = reads
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("an iosfc read waited for the device lock");
+    assert_eq!(reads, [Some(0), Some(0x40), Some(5), Some(5)]);
+    drop(drain_guard);
+
+    assert!(device_reset(id));
+    assert_eq!(
+        device_iosfc_read(id, IOSFC_REG_CAPACITY, 4),
+        Some(0),
+        "a reset publishes the registers it cleared"
+    );
+    assert!(device_destroy(id));
+}
