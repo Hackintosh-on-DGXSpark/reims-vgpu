@@ -2466,6 +2466,9 @@ pub struct DeviceState {
     /// walk over it has passed runtime validation. See
     /// [`crate::runtime::kernel_walk`].
     pub kernel_walk: crate::runtime::kernel_walk::KernelWalkState,
+    /// The guest's wire counts on type-11 surfaces, when that diagnostic is on.
+    /// See [`crate::runtime::mapper::wire_watch`].
+    pub wire_watch: crate::runtime::mapper::wire_watch::WireWatch,
     /// Live object refs per task, as `(task_id, ref)`.
     ///
     /// This is membership for host-copy teardown. [`Self::task_resources`]
@@ -2842,6 +2845,7 @@ impl DeviceState {
             node_guard: std::collections::BTreeMap::new(),
             released_pages: crate::runtime::released_pages::ReleasedPages::default(),
             kernel_walk: crate::runtime::kernel_walk::KernelWalkState::default(),
+            wire_watch: crate::runtime::mapper::wire_watch::WireWatch::default(),
             objects: std::collections::BTreeSet::new(),
             task_resources: TaskResources::default(),
             task_sampler_states: TaskSamplerStates::default(),
@@ -3218,6 +3222,8 @@ impl DeviceState {
         // Cleared as well as kept: a reset drops every channel, so a bit rung
         // before it names a channel that no longer exists.
         child_rung.store(0, Ordering::Release);
+        // What the wire watch cost this boot; its state goes with the boot.
+        crate::runtime::mapper::wire_watch::on_reset(self);
         // The mapper registers' read rail, kept the same way and published
         // as the reset leaves them.
         let iosfc_live = Arc::clone(&self.iosfc.live);

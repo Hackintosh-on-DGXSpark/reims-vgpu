@@ -2462,6 +2462,9 @@ fn copy_mapping_runs<H: HostMemory + HostOps>(
     site: &str,
 ) -> bool {
     if copy.is_write() {
+        if !wire_watch::before_write(state, &*host, mapping_id, site, wire_watch::WriteKind::Cpu) {
+            return false;
+        }
         // Puts bytes into guest pages the hypervisor's dirty bitmap cannot
         // witness. The read direction shares this walk and writes nothing.
         state.note_host_wrote_mapping(mapping_id);
@@ -2720,6 +2723,8 @@ const MAPPING_RUN_IMPORT_SLOW_US: u64 = 1_000;
 fn mapping_run_import_is_slow(elapsed_us: u64) -> bool {
     elapsed_us >= MAPPING_RUN_IMPORT_SLOW_US
 }
+
+pub mod wire_watch;
 
 #[cfg(test)]
 mod revalidate_tests;

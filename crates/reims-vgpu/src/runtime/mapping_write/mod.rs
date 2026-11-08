@@ -371,6 +371,15 @@ fn contig_for_write<H: HostMemory + HostOps>(
         return None;
     }
     let view = contig_for_span(state, host, mapping_id, span_end)?;
+    if !mapper::wire_watch::before_write(
+        state,
+        &*host,
+        mapping_id,
+        "mapping_write_contig",
+        mapper::wire_watch::WriteKind::Cpu,
+    ) {
+        return None;
+    }
     // Every raw-pointer write in this file goes through here, and none of them
     // goes through `mapper::write_mapping_bytes` — they poke rows straight into
     // the view. So this is where those writes enter `observe::footprint`, and
@@ -1104,6 +1113,13 @@ pub fn write_bgra8_from_resident_gpu<M: HostMemory + HostOps>(
     // than from zero, because unlike the contig view this rail knows its own
     // rows and has no pointer whose coverage it is restating.
     mapper::note_mapping_write_footprint(state, mapping_id, base_off, span_end - base_off);
+    mapper::wire_watch::before_write(
+        state,
+        &*host,
+        mapping_id,
+        "gpu_writeback",
+        mapper::wire_watch::WriteKind::Gpu,
+    );
     state.note_host_wrote_mapping(mapping_id);
     note_readback_phase(
         ReadbackPhase::Resolve,

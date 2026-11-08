@@ -199,6 +199,17 @@ pub const RANGE_COVERAGE: &str = "REIMS_VGPU_RANGE_COVERAGE";
 /// is `strict`, the side that never writes through an unwitnessed page list.
 pub const KVA_WALK: &str = "REIMS_VGPU_KVA_WALK";
 
+/// `on` samples the guest's wire count on every type-11 surface descriptor and
+/// logs its first wrong value beside the display, stamp and write events around
+/// it. A diagnostic: it reads guest kernel memory and changes nothing the guest
+/// sees. See [`crate::runtime::mapper::wire_watch`].
+pub const WIRE_WATCH: &str = "REIMS_VGPU_WIRE_WATCH";
+
+/// `on`, with [`WIRE_WATCH`] on, refuses a host CPU write into a mapping whose
+/// checked surface wire count reads zero or less right before the write. It only
+/// narrows: a refused write is one this device would have made.
+pub const WIRE_GUARD: &str = "REIMS_VGPU_WIRE_GUARD";
+
 /// `off` stops narrowing a guest buffer bind to the extent the shader's
 /// reflection proved it can read, so the bind walks the rest of the allocation
 /// exactly as it did before that rail existed.
@@ -1226,7 +1237,7 @@ pub fn switch(name: &str) -> Switch {
 /// Nothing enforces that a new `pub const` above is added to this list; the rule
 /// is stated and honestly unenforced. What keeps it small is that the list is
 /// next to the constants, and [`report_line`] is the only consumer.
-pub const ALL: [&str; 29] = [
+pub const ALL: [&str; 31] = [
     COLOR_GENERAL,
     LAZY_WRITEBACK,
     SLAB_RETAIN,
@@ -1246,6 +1257,8 @@ pub const ALL: [&str; 29] = [
     PAGE_GUARDS,
     RANGE_COVERAGE,
     KVA_WALK,
+    WIRE_WATCH,
+    WIRE_GUARD,
     BUFFER_EXTENT,
     BATCH_MIXED_TARGETS,
     BATCH_DEPTH,

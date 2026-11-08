@@ -82,6 +82,11 @@ fn note_translation_order_hold(state: &mut DeviceState, held_mask: u32) {
         state.translation_deferred_mask,
         state.translation_order_holds
     ));
+    let (held, producer) = (
+        state.translation_order_hold_mask,
+        state.translation_deferred_mask,
+    );
+    crate::runtime::mapper::wire_watch::on_hold(state, held, new_mask, producer);
 }
 
 /// What the deferred EXEC packets in `translation_deferred_mask` are waiting
@@ -108,6 +113,7 @@ fn release_translation_order_holds(state: &mut DeviceState) {
     crate::observe::off(format!(
         "translation_order_release held_mask={held_mask:#x} producer_mask=0x0"
     ));
+    crate::runtime::mapper::wire_watch::on_hold_release(state, held_mask);
 }
 
 /// Install a `DefineTask2` payload and record the page-table identity it
@@ -646,6 +652,78 @@ fn present_surface_id(opcode: u16, payload: &[u8]) -> Option<u32> {
     (payload.len() >= trailer).then(|| {
         let off = display_txn_trailer_slots(opcode).0 * 4;
         ld32(&payload[off..])
+    })
+}
+
+/// The three display present commands `process_child_packet` sends to
+/// `present_named_mapping`.
+fn is_display_present(opcode: u16) -> bool {
+    matches!(
+        opcode,
+        CHILD_OP_DISPLAY_SWAP | CHILD_OP_DISPLAY_TRANSACTION2 | CHILD_OP_DISPLAY_TRANSACTION3
+    )
+}
+
+/// The packet at a child FIFO's head, read and left where it is.
+pub(crate) struct HeadPeek {
+    pub head: u32,
+    pub opcode: u16,
+    pub completion_stamp: u32,
+    /// The surface a display present names; `None` for any other command.
+    pub mapping: Option<u32>,
+}
+
+/// Read the packet a held child FIFO would run next, without running it or
+/// moving its head. Only through a ring this device has already set up; an
+/// incomplete or unreadable packet is `None`.
+///
+/// For [`crate::runtime::mapper::wire_watch`], which wants to see a display
+/// swap when it arrives behind a hold and not only when it runs.
+pub(crate) fn peek_child_head<M: HostMemory>(
+    state: &DeviceState,
+    mem: &M,
+    channel_id: u32,
+) -> Option<HeadPeek> {
+    if state.gfx.root_page == 0 {
+        return None;
+    }
+    let regs_gpa = state.pfn_gpa(state.gfx.root_page) + child_reg_block_offset(channel_id)?;
+    let ring = state.child_rings.get(channel_id as usize)?;
+    let base_pfn = crate::runtime::host::read_u32(mem, regs_gpa + CHILD_REG_BASE_PFN).ok()?;
+    if !ring.valid || ring.base_pfn != base_pfn {
+        return None;
+    }
+    let head = crate::runtime::host::read_u32(mem, regs_gpa + CHILD_REG_HEAD).ok()?;
+    let tail = crate::runtime::host::read_u32(mem, regs_gpa + CHILD_REG_TAIL).ok()?;
+    let available = published_byte_count(head, tail, ring.length)?;
+    if available < PACKET_HEADER_LEN {
+        return None;
+    }
+    let read = |len: u32| {
+        read_child_ring_bytes_inner(mem, &ring.page_gpas, ring.length, head, len, state.page_shift)
+            .ok()
+    };
+    let header = read(PACKET_HEADER_LEN)?;
+    let opcode = ld16(&header[PACKET_OPCODE..]);
+    let total_size = ld32(&header[PACKET_TOTAL_SIZE..]);
+    let completion_stamp = ld32(&header[PACKET_COMPLETION_STAMP..]);
+    let payload_off = PACKET_HEADER_LEN
+        .saturating_add(u32::from(ld16(&header[PACKET_STAMP_COUNT..])) * PACKET_STAMP_LEN);
+    let mapping = if is_display_present(opcode)
+        && total_size <= available
+        && total_size <= ring.length
+        && payload_off <= total_size
+    {
+        let bytes = read(total_size)?;
+        present_surface_id(opcode, &bytes[payload_off as usize..])
+    } else {
+        None
+    };
+    Some(HeadPeek {
+        head,
+        opcode,
+        completion_stamp,
+        mapping,
     })
 }
 
@@ -1900,6 +1978,7 @@ pub fn write_stamp<H: HostMemory + HostOps>(
             // fence — which is what `armed_stamp_seq` is compared against, and
             // dating it from the completion would call that window punctual.
             state.completion_stamp_seq = state.completion_stamp_seq.wrapping_add(1);
+            crate::runtime::mapper::wire_watch::on_stamp(state, &*host, index, stamp_value, true);
             return;
         }
         if order.needs_blocking_fallback() {
@@ -1935,6 +2014,7 @@ pub fn write_stamp<H: HostMemory + HostOps>(
             .interrupt_status_gpu
             .fetch_or(1u32 << (index & 0x1f), std::sync::atomic::Ordering::AcqRel);
         host.enqueue(HostAction::irq_gfx());
+        crate::runtime::mapper::wire_watch::on_stamp(state, &*host, index, stamp_value, false);
     }
 }
 
@@ -5031,9 +5111,40 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
                     state.pending.child_mask |= bit;
                     break;
                 }
+                let watched_present = is_display_present(packet.opcode)
+                    && crate::runtime::mapper::wire_watch::enabled();
+                let present_started_us = if watched_present {
+                    crate::runtime::mapper::wire_watch::before_swap(state, &*host);
+                    crate::observe::elapsed_us()
+                } else {
+                    0
+                };
                 let proc_started = std::time::Instant::now();
                 let disposition = process_child_packet(state, host, channel_id, &packet);
                 census::note_drain_proc(packet.opcode, proc_started.elapsed().as_nanos() as u64);
+                if watched_present {
+                    let waits: Vec<(u32, u32)> = packet
+                        .stamp_waits
+                        .iter()
+                        .map(|w| (w.index, w.value))
+                        .collect();
+                    crate::runtime::mapper::wire_watch::after_swap(
+                        state,
+                        &*host,
+                        crate::runtime::mapper::wire_watch::SwapPacket {
+                            channel: channel_id,
+                            head,
+                            slot: stamp_index_slot,
+                            opcode: packet.opcode,
+                            stamp: packet.completion_stamp,
+                            waits: &waits,
+                            payload: &packet.payload,
+                            mapping: present_surface_id(packet.opcode, &packet.payload),
+                        },
+                        present_started_us,
+                        disposition == ChildPacketDisposition::Deferred,
+                    );
+                }
                 if disposition == ChildPacketDisposition::Deferred {
                     // Translation owns only immutable AIR bytes. Keep head and
                     // stamp untouched so retry cannot duplicate any packet
@@ -5203,6 +5314,7 @@ pub fn drain_iosfc<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut 
                             let _ = crate::runtime::mapper::resolve_mapping_backing(
                                 state, host, mapping_id,
                             );
+                            crate::runtime::mapper::wire_watch::on_map(state, &*host, mapping_id);
                         } else {
                             // Mismatched capture — put back for a later entry.
                             state.mapper_capture = Some(c);
@@ -5210,6 +5322,7 @@ pub fn drain_iosfc<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut 
                     }
                 }
                 MAPPER_REQUEST_UNMAP => {
+                    crate::runtime::mapper::wire_watch::on_unmap(state, &*host, mapping_id);
                     // Deferred-writeback: DROP, never write — same recycled-page
                     // hazard as DeleteIOSurfaceBacking2 (the unmap request
                     // trails the guest release; writing risks PTE corruption).
@@ -5343,6 +5456,7 @@ pub fn signal_display_present_complete<H: HostMemory + HostOps>(
     let gpa = state.display.shared_gpa;
     if gpa == 0 {
         note_display_present_signal(DISPLAY_PRESENT_NO_GPA);
+        crate::runtime::mapper::wire_watch::on_present(state, "no_gpa");
         return;
     }
     // The mask gates the pending write and not just the interrupt. It used to
@@ -5351,9 +5465,11 @@ pub fn signal_display_present_complete<H: HostMemory + HostOps>(
     // [`display_event_enabled`] for why that residue is not inert.
     if !display_event_enabled(host, gpa, DISPLAY_PRESENT_EVENT_MASK) {
         note_display_present_signal(DISPLAY_PRESENT_NOT_ENABLED);
+        crate::runtime::mapper::wire_watch::on_present(state, "not_enabled");
         return;
     }
     note_display_present_signal(DISPLAY_PRESENT_DELIVERED);
+    crate::runtime::mapper::wire_watch::on_present(state, "delivered");
     // Pending word is atomic read-and-clear (ldclral) on the guest side; OR
     // the present bit so a not-yet-consumed ONLINE event is preserved.
     let mut pending_le = [0u8; 4];
@@ -5831,6 +5947,7 @@ pub(crate) fn signal_display_refresh_classes<H: HostMemory + HostOps>(
     note_vbl(if vbl { VBL_DELIVERED } else { VBL_NOT_ENABLED }, now_ms);
     if transaction {
         note_display_present_signal(DISPLAY_PRESENT_REFRESH);
+        crate::runtime::mapper::wire_watch::note_refresh_signal();
     }
 
     let mut pending_le = [0u8; 4];
@@ -6167,6 +6284,7 @@ fn note_present_backpressure_hold(state: &mut DeviceState, channel: u32, head: u
         "THRASH present_action_starvation reason=pending_frames_cap ch={channel} head={head} tail={tail} unpainted={} episode={}",
         state.present.unpainted_presents, state.present.backpressure_hold_count
     ));
+    crate::runtime::mapper::wire_watch::swap_held(state, "backpressure", channel, head);
 }
 
 /// Publish the poll-tick/Dekker rescue to the asynchronous drain owner.
@@ -6365,6 +6483,8 @@ fn retry_stamp_held_timelines<H: HostMemory + HostOps>(state: &mut DeviceState, 
 }
 
 pub fn drain_pending<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut H) {
+    // Ahead of the yield below: a held present is exactly when it must look.
+    crate::runtime::mapper::wire_watch::tick(state, &*host);
     // A queued present action is part of the ordered device timeline. QEMU
     // cannot paint it while this worker owns the device lock, so later worker
     // wakeups must leave guest work queued until scanout consumes the action.
