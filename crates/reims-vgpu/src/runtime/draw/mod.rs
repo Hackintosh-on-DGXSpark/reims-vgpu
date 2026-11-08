@@ -5752,6 +5752,204 @@ fn load_type11_rgba_memoized<M: HostMemory + HostOps>(
     ))
 }
 
+/// A biplanar YCbCr surface bound whole, as macOS 14 and later bind their
+/// background video, expanded to RGBA8 on the CPU. The planes are re-read on
+/// every bind and memoized the way [`load_type11_rgba_memoized`] memoizes, so a
+/// paused frame costs a read and a compare, not a conversion and an upload.
+/// See [`crate::runtime::ycbcr`] for the two families, the matrix and the range.
+#[cfg(feature = "backend-vulkan")]
+fn load_type11_ycbcr_memoized<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mid: u32,
+    sampling: crate::runtime::ycbcr::Sampling,
+) -> Option<(std::sync::Arc<Vec<u8>>, LinearSampleIdentity)> {
+    use crate::contract::iosurface_pages::{
+        decode_device_surface, device_desc_plane, sample_window_from_device_plane,
+    };
+    use crate::contract::pixel_format::{
+        MTL_FORMAT_R16_UNORM, MTL_FORMAT_R8_UNORM, MTL_FORMAT_RG16_UNORM, MTL_FORMAT_RG8_UNORM,
+    };
+    use crate::runtime::ycbcr::{self, Biplanar};
+
+    let decline = |reason: &str, detail: String| {
+        if crate::observe::first_sight("ycbcr_sample_declined", u64::from(mid)) {
+            crate::observe::fail(format!("ycbcr_sample reason={reason} mid={mid} {detail}"));
+        }
+        None
+    };
+    let (layout, luma_window, chroma_window, fourcc) = {
+        let m = state.mappings.get(&mid)?;
+        let Some(desc) = m.device_desc_complete() else {
+            return decline("no_device_desc", format!("fmt={}", m.format));
+        };
+        let surface = decode_device_surface(desc)?;
+        let (Some((luma, _)), Some((chroma, _))) =
+            (device_desc_plane(desc, 0), device_desc_plane(desc, 1))
+        else {
+            return decline("planes", format!("planes={}", surface.plane_count));
+        };
+        let fourcc = surface.pixel_format;
+        let Some(layout) = Biplanar::from_planes(
+            surface.pixel_format,
+            (luma.width, luma.height, luma.bytes_per_element),
+            (chroma.width, chroma.height, chroma.bytes_per_element),
+        ) else {
+            return decline(
+                "layout",
+                format!(
+                    "fourcc={:#x} luma={}x{}x{} chroma={}x{}x{}",
+                    surface.pixel_format,
+                    luma.width,
+                    luma.height,
+                    luma.bytes_per_element,
+                    chroma.width,
+                    chroma.height,
+                    chroma.bytes_per_element
+                ),
+            );
+        };
+        let luma_window = sample_window_from_device_plane(
+            &luma,
+            if layout.sample_bytes == 2 {
+                MTL_FORMAT_R16_UNORM
+            } else {
+                MTL_FORMAT_R8_UNORM
+            },
+            layout.width,
+            layout.height,
+        );
+        let chroma_window = sample_window_from_device_plane(
+            &chroma,
+            if layout.sample_bytes == 2 {
+                MTL_FORMAT_RG16_UNORM
+            } else {
+                MTL_FORMAT_RG8_UNORM
+            },
+            layout.chroma_width(),
+            layout.chroma_height(),
+        );
+        let (Some(luma_window), Some(chroma_window)) = (luma_window, chroma_window) else {
+            return decline("window", format!("{layout:?}"));
+        };
+        (layout, luma_window, chroma_window, fourcc)
+    };
+    if !mapper::ensure_resolved_for_scanout(state, host, mid) {
+        return decline("unresolved", String::new());
+    }
+    let (w, h) = (layout.width, layout.height);
+    let (cw, ch) = (layout.chroma_width(), layout.chroma_height());
+    let s = layout.sample_bytes;
+    let luma_len = (w as usize) * (h as usize) * s as usize;
+    let chroma_len = (cw as usize) * 2 * (ch as usize) * s as usize;
+    let mut scratch = std::mem::take(&mut state.type11_memo_scratch);
+    scratch.resize(luma_len + chroma_len, 0);
+    let (luma, chroma) = scratch.split_at_mut(luma_len);
+    let read = |state: &mut DeviceState,
+                host: &mut M,
+                (base_off, bpr, span_end): (u64, u32, u64),
+                bpp: u32,
+                width: u32,
+                height: u32,
+                dst: &mut [u8]| {
+        mapping_write::read_rect_raw_at(
+            state,
+            host,
+            mid,
+            mapping_write::SurfaceWindow {
+                base_off,
+                bpr,
+                span_end,
+                bpp,
+            },
+            mapping_write::Rect {
+                origin_x: 0,
+                origin_y: 0,
+                width,
+                height,
+            },
+            dst,
+            width * bpp,
+        )
+    };
+    if !read(state, host, luma_window, s, w, h, luma)
+        || !read(state, host, chroma_window, 2 * s, cw, ch, chroma)
+    {
+        state.type11_memo_scratch = scratch;
+        return decline("read", format!("{layout:?}"));
+    }
+    // Each family's texels of one surface are a different image, so the family
+    // is part of both keys.
+    let family = sampling as u32;
+    let identity_key = (1u64 << 63) | (1u64 << 62) | (u64::from(family) << 40) | mid as u64;
+    let key = (mid, w | family << 30, h);
+    if let Some(m) = state.type11_memo.get_touch(&key) {
+        if m.native == scratch {
+            let rgba = m.rgba.clone();
+            let generation = m.generation;
+            state.type11_memo_scratch = scratch;
+            return Some((
+                rgba,
+                LinearSampleIdentity {
+                    key: identity_key,
+                    generation,
+                },
+            ));
+        }
+    }
+    let mut rgba = vec![0u8; (w as usize) * (h as usize) * 4];
+    let (luma, chroma) = scratch.split_at(luma_len);
+    if !ycbcr::to_rgba8(
+        layout,
+        sampling,
+        luma,
+        (w * s) as usize,
+        chroma,
+        (cw * 2 * s) as usize,
+        &mut rgba,
+    ) {
+        state.type11_memo_scratch = scratch;
+        return decline("convert", format!("{layout:?}"));
+    }
+    if crate::observe::first_sight("ycbcr_sample_converted", u64::from(mid)) {
+        let format = state.mappings.get(&mid).map_or(0, |m| m.format);
+        crate::observe::fail(format!(
+            "ycbcr_sample converted mid={mid} fmt={format} fourcc={fourcc:#x} {sampling:?} \
+             {layout:?} luma={luma_window:?} chroma={chroma_window:?}"
+        ));
+    }
+    let rgba = std::sync::Arc::new(rgba);
+    let generation = state.next_sampled_content_generation();
+    let entry_bytes = scratch.len() + rgba.len();
+    state.type11_memo.insert(
+        key,
+        crate::model::GuestLinearMemo {
+            native: scratch,
+            rgba: rgba.clone(),
+            layout: crate::contract::pixel_format::TexelLayout::Rgba8,
+            generation,
+        },
+        entry_bytes,
+    );
+    Some((
+        rgba,
+        LinearSampleIdentity {
+            key: identity_key,
+            generation,
+        },
+    ))
+}
+/// [`load_type11_ycbcr_memoized`]'s texels alone, for compute staging.
+#[cfg(feature = "backend-vulkan")]
+pub(crate) fn load_ycbcr_rgba<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mid: u32,
+    sampling: crate::runtime::ycbcr::Sampling,
+) -> Option<std::sync::Arc<Vec<u8>>> {
+    load_type11_ycbcr_memoized(state, host, mid, sampling).map(|(rgba, _)| rgba)
+}
+
 #[cfg(test)]
 mod tests;
 

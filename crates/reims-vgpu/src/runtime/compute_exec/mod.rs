@@ -2143,6 +2143,34 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
         if width == 0 || height == 0 {
             return Err(ComputeStatus::MissingTexture("compute_stage_tex_zero_geom"));
         }
+        // A biplanar YCbCr surface samples as one image in its family's channel
+        // order (15's VideoToolbox kernel reads Setup Assistant's background
+        // video this way). Stage those texels; there is nothing to write back.
+        #[cfg(feature = "backend-vulkan")]
+        if let (Some(sampling), false) =
+            (crate::runtime::ycbcr::Sampling::of(format), is_storage)
+        {
+            let Some(rgba) =
+                crate::runtime::draw::load_ycbcr_rgba(state, host, mapping_id, sampling)
+                    .filter(|rgba| rgba.len() == (width as usize) * (height as usize) * 4)
+            else {
+                return Err(ComputeStatus::Unsupported("stage_tex_ycbcr"));
+            };
+            return Ok(StagedTexture {
+                binding,
+                array_element: 0,
+                descriptor_count: 1,
+                pixel_format: pixel_format::MTL_FORMAT_RGBA8_UNORM,
+                storage_selector: None,
+                width,
+                height,
+                bytes: rgba.as_ref().clone(),
+                is_storage: false,
+                residency: None,
+                serve: None,
+                writeback: TextureWriteback::None,
+            });
+        }
         // sRGB color-renderable surfaces stage as unorm storage (same bpp).
         let view_format = match crate::runtime::draw::effective_view_sample_format_reasoned(
             format,

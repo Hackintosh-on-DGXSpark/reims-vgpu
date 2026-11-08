@@ -1258,6 +1258,32 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
         if let Some(m) = state.mappings.get(&mid) {
             if m.has_geom && m.width > 0 && m.height > 0 {
                 let (w, h) = (m.width, m.height);
+                // A biplanar YCbCr surface bound whole samples as one image,
+                // which none of the rungs below can produce: they serve the
+                // surface's bytes, and its bytes are two planes.
+                if let Some(sampling) = crate::runtime::ycbcr::Sampling::of(m.format) {
+                    let texels = (w as usize) * (h as usize) * 4;
+                    if let Some((rgba, identity)) =
+                        load_type11_ycbcr_memoized(state, host, mid, sampling)
+                            .filter(|(rgba, _)| rgba.len() == texels)
+                    {
+                        crate::runtime::drain::note_store_route("t11rung_ycbcr");
+                        return Some((
+                            w,
+                            h,
+                            mid,
+                            SampledSourceRequest::Bytes(
+                                rgba,
+                                Some(identity),
+                                SampledByteFormat::from_source(
+                                    TexelLayout::Rgba8,
+                                    crate::contract::pixel_format::MTL_FORMAT_RGBA8_UNORM,
+                                ),
+                                crate::backend::vulkan::engine::SampledByteOrigin::SurfaceGuestFallback,
+                            ),
+                        ));
+                    }
+                }
                 // Compute the resident-surface identity once and reuse it for
                 // both the readiness check and the direct bind.
                 let resident_id =
