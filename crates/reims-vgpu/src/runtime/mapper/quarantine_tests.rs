@@ -125,11 +125,50 @@ fn a_collision_quarantines_both_and_the_old_surface_takes_no_write() {
     );
 }
 
-/// The guest's UNMAP of the old surface is the evidence: its quarantine lifts
-/// and its frame is dropped unwritten, and the new surface, left without a
-/// counterpart, is lifted with it and writes again.
+/// The reverse of the 27 boot's sequence: the new surface is unmapped after
+/// the collision. That proves the new surface gave its pages up, not that the
+/// old one owns them again, so the old surface stays quarantined: its flush and
+/// its owed frame write nothing.
 #[test]
-fn the_old_surfaces_unmap_lifts_both_and_drops_only_its_frame() {
+fn the_new_surfaces_unmap_does_not_restore_the_old_one() {
+    let (mut host, mut state) = fixture();
+    owe_a_frame(&mut state, OLD);
+    // As on the 27 boot: two new surfaces, each handed one of the old one's
+    // pages, then both unmapped in turn.
+    surface(&mut state, NEW, &[P1]);
+    fail_closed_surface_page_collision(&mut state, NEW, P1, OLD, 1, "rewire");
+    surface(&mut state, 9, &[P0]);
+    fail_closed_surface_page_collision(&mut state, 9, P0, OLD, 1, "rewire");
+    let epoch = state.host_writes.epoch();
+
+    assert!(state.unmap_surface(NEW));
+    assert!(!is_quarantined(&state, NEW));
+    assert!(state.unmap_surface(9));
+    assert!(!is_quarantined(&state, 9));
+    assert!(
+        is_quarantined(&state, OLD),
+        "a partner's release is not the old surface's evidence"
+    );
+
+    let frame: Vec<u8> = [89u8, 101, 112, 255].repeat(16);
+    assert!(!crate::runtime::mapping_write::write_bgra8_uncached(
+        &mut state, &mut host, OLD, &frame, 16, 4, 4
+    ));
+    crate::runtime::writeback_debt::pay_for_mapping(&mut state, &mut host, OLD);
+    assert!(state.pending_writebacks.get(OLD).is_some(), "still held");
+    assert!(untouched(&host), "no byte reached either page");
+    assert_eq!(
+        state.host_writes.wrote_any_since(epoch, &[P0, P1]),
+        HostWriteVerdict::Quiet
+    );
+}
+
+/// The guest's UNMAP of the old surface is its own evidence: its quarantine
+/// lifts and its frame is dropped unwritten. The new surface stays quarantined:
+/// its own MAP only arms the lift, and the resolve that adopts a table other
+/// than the quarantined one completes it.
+#[test]
+fn each_side_is_lifted_only_by_its_own_lifecycle() {
     let (mut host, mut state) = fixture();
     owe_a_frame(&mut state, OLD);
     surface(&mut state, NEW, &[P1]);
@@ -137,56 +176,184 @@ fn the_old_surfaces_unmap_lifts_both_and_drops_only_its_frame() {
     let cap = crate::observe::sink::FailCapture::start();
 
     assert!(state.unmap_surface(OLD));
-    assert!(!is_quarantined(&state, OLD) && !is_quarantined(&state, NEW));
+    assert!(!is_quarantined(&state, OLD));
     assert!(
         state.pending_writebacks.get(OLD).is_none(),
         "dropped, not paid"
     );
-    let lines = cap.lines();
-    assert!(lines.iter().any(
-        |l| l.contains("surface_quarantine_lifted mid=2 evidence=unmap")
-            && l.contains("debt_dropped=true")
-    ));
-    assert!(lines
-        .iter()
-        .any(|l| l.contains("surface_quarantine_lifted mid=8 evidence=partner_unmap")));
+    assert!(cap.lines().iter().any(|l| l
+        .contains("surface_quarantine_lifted mid=2 evidence=unmap")
+        && l.contains("debt_dropped=true")));
+    assert!(
+        is_quarantined(&state, NEW),
+        "the old surface's release is not the new one's evidence"
+    );
 
-    // The new surface re-resolves its page and owns it now.
+    assert!(state.map_surface(NEW));
+    assert!(is_quarantined(&state, NEW), "a MAP alone lifts nothing");
+    // What a resolve does after adopting a table: the same one lifts nothing,
+    // another one does.
     state.mappings.get_mut(&NEW).unwrap().page_entries = vec![entry(P1)];
+    crate::runtime::surface_quarantine::confirm_new_backing(&mut state, NEW);
+    assert!(is_quarantined(&state, NEW), "the quarantined table again");
+    state.mappings.get_mut(&NEW).unwrap().page_entries = vec![entry(P0)];
+    crate::runtime::surface_quarantine::confirm_new_backing(&mut state, NEW);
+    assert!(!is_quarantined(&state, NEW));
+
     let token = vouch_mapping_pages_verdict(&mut state, &host, NEW)
         .1
-        .expect("the survivor can be vouched");
+        .expect("the new backing can be vouched");
     assert!(write_mapping_bytes(
         &mut state, &mut host, NEW, 0, b"MINE", &token
     ));
     let mut got = [0u8; 4];
-    host.read_gpa(P1, &mut got).unwrap();
+    host.read_gpa(P0, &mut got).unwrap();
     assert_eq!(&got, b"MINE");
 }
 
-/// A new MAP of the old id is a rebind: its quarantine lifts and its old
-/// frame is dropped. A MappingInternal re-stated unchanged is not evidence.
+/// A proof minted before a quarantine never covers again, even if the
+/// quarantine were cleared at the same generation: the revocation moved the
+/// mapping's write epoch.
 #[test]
-fn a_rebind_lifts_the_quarantine_and_a_restatement_does_not() {
-    let (_host, mut state) = fixture();
-    owe_a_frame(&mut state, OLD);
+fn a_proof_from_before_the_quarantine_never_covers_again() {
+    let (host, mut state) = fixture();
+    let early = vouch_mapping_pages_verdict(&mut state, &host, OLD)
+        .1
+        .expect("vouched before");
+    assert!(early.covers(&state, OLD));
     surface(&mut state, NEW, &[P1]);
     fail_closed_surface_page_collision(&mut state, NEW, P1, OLD, 1, "rewire");
+    let generation = state.mappings[&OLD].map_generation;
+    state.mappings.get_mut(&OLD).unwrap().quarantine = None;
+    assert_eq!(state.mappings[&OLD].map_generation, generation);
+    assert!(!early.covers(&state, OLD));
+}
 
-    assert!(
-        state.attach_mapping_internal(OLD, 1),
-        "the same MappingInternal"
-    );
-    assert!(
-        is_quarantined(&state, OLD),
-        "a re-statement is not a rebind"
-    );
+/// A store that finds the collision itself — the resolve inside its write is
+/// what quarantines the mapping — defers the frame: back in the ledger at its
+/// generation, not lost. Without a quarantine the refusal is a loss as before.
+#[test]
+fn a_store_that_finds_the_quarantine_defers_the_frame() {
+    use crate::runtime::surface_quarantine::{after_refused_store, RefusedStore};
+    let (_host, mut state) = fixture();
+    owe_a_frame(&mut state, OLD);
+    let debt = state.pending_writebacks.take(OLD).unwrap();
+    let armed_gen = debt.map_generation;
+    assert!(matches!(
+        after_refused_store(&mut state, OLD, debt.clone()),
+        RefusedStore::Lost(_)
+    ));
 
-    assert!(state.map_surface(OLD));
-    assert!(!is_quarantined(&state, OLD));
-    assert!(state.pending_writebacks.get(OLD).is_none());
-    assert!(
-        !is_quarantined(&state, NEW),
-        "its only counterpart was rebound"
+    surface(&mut state, NEW, &[P1]);
+    fail_closed_surface_page_collision(&mut state, NEW, P1, OLD, 1, "rewire");
+    assert_eq!(
+        after_refused_store(&mut state, OLD, debt),
+        RefusedStore::Deferred
     );
+    assert_eq!(
+        state.pending_writebacks.get(OLD).map(|d| d.map_generation),
+        Some(armed_gen),
+        "held at the generation it was armed at"
+    );
+}
+
+// MARK: - Through the resolve
+
+mod through_resolve {
+    use super::*;
+    use crate::contract::iosurface_pages::{
+        MAPPING_INTERNAL_BACKPTR, MAPPING_INTERNAL_EXPECTED_SIZE, MAPPING_INTERNAL_ID,
+        MAPPING_INTERNAL_PAGE_COUNT, MAPPING_INTERNAL_PAGE_FIELD_48, MAPPING_INTERNAL_SIZE,
+        MAPPING_PAGE_TABLE_FROM_F48,
+    };
+    use crate::model::{PAGE_SHIFT_ARM64E, PAGE_SIZE_ARM64E};
+
+    const KVA: u64 = 0xfffffe00_2000_0000;
+    const TABLE: u64 = KVA + 0x3000;
+    const A: u32 = 0x3_1000;
+    const B: u32 = 0x3_2000;
+
+    fn put(host: &mut FakeHost, at: u64, bytes: &[u8]) {
+        host.map_range(at, bytes.len(), 0);
+        host.write_gpa(at, bytes).unwrap();
+    }
+
+    fn entry16(pfn: u32) -> u32 {
+        (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID
+    }
+
+    /// Mapping `OLD` with a MappingInternal whose one-page table names `A`.
+    fn resolvable() -> (FakeHost, DeviceState) {
+        let mut host = FakeHost::new();
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let (internal, mapper, page_obj) = (KVA, KVA + 0x1000, KVA + 0x2000);
+        put(
+            &mut host,
+            internal + MAPPING_INTERNAL_BACKPTR,
+            &mapper.to_le_bytes(),
+        );
+        put(
+            &mut host,
+            internal + MAPPING_INTERNAL_ID,
+            &OLD.to_le_bytes(),
+        );
+        put(
+            &mut host,
+            internal + MAPPING_INTERNAL_SIZE,
+            &MAPPING_INTERNAL_EXPECTED_SIZE.to_le_bytes(),
+        );
+        put(
+            &mut host,
+            internal + MAPPING_INTERNAL_PAGE_FIELD_48,
+            &page_obj.to_le_bytes(),
+        );
+        put(
+            &mut host,
+            internal + MAPPING_INTERNAL_PAGE_COUNT,
+            &1u64.to_le_bytes(),
+        );
+        put(
+            &mut host,
+            page_obj + MAPPING_PAGE_TABLE_FROM_F48,
+            &TABLE.to_le_bytes(),
+        );
+        put(&mut host, TABLE, &entry16(A).to_le_bytes());
+        for pfn in [A, B] {
+            host.map_range(
+                u64::from(pfn) << PAGE_SHIFT_ARM64E,
+                PAGE_SIZE_ARM64E as usize,
+                0,
+            );
+        }
+        state.mapper_device_kva = mapper;
+        assert!(state.attach_mapping_internal(OLD, internal));
+        assert!(resolve_mapping_backing(&mut state, &host, OLD));
+        (host, state)
+    }
+
+    /// The 27 sequence with a MAP for the old id: the MAP arms nothing but a
+    /// re-check, the resolve that re-reads the same stale table keeps the
+    /// quarantine, and only a resolve adopting a different table lifts it.
+    #[test]
+    fn a_map_with_the_same_stale_table_lifts_nothing_and_a_new_table_does() {
+        let (mut host, mut state) = resolvable();
+        let gpa = u64::from(A) << PAGE_SHIFT_ARM64E;
+        state.map_surface(NEW);
+        state.mappings.get_mut(&NEW).unwrap().page_entries = vec![entry16(A)];
+        fail_closed_surface_page_collision(&mut state, NEW, gpa, OLD, 1, "rewire");
+        assert!(is_quarantined(&state, OLD));
+
+        assert!(state.map_surface(OLD));
+        let _ = resolve_mapping_backing(&mut state, &host, OLD);
+        assert_eq!(state.mappings[&OLD].page_entries, vec![entry16(A)]);
+        assert!(
+            is_quarantined(&state, OLD),
+            "the same stale table re-announced"
+        );
+
+        put(&mut host, TABLE, &entry16(B).to_le_bytes());
+        assert!(resolve_mapping_backing(&mut state, &host, OLD));
+        assert_eq!(state.mappings[&OLD].page_entries, vec![entry16(B)]);
+        assert!(!is_quarantined(&state, OLD), "a new backing");
+    }
 }

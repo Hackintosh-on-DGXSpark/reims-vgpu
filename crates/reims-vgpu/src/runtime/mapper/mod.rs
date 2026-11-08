@@ -728,6 +728,9 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
     if let Some(import) = retired_import {
         state.retired_guest_imports.push(import);
     }
+    // A rebind seen for a quarantined id is confirmed only by adopting a table
+    // other than the quarantined one; see `runtime::surface_quarantine`.
+    crate::runtime::surface_quarantine::confirm_new_backing(state, mapping_id);
     if incarnation_changed {
         // The condemned backing really died and the id now carries a new
         // surface: drop the prior incarnation's deferred windows before any
@@ -1406,6 +1409,8 @@ pub fn type4_pages_witness<H: HostMemory>(
 pub struct PagesVouched {
     mapping_id: u32,
     map_generation: u32,
+    /// The mapping's write epoch when minted; a revocation moves it.
+    write_epoch: u64,
 }
 
 impl PagesVouched {
@@ -1419,7 +1424,9 @@ impl PagesVouched {
             && state
                 .mappings
                 .get(&mapping_id)
-                .is_some_and(|m| m.map_generation == self.map_generation)
+                .is_some_and(|m| {
+                    m.map_generation == self.map_generation && m.write_epoch == self.write_epoch
+                })
             // A quarantine revokes every proof at once, including one minted
             // before it: see `runtime::surface_quarantine`.
             && !crate::runtime::surface_quarantine::is_quarantined(state, mapping_id)
@@ -1462,6 +1469,7 @@ pub fn vouch_mapping_pages_verdict<H: HostMemory + HostOps>(
     let token = state.mappings.get(&mapping_id).map(|m| PagesVouched {
         mapping_id,
         map_generation: m.map_generation,
+        write_epoch: m.write_epoch,
     });
     (verdict, token)
 }

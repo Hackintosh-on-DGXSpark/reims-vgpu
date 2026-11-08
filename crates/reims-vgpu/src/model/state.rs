@@ -1511,6 +1511,9 @@ pub struct MappingEntry {
     pub quarantine: Option<crate::runtime::surface_quarantine::Quarantine>,
     /// `observe::elapsed_ms` when a resolve last adopted this page list.
     pub validated_ms: u64,
+    /// Bumped whenever this mapping's write authority is revoked; a page proof
+    /// carries the epoch it was minted in and covers no other.
+    pub write_epoch: u64,
     /// Guest KVA of MappingInternal (from capture or recover).
     pub mapping_internal: u64,
     pub page_table_kva: u64,
@@ -3590,9 +3593,6 @@ impl DeviceState {
     /// plan) or bumps + drops (different plan). Returns whether a fingerprint
     /// was stashed; on `false` the caller should fall back to full teardown.
     pub fn condemn_surface_backing(&mut self, mapping_id: u32) -> bool {
-        // The guest deleted this backing: whatever it collided with is no longer
-        // in dispute on its account.
-        crate::runtime::surface_quarantine::lift(self, mapping_id, "delete_backing");
         self.forget_compositor_mapping(mapping_id);
         self.host_surfaces.remove(&mapping_id);
         let Some(e) = self.mappings.get_mut(&mapping_id) else {
@@ -3632,7 +3632,10 @@ impl DeviceState {
             StateMutationDecline::MapSurfaceIdSentinel { mapping_id }.emit(u64::from(mapping_id));
             return false;
         }
-        crate::runtime::surface_quarantine::lift(self, mapping_id, "map");
+        // A MAP notification alone is not a new backing: it can trail the
+        // resolve that already adopted this table. It only arms the lift
+        // that a resolve adopting a different table confirms.
+        crate::runtime::surface_quarantine::note_rebind(self, mapping_id, "map");
         let e = self.mappings.entry(mapping_id).or_default();
         e.mapped = true;
         // Fresh MAP invalidates any previous page table / geom for this slot.
@@ -3733,7 +3736,7 @@ impl DeviceState {
             return false;
         }
         if self.mappings.get(&mapping_id).map(|m| m.mapping_internal) != Some(mapping_internal) {
-            crate::runtime::surface_quarantine::lift(self, mapping_id, "new_internal");
+            crate::runtime::surface_quarantine::note_rebind(self, mapping_id, "new_internal");
         }
         let e = self.mappings.entry(mapping_id).or_default();
         // A re-statement of the SAME MappingInternal (notify trailing our

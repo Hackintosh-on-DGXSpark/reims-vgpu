@@ -1459,7 +1459,7 @@ fn pay<M: HostMemory + HostOps>(
     }
     // The resident the draw registered, not the one a fresh derivation would
     // name today. See `WritebackDebt::identity`.
-    let identity = debt.identity;
+    let identity = debt.identity.clone();
     if crate::runtime::resource_validity::licence_of(validity)
         == crate::runtime::resource_validity::WritebackLicence::Superseded
     {
@@ -1476,6 +1476,16 @@ fn pay<M: HostMemory + HostOps>(
         debt.width,
         debt.height,
     ) {
+        // The store may have found the collision itself, in the resolve its
+        // write runs: then the frame is deferred at its generation — back in the
+        // ledger, its resident still the only copy, and nothing stamped as
+        // written. See `runtime::surface_quarantine`.
+        let debt = match crate::runtime::surface_quarantine::after_refused_store(
+            state, mapping_id, debt,
+        ) {
+            crate::runtime::surface_quarantine::RefusedStore::Deferred => return,
+            crate::runtime::surface_quarantine::RefusedStore::Lost(debt) => debt,
+        };
         // `store_render_frame` reports its own loss on the failure channel; this
         // names the rail that owed it, because a debt paid late and refused is a
         // different investigation from a Store refused where it was issued.

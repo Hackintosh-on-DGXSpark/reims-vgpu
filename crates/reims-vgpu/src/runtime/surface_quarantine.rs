@@ -21,11 +21,17 @@
 //! submitted to either page list are waited for. Their owed frames stay in the
 //! ledger and are not written: the collision alone does not say whose they are.
 //!
-//! A quarantine is lifted only by protocol evidence about that mapping: an
-//! UNMAP, a new MAP or MappingInternal for its id, or its backing's delete; and
-//! a partner whose every counterpart was released that way is lifted with it.
-//! Re-reading the same page table lifts nothing. There is no page blacklist:
-//! the pages are free to belong to whoever the next protocol event names.
+//! A quarantine is lifted only by protocol evidence about that mapping itself:
+//! its UNMAP, or a new MAP or MappingInternal for its id *followed by* a resolve
+//! that adopts a page table different from the one it was quarantined with. A
+//! MAP notification alone is not that: it can trail the resolve that already
+//! adopted the stale table, and a delete that only condemns the table can be
+//! reprieved by re-reading it.
+//! A partner's release is not such evidence: it says the partner no longer owns
+//! the pages, not that this mapping owns them again — the stale side of a
+//! collision whose new surfaces are later unmapped stays quarantined. Re-reading
+//! the same page table lifts nothing. There is no page blacklist: the pages are
+//! free to belong to whoever the next protocol event names.
 
 use crate::model::DeviceState;
 
@@ -39,6 +45,12 @@ pub struct Quarantine {
     /// The mapping's own `map_generation` when it was quarantined.
     pub generation: u32,
     pub since_ms: u64,
+    /// The page entries it held when quarantined: a new backing is a table
+    /// other than this one.
+    pub entries: Vec<u32>,
+    /// A MAP or new MappingInternal arrived for this id since; the next resolve
+    /// adopting a different table lifts the quarantine.
+    pub rebind_seen: Option<&'static str>,
 }
 
 pub fn is_quarantined(state: &DeviceState, mapping_id: u32) -> bool {
@@ -134,6 +146,8 @@ pub fn quarantine_collision(
         let Some(m) = state.mappings.get_mut(&side.mapping_id) else {
             continue;
         };
+        // Every page proof minted before this is void, whatever happens later.
+        m.write_epoch = m.write_epoch.wrapping_add(1);
         match m.quarantine.as_mut() {
             Some(q) => {
                 if !q.partners.contains(&partner) {
@@ -147,6 +161,8 @@ pub fn quarantine_collision(
                     gpa,
                     generation: side.generation,
                     since_ms: now_ms,
+                    entries: m.page_entries.clone(),
+                    rebind_seen: None,
                 });
                 fresh = true;
             }
@@ -170,9 +186,9 @@ pub fn quarantine_collision(
     }
 }
 
-/// A protocol event about `mapping_id` that ends its claim: lift its
-/// quarantine, drop its owed frame unwritten, and lift every partner left
-/// without a counterpart, keeping that partner's frame.
+/// A protocol event about `mapping_id` itself that ends its claim: lift its
+/// quarantine and drop its owed frame unwritten. Its partners stay
+/// quarantined, even with no partner left: see the module doc.
 pub fn lift(state: &mut DeviceState, mapping_id: u32, evidence: &'static str) {
     let now_ms = crate::observe::elapsed_ms() as u64;
     let Some(q) = state
@@ -191,34 +207,16 @@ pub fn lift(state: &mut DeviceState, mapping_id: u32, evidence: &'static str) {
         q.generation,
         q.partners
     ));
+    // The partners keep their quarantine; only the record of who they collided
+    // with is updated, for their own lift line.
     for partner in q.partners {
-        let orphaned = state
+        if let Some(pq) = state
             .mappings
             .get_mut(&partner)
             .and_then(|m| m.quarantine.as_mut())
-            .map(|pq| {
-                pq.partners.retain(|&p| p != mapping_id);
-                pq.partners.is_empty()
-            })
-            .unwrap_or(false);
-        if !orphaned {
-            continue;
+        {
+            pq.partners.retain(|&p| p != mapping_id);
         }
-        let Some(pq) = state
-            .mappings
-            .get_mut(&partner)
-            .and_then(|m| m.quarantine.take())
-        else {
-            continue;
-        };
-        crate::runtime::drain::note_store_route("surface_quarantine_lifted");
-        crate::observe::fail(format!(
-            "surface_quarantine_lifted mid={partner} evidence=partner_{evidence} partner={mapping_id} \
-             held_ms={} gen_then={} debt_dropped=false (its counterpart released its claim; \
-             this mapping's frame is kept)",
-            now_ms.saturating_sub(pq.since_ms),
-            pq.generation
-        ));
     }
 }
 
@@ -243,4 +241,75 @@ pub fn note_refused(mapping_id: u32, writer: &'static str) {
              whose pages another live mapping also claims; not written)"
         ));
     }
+}
+
+/// A MAP, or a new MappingInternal, arrived for a quarantined id. It does not
+/// lift anything by itself; it arms the lift that [`confirm_new_backing`]
+/// performs when a resolve adopts a different table.
+pub fn note_rebind(state: &mut DeviceState, mapping_id: u32, what: &'static str) {
+    let Some(q) = state
+        .mappings
+        .get_mut(&mapping_id)
+        .and_then(|m| m.quarantine.as_mut())
+    else {
+        return;
+    };
+    if q.rebind_seen.is_none() {
+        q.rebind_seen = Some(what);
+        crate::observe::fail(format!(
+            "surface_quarantine_rebind_seen mid={mapping_id} evidence={what} (held until a \
+             resolve adopts a page table other than the quarantined one)"
+        ));
+    }
+}
+
+/// A resolve has just adopted `mapping_id`'s page table. If a rebind was seen
+/// and the table is not the one quarantined, the guest has given the id a new
+/// backing: lift. The same table re-announced lifts nothing.
+pub fn confirm_new_backing(state: &mut DeviceState, mapping_id: u32) {
+    let Some(m) = state.mappings.get(&mapping_id) else {
+        return;
+    };
+    let Some(q) = m.quarantine.as_ref() else {
+        return;
+    };
+    let Some(what) = q.rebind_seen else {
+        return;
+    };
+    if m.page_entries.is_empty() || m.page_entries == q.entries {
+        return;
+    }
+    lift(
+        state,
+        mapping_id,
+        match what {
+            "new_internal" => "new_internal_new_backing",
+            _ => "map_new_backing",
+        },
+    );
+}
+
+/// What a payment whose store wrote nothing owes afterwards.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RefusedStore {
+    /// The store found the mapping quarantined, possibly by discovering the
+    /// collision itself: the frame is back in the ledger, not lost, and not
+    /// copied out.
+    Deferred,
+    /// Any other refusal: the frame is lost, as before.
+    Lost(crate::runtime::writeback_debt::WritebackDebt),
+}
+
+/// Decide a payment whose store returned without writing.
+pub fn after_refused_store(
+    state: &mut DeviceState,
+    mapping_id: u32,
+    debt: crate::runtime::writeback_debt::WritebackDebt,
+) -> RefusedStore {
+    if !is_quarantined(state, mapping_id) {
+        return RefusedStore::Lost(debt);
+    }
+    state.pending_writebacks.restore(mapping_id, debt);
+    note_refused(mapping_id, "debt_store");
+    RefusedStore::Deferred
 }
