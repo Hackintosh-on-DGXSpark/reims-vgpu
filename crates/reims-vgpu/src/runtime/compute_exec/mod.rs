@@ -2256,13 +2256,6 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             ));
             return Err(ComputeStatus::Unsupported("stage_tex_host_len"));
         };
-        let page_bytes = (pages_n as u64).saturating_mul(1u64 << state.page_shift);
-        if page_bytes < span_end {
-            crate::observe::fail(format!(
-                "compute_stage_tex type11_fail reason=span mapping={mapping_id} {width}x{height} pages={pages_n} page_bytes={page_bytes} span_end={span_end} bpr={surface_bpr} wire_len={wire_len}"
-            ));
-            return Err(ComputeStatus::GuestIo("compute_stage_tex_type11_span"));
-        }
         #[cfg(feature = "backend-vulkan")]
         let residency_key = crate::model::ComputeStorageResidencyKey {
             mapping_id,
@@ -2318,8 +2311,28 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
                 "compute_stage_resident_sample mapping={mapping_id} {width}x{height} fmt={stage_fmt:#x} gen={generation} bytes={need}"
             ));
         }
+        let page_bytes = (pages_n as u64).saturating_mul(1u64 << state.page_shift);
+        // Only a guest read needs the pages. A window whose content the engine
+        // already holds (a prior dispatch wrote it) is served without them.
+        // A storage window with no CPU pages at all is GPU-private: macOS
+        // renders its wallpaper and backdrops into such surfaces and only ever
+        // samples them on the GPU. It starts from zero, lives in the engine,
+        // and is never written back.
+        let private = page_bytes < span_end && is_storage && pages_n == 0;
+        if private && serve.is_none() {
+            crate::observe::off(format!(
+                "compute_stage_tex type11_private mapping={mapping_id} {width}x{height} fmt={stage_fmt:#x} span_end={span_end}"
+            ));
+        }
+        if serve.is_none() && page_bytes < span_end && !private {
+            crate::observe::fail(format!(
+                "compute_stage_tex type11_fail reason=span mapping={mapping_id} {width}x{height} pages={pages_n} page_bytes={page_bytes} span_end={span_end} bpr={surface_bpr} wire_len={wire_len}"
+            ));
+            return Err(ComputeStatus::GuestIo("compute_stage_tex_type11_span"));
+        }
         let mut bytes = vec![0u8; need];
         if serve.is_none()
+            && !private
             && !mapping_write::read_rect_raw_at(
                 state,
                 host,
@@ -2345,7 +2358,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             ));
             return Err(ComputeStatus::GuestIo("compute_stage_tex_type11_read"));
         }
-        let writeback = if is_storage {
+        let writeback = if is_storage && !private {
             TextureWriteback::Type11 {
                 mapping_id,
                 surface_offset,
