@@ -2,20 +2,17 @@
 //!
 //! From macOS 14 on, Setup Assistant plays its background video into IOSurfaces
 //! with a luma plane and an interleaved CbCr plane (`'420f'` on 14, `'422f'` on
-//! 15, `'444f'` and ten-bit `'x420'` on 27) and binds the whole surface as one
-//! texture in one of Metal's private biplanar formats. They sample in three
+//! 15, `'444f'` and ten-bit `'x420'` on 15 and 27) and binds the whole surface
+//! as one texture in one of Metal's private biplanar formats. They sample in two
 //! ways, each read off the shader that consumes it:
 //!
 //! - **500 to 510** convert in the sampler. 14's compositor reads `.rgb` and
 //!   goes straight on to its transfer function, so it is handed R'G'B'.
-//! - **540 to 542** (8-bit 4:2:0, 4:2:2 and 4:4:4) return Cr, Y and Cb in red,
-//!   green and blue: VideoToolbox's transfer kernel on 15 and 27 swizzles
-//!   `.gbr` and applies its own matrix.
-//! - **543** (ten-bit 4:2:0) is 27's 4K hello video. Its kernel reads `.rgb` as
-//!   Y, Cb and Cr, but handed that, the Golden Gate Bridge comes out blue and
-//!   the sunset sky blue on the wrong side, against Apple's own still of the
-//!   scene. Handed Y, Cr and Cb it matches the still. Why the kernel's reading
-//!   and the screen disagree is not found yet.
+//! - **540 to 543** (8-bit 4:2:0, 4:2:2 and 4:4:4, and ten-bit 4:2:0) return
+//!   Cr, Y and Cb in red, green and blue: VideoToolbox's transfer kernels on 15
+//!   and 27 swizzle `.gbr` and apply their own matrix. The ten-bit kernel
+//!   swizzles when it stores the sample in a local array and reads `.rgb` back
+//!   later, which was once misread as the kernel taking Y, Cb and Cr.
 //!
 //! The rest of the private range has not been met, and is refused rather than
 //! guessed.
@@ -25,9 +22,9 @@
 //! kernel applies BT.601 to its 512 by 512 frames. The range comes from the
 //! surface's FourCC: a trailing `f` is full range, anything else video range.
 //!
-//! Ten-bit surfaces (`'x420'`, 27's background after its language panel) hold
-//! each sample in the high bits of 16; the high byte is taken, which is what
-//! an RGBA8 result can hold anyway.
+//! Ten-bit surfaces (`'x420'`, the background video after the language panel)
+//! hold each sample in the high bits of 16; the high byte is taken, which is
+//! what an RGBA8 result can hold anyway.
 
 /// How a texture in one of these formats samples.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -36,8 +33,6 @@ pub enum Sampling {
     Converted,
     /// The sampler returns Cr, Y and Cb in red, green and blue.
     CrYCb,
-    /// Y, Cr and Cb in red, green and blue: 543, see the module doc.
-    YCrCb,
 }
 
 impl Sampling {
@@ -46,8 +41,7 @@ impl Sampling {
     pub fn of(format: u16) -> Option<Self> {
         match format {
             500..=510 => Some(Self::Converted),
-            540..=542 => Some(Self::CrYCb),
-            543 => Some(Self::YCrCb),
+            540..=543 => Some(Self::CrYCb),
             _ => None,
         }
     }
@@ -191,10 +185,6 @@ pub fn to_rgba8(
                     texel.copy_from_slice(&[cr, luma_texel, cb, 255]);
                     continue;
                 }
-                Sampling::YCrCb => {
-                    texel.copy_from_slice(&[luma_texel, cr, cb, 255]);
-                    continue;
-                }
                 Sampling::Converted => {}
             }
             let (cb, cr) = (i32::from(cb) - 128, i32::from(cr) - 128);
@@ -221,7 +211,7 @@ mod tests {
         assert_eq!(Sampling::of(500), Some(Sampling::Converted));
         assert_eq!(Sampling::of(541), Some(Sampling::CrYCb));
         assert_eq!(Sampling::of(542), Some(Sampling::CrYCb));
-        assert_eq!(Sampling::of(543), Some(Sampling::YCrCb));
+        assert_eq!(Sampling::of(543), Some(Sampling::CrYCb));
         assert_eq!(Sampling::of(520), None);
         assert_eq!(Sampling::of(544), None);
         assert_eq!(Sampling::of(80), None);

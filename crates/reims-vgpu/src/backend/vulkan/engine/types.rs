@@ -371,9 +371,26 @@ impl PipelineObjectIdentity {
     }
 }
 
+/// A storage image a fragment shader writes, for a draw whose shader has no
+/// colour output. The draw binds an image of this shape, seeded with `seed`
+/// (tight rows) when given, and hands its texels back in
+/// [`DrawOutput::storage_pixels`] when `read_back` is set; the colour
+/// attachments are left as they were.
+#[derive(Clone, Debug)]
+pub struct DrawScratchStorageImage {
+    pub binding: u32,
+    pub width: u32,
+    pub height: u32,
+    pub format: StorageImageFormat,
+    pub seed: Option<std::sync::Arc<Vec<u8>>>,
+    pub read_back: bool,
+}
+
 /// Inputs for one offscreen draw. Engine receives resolved bytes + post-reloc SPIR-V only.
 #[derive(Debug, Default)]
 pub struct DrawRequest {
+    /// See [`DrawScratchStorageImage`].
+    pub scratch_storage_images: Vec<DrawScratchStorageImage>,
     /// The retained guest pipeline object this draw resolved, when the retained
     /// lifecycle is enabled. Vulkan still compares the complete variant key;
     /// this identity only chooses the object's exact front entry.
@@ -735,6 +752,9 @@ pub struct SecondaryColorTarget {
 #[derive(Debug, Default)]
 pub struct DrawOutput {
     pub pixels: Vec<u8>,
+    /// The texels of each scratch storage image with `read_back`, in request
+    /// order, tight rows.
+    pub storage_pixels: Vec<Vec<u8>>,
     /// Whether color attachment zero was rendered through the retained guest
     /// allocation supplied on this request.
     ///

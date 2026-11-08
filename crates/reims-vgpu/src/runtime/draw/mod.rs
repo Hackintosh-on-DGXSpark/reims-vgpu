@@ -1374,15 +1374,11 @@ pub(crate) fn load_render_pipeline<M: HostMemory + HostOps>(
         );
         return None;
     };
-    // Both stages are required to build a pipeline, and the two are reported
-    // apart because they are different guest mistakes — the compute sibling
-    // names its one stage the same way, as `kernel_func_zero`.
+    // A vertex function is required. A fragment function is not: Metal runs a
+    // pipeline without one for its depth and stencil, and
+    // `pipeline_resolve` gives it a fragment stage that writes nothing.
     if p.vertex_func_ref == 0 {
         report.reason(task_id, pipeline_ref, "vertex_func_zero", "");
-        return None;
-    }
-    if p.fragment_func_ref == 0 {
-        report.reason(task_id, pipeline_ref, "fragment_func_zero", "");
         return None;
     }
     Some(p)
@@ -1681,7 +1677,6 @@ pub(crate) struct HeapTexture {
     pub format: u16,
     pub sample_count: u32,
     pub texture_type: u8,
-    pub mipmap_level_count: u16,
 }
 
 /// The heap texture a type-8 descriptor creates, or `None` for any other record.
@@ -1703,7 +1698,6 @@ pub(crate) fn heap_texture_of(desc: &[u8]) -> Option<HeapTexture> {
         format: body.pixel_format,
         sample_count: u32::from(body.sample_count.max(1)),
         texture_type: body.texture_type,
-        mipmap_level_count: body.mipmap_level_count,
     })
 }
 

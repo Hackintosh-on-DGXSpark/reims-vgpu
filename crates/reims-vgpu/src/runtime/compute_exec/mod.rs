@@ -4464,7 +4464,7 @@ fn mtl_to_engine_sampled(
 }
 
 #[cfg(feature = "backend-vulkan")]
-fn spirv_image_format_to_engine_storage(
+pub(crate) fn spirv_image_format_to_engine_storage(
     format: crate::runtime::spirv_bind::ImageFormat,
 ) -> Option<crate::backend::vulkan::engine::StorageImageFormat> {
     use crate::backend::vulkan::engine::StorageImageFormat as V;

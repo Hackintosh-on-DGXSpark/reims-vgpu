@@ -2789,7 +2789,8 @@ pub(crate) unsafe fn execute_draw_inner(
         batch_full: matches!(fit, BatchFit::Full),
         target_switch: matches!(fit, BatchFit::OtherTarget),
     };
-    let batch_eligible = terms.batch_eligible();
+    let batch_eligible = terms.batch_eligible()
+        && !req.scratch_storage_images.iter().any(|image| image.read_back);
     let no_join = terms.refusal();
     // The join arm splits by self-alias, and the two must sum to the joins.
     // `nojoin_samples_own_target` was 29.7 % of all draws and is the population
@@ -2873,6 +2874,14 @@ pub(crate) unsafe fn execute_draw_inner(
             binding: b.binding,
             ty: vk::DescriptorType::SAMPLER.as_raw() as u32,
             stages: (vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT).as_raw(),
+            count: 1,
+        });
+    }
+    for image in &req.scratch_storage_images {
+        layout_bindings.push(BindingSig {
+            binding: image.binding,
+            ty: vk::DescriptorType::STORAGE_IMAGE.as_raw() as u32,
+            stages: vk::ShaderStageFlags::FRAGMENT.as_raw(),
             count: 1,
         });
     }
@@ -4127,6 +4136,24 @@ pub(crate) unsafe fn execute_draw_inner(
         .iter()
         .map(|(_, s)| vk::DescriptorImageInfo::default().sampler(*s))
         .collect();
+    let mut scratch_images = Vec::with_capacity(req.scratch_storage_images.len());
+    for image in &req.scratch_storage_images {
+        let key = super::pools::StorageImageKey {
+            width: image.width,
+            height: image.height,
+            format: image.format,
+            sampled_only: false,
+        };
+        scratch_images.push((image.binding, pools.acquire_storage_image(ctx, key, counters)?));
+    }
+    let scratch_infos: Vec<_> = scratch_images
+        .iter()
+        .map(|(_, slot)| {
+            vk::DescriptorImageInfo::default()
+                .image_view(slot.view)
+                .image_layout(vk::ImageLayout::GENERAL)
+        })
+        .collect();
     // Framebuffer fetch: the input attachment IS the color target's view;
     // derive the same layout as the subpass reference. A draw that also
     // samples the target upgrades both from GENERAL to the feedback layout.
@@ -4175,6 +4202,15 @@ pub(crate) unsafe fn execute_draw_inner(
                 .dst_binding(*binding)
                 .descriptor_type(vk::DescriptorType::SAMPLER)
                 .image_info(std::slice::from_ref(&sampler_infos[i])),
+        );
+    }
+    for (i, (binding, _)) in scratch_images.iter().enumerate() {
+        descriptor_writes.push(
+            vk::WriteDescriptorSet::default()
+                .dst_set(dst_set)
+                .dst_binding(*binding)
+                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                .image_info(std::slice::from_ref(&scratch_infos[i])),
         );
     }
     for (binding, info) in &color_input_infos {
@@ -4984,8 +5020,9 @@ pub(crate) unsafe fn execute_draw_inner(
     // query reset Vulkan forbids inside it; this ladder therefore remains an
     // instrument for the continuation opportunities those commands consume.
     let continues = joins && pools.pass_echoes(&echo);
-    let continues_open =
-        continues_open_render_pass(req.continues_render_pass, pools.open_pass_echoes(&echo));
+    // A scratch storage image needs its layout set outside the pass.
+    let continues_open = req.scratch_storage_images.is_empty()
+        && continues_open_render_pass(req.continues_render_pass, pools.open_pass_echoes(&echo));
     // `passmerge_pass_differs` is one bucket over four independent causes with
     // four different repairs, and on a driven Maps leg it is the bucket that
     // holds 82 % of the draws. Split it where it is charged, so the two stay a
@@ -5029,6 +5066,78 @@ pub(crate) unsafe fn execute_draw_inner(
         // An encoder boundary, a different pass instance, or an intervening
         // outside-pass command closes whatever the predecessor left open.
         unsafe { pools.close_open_pass(&ctx.device, cb) };
+        for ((_, slot), image) in scratch_images.iter().zip(&req.scratch_storage_images) {
+            let seeded = match image.seed.as_ref() {
+                Some(seed) => {
+                    let staging = pools.acquire_staging(
+                        ctx,
+                        seed.len() as u64,
+                        vk::BufferUsageFlags::TRANSFER_SRC,
+                        counters,
+                    )?;
+                    pools.write_staging(ctx, &staging, seed)?;
+                    let to_dst = [vk::ImageMemoryBarrier::default()
+                        .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                        .old_layout(vk::ImageLayout::UNDEFINED)
+                        .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                        .image(slot.image)
+                        .subresource_range(super::color_subresource_range())];
+                    ctx.device.cmd_pipeline_barrier(
+                        cb,
+                        vk::PipelineStageFlags::TOP_OF_PIPE,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[],
+                        &to_dst,
+                    );
+                    let region = [vk::BufferImageCopy::default()
+                        .image_subresource(super::color_subresource_layers())
+                        .image_extent(vk::Extent3D {
+                            width: image.width,
+                            height: image.height,
+                            depth: 1,
+                        })];
+                    ctx.device.cmd_copy_buffer_to_image(
+                        cb,
+                        staging.buffer,
+                        slot.image,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        &region,
+                    );
+                    true
+                }
+                None => false,
+            };
+            let to_general = [vk::ImageMemoryBarrier::default()
+                .src_access_mask(if seeded {
+                    vk::AccessFlags::TRANSFER_WRITE
+                } else {
+                    vk::AccessFlags::empty()
+                })
+                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
+                .old_layout(if seeded {
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL
+                } else {
+                    vk::ImageLayout::UNDEFINED
+                })
+                .new_layout(vk::ImageLayout::GENERAL)
+                .image(slot.image)
+                .subresource_range(super::color_subresource_range())];
+            ctx.device.cmd_pipeline_barrier(
+                cb,
+                if seeded {
+                    vk::PipelineStageFlags::TRANSFER
+                } else {
+                    vk::PipelineStageFlags::TOP_OF_PIPE
+                },
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &to_general,
+            );
+        }
         crate::runtime::drain::note_store_route(pass_begin_area_band(req.width, req.height));
         crate::runtime::drain::note_store_route(if pass_key.load_seed {
             "passbegin_load"
@@ -5266,6 +5375,7 @@ pub(crate) unsafe fn execute_draw_inner(
         ctx.device.cmd_end_query(cb, pool, 0);
     }
     let keep_pass_open = req.render_pass_continues
+        && req.scratch_storage_images.is_empty()
         && batch_eligible
         && !pass_churn_probe_enabled()
         && !layout_churn_probe_enabled();
@@ -5273,6 +5383,49 @@ pub(crate) unsafe fn execute_draw_inner(
         crate::runtime::drain::note_store_route("pass_left_open");
     } else {
         unsafe { pools.close_open_pass(&ctx.device, cb) };
+    }
+    // Copy each scratch storage image the caller wants back into a readback
+    // buffer, behind the pass that wrote it.
+    let mut storage_readbacks = Vec::new();
+    for ((_, slot), image) in scratch_images.iter().zip(&req.scratch_storage_images) {
+        if !image.read_back {
+            continue;
+        }
+        let size = u64::from(image.width)
+            * u64::from(image.height)
+            * image.format.bytes_per_texel() as u64;
+        let buffer = pools.acquire_readback(ctx, size, counters)?;
+        let to_src = [vk::ImageMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+            .old_layout(vk::ImageLayout::GENERAL)
+            .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+            .image(slot.image)
+            .subresource_range(super::color_subresource_range())];
+        ctx.device.cmd_pipeline_barrier(
+            cb,
+            vk::PipelineStageFlags::FRAGMENT_SHADER,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &to_src,
+        );
+        let region = [vk::BufferImageCopy::default()
+            .image_subresource(super::color_subresource_layers())
+            .image_extent(vk::Extent3D {
+                width: image.width,
+                height: image.height,
+                depth: 1,
+            })];
+        ctx.device.cmd_copy_image_to_buffer(
+            cb,
+            slot.image,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            buffer.buffer,
+            &region,
+        );
+        storage_readbacks.push((buffer, size));
     }
     if pass_churn_probe_enabled() && load_uses_gpu_content && !target_feedback {
         // PROBE — `REIMS_VGPU_PASS_CHURN=on`. One extra render pass instance on
@@ -5687,6 +5840,7 @@ pub(crate) unsafe fn execute_draw_inner(
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return Ok(DrawOutput {
             pixels: Vec::new(),
+            storage_pixels: Vec::new(),
             target_guest_backed,
             guest_store_recorded,
             guest_store_footprint: guest_store_footprint.clone(),
@@ -5747,6 +5901,33 @@ pub(crate) unsafe fn execute_draw_inner(
     // `gva_store_defer_eligible` and keeps its readback. Delete this and that
     // Store loses its frame silently, which is the one outcome the ground rules
     // forbid outright. What the equality licenses is not re-measuring it.
+    let read_storage = |ctx: &super::context::DeviceContext| -> Result<Vec<Vec<u8>>, DrawError> {
+        storage_readbacks
+            .iter()
+            .map(|(buffer, size)| {
+                super::pools::read_back_slot(
+                    ctx,
+                    buffer,
+                    *size,
+                    VkOp::ExecMapReadback,
+                    VkOp::ExecInvalidateReadback,
+                )
+            })
+            .collect()
+    };
+    if readback.is_none() && !storage_readbacks.is_empty() {
+        phase.enter(super::draw_phase::Phase::Wait);
+        pools.wait_entry_fence(ctx, counters, fence)?;
+        return Ok(DrawOutput {
+            pixels: Vec::new(),
+            storage_pixels: read_storage(ctx)?,
+            target_guest_backed,
+            guest_store_recorded,
+            guest_store_footprint: guest_store_footprint.clone(),
+            pixels_bgra: output_bgra,
+            occlusion_samples: read_occlusion_samples(ctx, occlusion)?,
+        });
+    }
     let Some(ref rb) = readback else {
         // A queried draw has no pixels to read back and still cannot take this
         // return: the sample count *is* its result, and it is not readable
@@ -5759,6 +5940,7 @@ pub(crate) unsafe fn execute_draw_inner(
             pools.wait_entry_fence(ctx, counters, fence)?;
             return Ok(DrawOutput {
                 pixels: Vec::new(),
+                storage_pixels: Vec::new(),
                 target_guest_backed,
                 guest_store_recorded,
                 guest_store_footprint: guest_store_footprint.clone(),
@@ -5771,6 +5953,7 @@ pub(crate) unsafe fn execute_draw_inner(
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return Ok(DrawOutput {
             pixels: Vec::new(),
+            storage_pixels: Vec::new(),
             target_guest_backed,
             guest_store_recorded,
             guest_store_footprint: guest_store_footprint.clone(),
@@ -5819,6 +6002,7 @@ pub(crate) unsafe fn execute_draw_inner(
 
     Ok(DrawOutput {
         pixels,
+        storage_pixels: read_storage(ctx)?,
         target_guest_backed,
         guest_store_recorded,
         guest_store_footprint,

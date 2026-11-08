@@ -6671,6 +6671,11 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             crate::runtime::spirv_bind::first_non_sampled_texture_descriptor(&shader.reflection)
         {
             let access = match descriptor.access {
+                crate::runtime::spirv_bind::ReflectedTextureAccess::Storage
+                    if stage == "fragment" && shader.reflection.render_targets.is_empty() =>
+                {
+                    continue
+                }
                 crate::runtime::spirv_bind::ReflectedTextureAccess::Storage => "storage",
                 crate::runtime::spirv_bind::ReflectedTextureAccess::Unknown => "unknown",
                 crate::runtime::spirv_bind::ReflectedTextureAccess::Sampled => continue,
@@ -7197,6 +7202,9 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // is something the guest asked for. See
         // [`crate::runtime::gpu_hang_trail::SamplerNote`].
         let mut sampler_origin: std::collections::BTreeMap<u32, u8> = Default::default();
+        let mut scratch_storage: Vec<crate::backend::vulkan::engine::DrawScratchStorageImage> =
+            Vec::new();
+        let mut storage_writebacks: Vec<StorageWriteback> = Vec::new();
         {
             let mut push_tex = |index: u32,
                                 texture_ref: u32,
@@ -7224,6 +7232,53 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     + base_off;
                 if let Some(descriptor) = reflected_descriptor {
                     use crate::runtime::spirv_bind::ReflectedTextureAccess;
+                    // A fragment shader with no colour output that writes a
+                    // storage image (14 and 15's `inplace_copy_lph` snapshots
+                    // the framebuffer this way) gets an image of its own; the
+                    // pass's colour stays as it was. A level-0 linear texture
+                    // of the shader's texel width seeds that image and takes
+                    // its texels back after the draw. Anything else is scratch.
+                    if descriptor.access == ReflectedTextureAccess::Storage
+                        && frag_stage
+                        && reflection.render_targets.is_empty()
+                    {
+                        let format = crate::runtime::spirv_bind::reflected_storage_image_format(
+                            reflection,
+                            descriptor.binding,
+                        )
+                        .and_then(
+                            crate::runtime::compute_exec::spirv_image_format_to_engine_storage,
+                        );
+                        if let (Some(format), Some(c0)) = (format, req.colors.first()) {
+                            let linear = linear_storage_target(
+                                state,
+                                host,
+                                req.task_id,
+                                texture_ref,
+                                format.bytes_per_texel(),
+                            );
+                            crate::runtime::drain::note_store_route("frag_storage_scratch");
+                            let (width, height, seed) = match linear {
+                                Some((target, seed)) => {
+                                    let shape = (target.width, target.height);
+                                    storage_writebacks.push(target);
+                                    (shape.0, shape.1, Some(std::sync::Arc::new(seed)))
+                                }
+                                None => (c0.width, c0.height, None),
+                            };
+                            scratch_storage.push(
+                                crate::backend::vulkan::engine::DrawScratchStorageImage {
+                                    binding: img_bind,
+                                    width,
+                                    height,
+                                    format,
+                                    read_back: seed.is_some(),
+                                    seed,
+                                },
+                            );
+                            return Ok(());
+                        }
+                    }
                     let unsupported = match descriptor.access {
                         ReflectedTextureAccess::Sampled => None,
                         ReflectedTextureAccess::Storage => Some("storage"),
@@ -8051,6 +8106,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         }
         crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Assemble);
         let mut resources = crate::backend::vulkan::engine::DrawRequest {
+            scratch_storage_images: std::mem::take(&mut scratch_storage),
             pipeline_object: resolved.pipeline_object.clone(),
             // Honor the guest's face-culling state, its winding, and its
             // primitive type. All three come from `translate::raster`, and all
@@ -8418,6 +8474,16 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // guest is replacing rather than compositing.
         crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Assemble);
         resources.color_write_mask = pd.color0.write_mask;
+        if f_shader.reflection.render_targets.is_empty() {
+            // The fragment stage writes no colour (a scratch storage write, or a
+            // pipeline with no fragment function), so no attachment may change.
+            let none = crate::runtime::decode::resource::ColorWriteMask::new(0)
+                .expect("an empty mask is in range");
+            resources.color_write_mask = none;
+            for target in &mut resources.secondary_targets {
+                target.color_write_mask = none;
+            }
+        }
         if pd.color0.blending_enabled {
             let constants = req.blend_color.unwrap_or([0.0; 4]);
             match translate::blend::state(&pd.color0, constants) {
@@ -8974,6 +9040,9 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // queries; the sum belongs to whoever knows the offset, which is not
         // this arm.
         req.visibility_samples = out.occlusion_samples;
+        for (target, pixels) in storage_writebacks.iter().zip(&out.storage_pixels) {
+            land_storage_writeback(state, host, req.task_id, target, pixels);
+        }
         // Everything from here to the end of the chain is Store routing, and the
         // `?` above deliberately leaves a declined draw charged to `engine`:
         // where it declined is the engine's own typed reason to report, not this
@@ -9123,6 +9192,96 @@ pub(super) fn depth_chain_identity(
         generation: 0,
         stencil: with_stencil,
     })
+}
+
+/// Where a fragment shader's storage writes to a linear (type-2/3) texture land:
+/// that texture's level-0 rows in guest memory.
+pub(super) struct StorageWriteback {
+    texture_ref: u32,
+    gva: u64,
+    row_stride: u64,
+    width: u32,
+    height: u32,
+    tight: usize,
+}
+
+/// The linear texture a fragment storage write targets, and its current texels
+/// as tight rows to seed the image with, so texels the pass does not write keep
+/// their content. `None` for anything that is not a level-0 linear texture of
+/// the shader's texel width.
+fn linear_storage_target<M: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    texture_ref: u32,
+    bytes_per_texel: usize,
+) -> Option<(StorageWriteback, Vec<u8>)> {
+    let resource = objects::resolve_resource(state, host, task_id, texture_ref).ok()?;
+    let Ok(crate::runtime::decode::resource::Descriptor::Texture(tex)) = resource.decoded() else {
+        return None;
+    };
+    if pixel_format::bytes_per_pixel(tex.pixel_format)? as usize != bytes_per_texel {
+        return None;
+    }
+    let (gva, layout) = tex.level_gva(0, state.page_shift)?;
+    let tight = (layout.width as usize).checked_mul(bytes_per_texel)?;
+    if layout.row_stride < tight as u64 {
+        return None;
+    }
+    let mut seed = vec![0u8; tight.checked_mul(layout.height as usize)?];
+    for (y, row) in seed.chunks_exact_mut(tight).enumerate() {
+        crate::runtime::gva_mem::read_task_gva_by_id(
+            host,
+            &state.tasks,
+            task_id,
+            gva + y as u64 * layout.row_stride,
+            row,
+            state.page_shift,
+        )
+        .ok()?;
+    }
+    Some((
+        StorageWriteback {
+            texture_ref,
+            gva,
+            row_stride: layout.row_stride,
+            width: layout.width,
+            height: layout.height,
+            tight,
+        },
+        seed,
+    ))
+}
+
+/// Write a fragment storage image's texels back to the linear texture it
+/// stands for, and drop host copies of that texture.
+fn land_storage_writeback<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    target: &StorageWriteback,
+    pixels: &[u8],
+) {
+    let rows = pixels.chunks_exact(target.tight).take(target.height as usize);
+    let mut landed = true;
+    for (y, row) in rows.enumerate() {
+        landed &= crate::runtime::gva_mem::write_task_gva_product_within(
+            state,
+            host,
+            task_id,
+            target.gva + y as u64 * target.row_stride,
+            row,
+            None,
+        )
+        .is_ok();
+    }
+    crate::runtime::surface_cache::evict_texture(state, task_id, target.texture_ref);
+    crate::runtime::surface_cache::evict_gva(state, target.gva);
+    crate::runtime::drain::note_store_route(if landed {
+        "frag_storage_landed"
+    } else {
+        "frag_storage_land_partial"
+    });
 }
 
 /// Generation of every heap texture's resident. Memoryless attachments take 0

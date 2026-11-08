@@ -373,17 +373,23 @@ fn resolve_uncached<M: HostMemory + HostOps>(
         task_id,
         function_ref: desc.vertex_func_ref,
     })?;
-    let f_mtlb = load_mtlb(
-        state,
-        host,
-        task_id,
-        desc.fragment_func_ref,
-        AirLoadRail::Draw,
-    )
-    .ok_or(DrawPreparationDecline::FragmentMtlbMissing {
-        task_id,
-        function_ref: desc.fragment_func_ref,
-    })?;
+    let f_mtlb = if desc.fragment_func_ref == 0 {
+        None
+    } else {
+        Some(
+            load_mtlb(
+                state,
+                host,
+                task_id,
+                desc.fragment_func_ref,
+                AirLoadRail::Draw,
+            )
+            .ok_or(DrawPreparationDecline::FragmentMtlbMissing {
+                task_id,
+                function_ref: desc.fragment_func_ref,
+            })?,
+        )
+    };
     enter(Phase::PipelineAir);
     let v_air = crate::runtime::mtlb::extract_air(&v_mtlb).map_err(|reason| {
         DrawPreparationDecline::VertexAirExtract {
@@ -391,12 +397,17 @@ fn resolve_uncached<M: HostMemory + HostOps>(
             reason,
         }
     })?;
-    let f_air = crate::runtime::mtlb::extract_air(&f_mtlb).map_err(|reason| {
-        DrawPreparationDecline::FragmentAirExtract {
-            function_ref: desc.fragment_func_ref,
-            reason,
-        }
-    })?;
+    let f_air = f_mtlb
+        .as_deref()
+        .map(|f_mtlb| {
+            crate::runtime::mtlb::extract_air(f_mtlb).map_err(|reason| {
+                DrawPreparationDecline::FragmentAirExtract {
+                    function_ref: desc.fragment_func_ref,
+                    reason,
+                }
+            })
+        })
+        .transpose()?;
     enter(Phase::PipelineXlate);
     let vertex = crate::runtime::m2v_cache::translate_cached_reflected(
         v_air,
@@ -407,15 +418,18 @@ fn resolve_uncached<M: HostMemory + HostOps>(
         pipeline_ref,
         reason,
     })?;
-    let fragment = crate::runtime::m2v_cache::translate_cached_reflected(
-        f_air,
-        metal2vulkan::passes::Stage::Fragment,
-        pipeline_ref,
-    )
-    .map_err(|reason| DrawPreparationDecline::FragmentTranslate {
-        pipeline_ref,
-        reason,
-    })?;
+    let fragment = match f_air {
+        None => colourless_fragment(),
+        Some(f_air) => crate::runtime::m2v_cache::translate_cached_reflected(
+            f_air,
+            metal2vulkan::passes::Stage::Fragment,
+            pipeline_ref,
+        )
+        .map_err(|reason| DrawPreparationDecline::FragmentTranslate {
+            pipeline_ref,
+            reason,
+        })?,
+    };
     let bind_plan = Arc::new(VertexBindPlan::build(&desc));
     Ok(ResolvedRenderPipeline {
         pipeline_object: None,
@@ -424,6 +438,64 @@ fn resolve_uncached<M: HostMemory + HostOps>(
         fragment,
         bind_plan,
     })
+}
+
+/// The fragment stage of a pipeline the guest built with no fragment function:
+/// an empty `main` with no inputs, outputs or resources. The draw masks every
+/// colour write for a fragment stage with no outputs, so only depth and
+/// stencil change, as Metal does.
+fn colourless_fragment() -> Arc<CachedShader> {
+    use metal2vulkan::reflect::{ShaderReflection, ShaderStage, REFLECTION_VERSION};
+    static SHADER: OnceLock<Arc<CachedShader>> = OnceLock::new();
+    SHADER
+        .get_or_init(|| {
+            // OpCapability Shader; OpMemoryModel Logical GLSL450;
+            // OpEntryPoint Fragment %1 "main"; OpExecutionMode %1 OriginUpperLeft;
+            // %2 = OpTypeVoid; %3 = OpTypeFunction %2;
+            // %1 = OpFunction %2 None %3; %4 = OpLabel; OpReturn; OpFunctionEnd.
+            const WORDS: [u32; 32] = [
+                0x0723_0203, 0x0001_0000, 0, 5, 0, //
+                0x0002_0011, 1, //
+                0x0003_000e, 0, 1, //
+                0x0005_000f, 4, 1, 0x6e69_616d, 0, //
+                0x0003_0010, 1, 7, //
+                0x0002_0013, 2, //
+                0x0003_0021, 3, 2, //
+                0x0005_0036, 2, 1, 0, 3, //
+                0x0002_00f8, 4, //
+                0x0001_00fd, //
+                0x0001_0038,
+            ];
+            let spirv = WORDS
+                .iter()
+                .flat_map(|word| word.to_le_bytes())
+                .collect();
+            Arc::new(CachedShader::new(
+                spirv,
+                Arc::new(ShaderReflection {
+                    reflection_version: REFLECTION_VERSION,
+                    stage: ShaderStage::Fragment,
+                    entry_point: Some("main".to_owned()),
+                    bindings: vec![],
+                    argument_buffer_fields: vec![],
+                    vertex_attributes: vec![],
+                    varyings: vec![],
+                    render_targets: vec![],
+                    depth_members: vec![],
+                    depth_qualifier: None,
+                    stencil_members: vec![],
+                    local_size: None,
+                    vertex_builtins: None,
+                    tessellation: None,
+                    imageblock_layouts: vec![],
+                    implicit_imageblock_attachments: vec![],
+                    fragment_imageblock: None,
+                    datalayout: None,
+                    function_constants: vec![],
+                }),
+            ))
+        })
+        .clone()
 }
 
 #[cfg(test)]
