@@ -1506,6 +1506,11 @@ pub struct MappingEntry {
     /// (bump + drop condemned windows). Cleared by every explicit lifecycle
     /// event (fresh MAP, unmap, MappingInternal reattach, ReplacePhysical).
     pub condemned_entries: Option<Vec<u32>>,
+    /// Set while another live mapping claims one of this mapping's pages; no
+    /// write goes through it. See [`crate::runtime::surface_quarantine`].
+    pub quarantine: Option<crate::runtime::surface_quarantine::Quarantine>,
+    /// `observe::elapsed_ms` when a resolve last adopted this page list.
+    pub validated_ms: u64,
     /// Guest KVA of MappingInternal (from capture or recover).
     pub mapping_internal: u64,
     pub page_table_kva: u64,
@@ -3585,6 +3590,9 @@ impl DeviceState {
     /// plan) or bumps + drops (different plan). Returns whether a fingerprint
     /// was stashed; on `false` the caller should fall back to full teardown.
     pub fn condemn_surface_backing(&mut self, mapping_id: u32) -> bool {
+        // The guest deleted this backing: whatever it collided with is no longer
+        // in dispute on its account.
+        crate::runtime::surface_quarantine::lift(self, mapping_id, "delete_backing");
         self.forget_compositor_mapping(mapping_id);
         self.host_surfaces.remove(&mapping_id);
         let Some(e) = self.mappings.get_mut(&mapping_id) else {
@@ -3624,6 +3632,7 @@ impl DeviceState {
             StateMutationDecline::MapSurfaceIdSentinel { mapping_id }.emit(u64::from(mapping_id));
             return false;
         }
+        crate::runtime::surface_quarantine::lift(self, mapping_id, "map");
         let e = self.mappings.entry(mapping_id).or_default();
         e.mapped = true;
         // Fresh MAP invalidates any previous page table / geom for this slot.
@@ -3678,6 +3687,7 @@ impl DeviceState {
             StateMutationDecline::UnmapSurfaceIdSentinel { mapping_id }.emit(u64::from(mapping_id));
             return false;
         }
+        crate::runtime::surface_quarantine::lift(self, mapping_id, "unmap");
         self.forget_compositor_mapping(mapping_id);
         if let Some(e) = self.mappings.get_mut(&mapping_id) {
             e.mapped = false;
@@ -3721,6 +3731,9 @@ impl DeviceState {
             StateMutationDecline::AttachMappingInternalZero { mapping_id }
                 .emit(u64::from(mapping_id));
             return false;
+        }
+        if self.mappings.get(&mapping_id).map(|m| m.mapping_internal) != Some(mapping_internal) {
+            crate::runtime::surface_quarantine::lift(self, mapping_id, "new_internal");
         }
         let e = self.mappings.entry(mapping_id).or_default();
         // A re-statement of the SAME MappingInternal (notify trailing our

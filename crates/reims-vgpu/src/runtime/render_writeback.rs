@@ -697,6 +697,9 @@ settle_sites! {
     MappingBytesWrite => "settle_mapping_bytes_write",
     /// `mapper::read_mapping_bytes`.
     MappingBytesRead => "settle_mapping_bytes_read",
+    /// `surface_quarantine::quarantine_collision` — both colliding mappings'
+    /// pages, before anything is decided about them.
+    Quarantine => "settle_quarantine",
 }
 
 /// Block until every guest-page write this device has submitted has executed.

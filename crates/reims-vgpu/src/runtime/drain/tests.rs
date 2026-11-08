@@ -6774,3 +6774,17 @@ mod pipeline_wait {
         );
     }
 }
+
+/// The ring backlog the mapper reports, at each edge.
+#[test]
+fn the_mapper_ring_backlog_names_an_overrun_and_a_consumer_ahead() {
+    assert_eq!(ring_backlog(5, 4, 4), RingBacklog::One);
+    assert_eq!(ring_backlog(7, 4, 4), RingBacklog::Several(3));
+    assert_eq!(
+        ring_backlog(8, 4, 4),
+        RingBacklog::Several(4),
+        "a full ring is not lost yet"
+    );
+    assert_eq!(ring_backlog(10, 4, 4), RingBacklog::Overrun { lost: 2 });
+    assert_eq!(ring_backlog(3, 4, 4), RingBacklog::ConsumerAhead);
+}

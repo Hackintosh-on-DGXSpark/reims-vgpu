@@ -714,6 +714,7 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
             }
         }
         m.page_entries = plan.entries;
+        m.validated_ms = crate::observe::elapsed_ms() as u64;
         m.page_table_kva = plan.page_table_kva;
         m.mapping_internal = internal;
         m.mapped = true;
@@ -891,6 +892,9 @@ fn fail_closed_surface_page_collision(
     path: &str,
 ) {
     note_surface_page_collision(mapping_id, gpa, owner, mine_pages, path);
+    // Both sides, before this one's page list is withdrawn below: the collision
+    // does not say which of the two is stale.
+    crate::runtime::surface_quarantine::quarantine_collision(state, mapping_id, owner, gpa, path);
     let _ = state.invalidate_mapping_pages(mapping_id);
 }
 
@@ -1416,6 +1420,9 @@ impl PagesVouched {
                 .mappings
                 .get(&mapping_id)
                 .is_some_and(|m| m.map_generation == self.map_generation)
+            // A quarantine revokes every proof at once, including one minted
+            // before it: see `runtime::surface_quarantine`.
+            && !crate::runtime::surface_quarantine::is_quarantined(state, mapping_id)
     }
 }
 
@@ -1446,6 +1453,10 @@ pub fn vouch_mapping_pages_verdict<H: HostMemory + HostOps>(
 ) -> (PagesVerdict, Option<PagesVouched>) {
     let verdict = mapping_pages_verdict(state, host, mapping_id);
     if verdict == PagesVerdict::Drifted {
+        return (verdict, None);
+    }
+    if crate::runtime::surface_quarantine::is_quarantined(state, mapping_id) {
+        crate::runtime::surface_quarantine::note_refused(mapping_id, "vouch");
         return (verdict, None);
     }
     let token = state.mappings.get(&mapping_id).map(|m| PagesVouched {
@@ -2557,6 +2568,9 @@ fn mapping_run_import_is_slow(elapsed_us: u64) -> bool {
 
 #[cfg(test)]
 mod revalidate_tests;
+
+#[cfg(test)]
+mod quarantine_tests;
 
 #[cfg(test)]
 mod tests;

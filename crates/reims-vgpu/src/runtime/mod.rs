@@ -108,6 +108,9 @@ pub mod present_identity;
 /// edit of them requires — the direction that is ordered is the map.
 pub mod range_coverage;
 pub mod released_pages;
+/// Type-11 mappings that claim one guest page, held out of writing until the
+/// guest says which one it released.
+pub mod surface_quarantine;
 /// Transfer a host-resident render frame into guest pages when synchronization
 /// or a guest-memory reader makes the bytes observable.
 pub mod render_writeback;

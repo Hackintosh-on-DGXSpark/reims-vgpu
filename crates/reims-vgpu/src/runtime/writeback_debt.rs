@@ -297,6 +297,11 @@ impl PendingWritebacks {
         self.debts.remove(&mapping_id)
     }
 
+    /// Put back a debt that was taken and could not be paid, keeping its age.
+    pub fn restore(&mut self, mapping_id: u32, debt: WritebackDebt) {
+        self.debts.insert(mapping_id, debt);
+    }
+
     /// Every mapping owed a frame, oldest arm first.
     pub fn mappings_by_age(&self) -> Vec<u32> {
         let mut all: Vec<(u64, u32)> = self.debts.iter().map(|(id, d)| (d.seq, *id)).collect();
@@ -1436,6 +1441,13 @@ fn pay<M: HostMemory + HostOps>(
     debt: WritebackDebt,
     route: &'static str,
 ) {
+    // A quarantined mapping's frame is neither written nor dropped: the
+    // collision does not say whose it is, and a release or rebind will.
+    if crate::runtime::surface_quarantine::is_quarantined(state, mapping_id) {
+        state.pending_writebacks.restore(mapping_id, debt);
+        crate::runtime::surface_quarantine::note_refused(mapping_id, "debt");
+        return;
+    }
     let Some(entry) = state.mappings.get(&mapping_id) else {
         crate::runtime::drain::note_store_route("wbdebt_generation_moved");
         return;

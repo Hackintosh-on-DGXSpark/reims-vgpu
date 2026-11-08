@@ -5149,6 +5149,7 @@ pub fn drain_iosfc<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut 
         state.pending.iosfc = false;
         return;
     }
+    note_iosfc_ring_backlog(state, producer, consumer);
 
     // Process requests between consumer and producer when ring is programmed.
     // Request `idx` lives in slot `idx % capacity`; see
@@ -5172,6 +5173,17 @@ pub fn drain_iosfc<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut 
                 .read_gpa(state.iosfc.ring_base + entry_off, &mut e)
                 .is_err()
             {
+                // The rest of this backlog, an UNMAP included, waits for the
+                // next publish: `pending.iosfc` is cleared below either way.
+                note_store_route("iosfc_ring_read_failed");
+                if crate::observe::first_sight("iosfc_ring_read_failed", 0) {
+                    crate::observe::fail(format!(
+                        "iosfc_ring_read_failed idx={idx} producer={producer} consumer={consumer} \
+                         gpa={:#x} (the requests from here on are read at the next publish, not \
+                         now; an UNMAP among them arrives late)",
+                        state.iosfc.ring_base + entry_off
+                    ));
+                }
                 break;
             }
             let rtype = ld32(&e[MAPPER_REQUEST_TYPE..]);
@@ -5245,6 +5257,65 @@ pub fn drain_iosfc<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut 
         host.enqueue(HostAction::irq_iosfc());
     }
     state.pending.iosfc = false;
+}
+
+/// What the mapper ring holds unread when the guest publishes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RingBacklog {
+    /// One request, the one just published: the ordinary case, since the ring
+    /// is drained at every publish.
+    One,
+    /// Several unread requests, all still in their slots.
+    Several(u32),
+    /// More unread requests than slots: the guest has overwritten `lost`
+    /// requests this device never read.
+    Overrun { lost: u32 },
+    /// The consumer is ahead of the producer. The drain catches it up without
+    /// reading anything.
+    ConsumerAhead,
+}
+
+pub(crate) fn ring_backlog(producer: u32, consumer: u32, capacity: u32) -> RingBacklog {
+    if producer < consumer {
+        return RingBacklog::ConsumerAhead;
+    }
+    match producer - consumer {
+        0 | 1 => RingBacklog::One,
+        lag if lag > capacity => RingBacklog::Overrun {
+            lost: lag - capacity,
+        },
+        lag => RingBacklog::Several(lag),
+    }
+}
+
+/// Count the mapper ring's backlog at a publish. Always on: one subtraction per
+/// publish, and a line only the first time a request is lost.
+///
+/// A lost UNMAP leaves this device holding the page list of a surface the
+/// guest has freed and writing frames into it, which is what reading past the
+/// ring did before 8a7b3334. An overrun is the other way to lose one, and so is
+/// a consumer the guest moved ahead of the producer.
+fn note_iosfc_ring_backlog(state: &DeviceState, producer: u32, consumer: u32) {
+    let capacity = state.iosfc.capacity;
+    if state.iosfc.ring_base == 0 || capacity == 0 {
+        return;
+    }
+    let (route, lost) = match ring_backlog(producer, consumer, capacity) {
+        RingBacklog::One => return,
+        RingBacklog::Several(_) => ("iosfc_ring_backlog", None),
+        RingBacklog::Overrun { lost } => ("iosfc_ring_overrun", Some(lost.to_string())),
+        RingBacklog::ConsumerAhead => ("iosfc_ring_consumer_ahead", Some("unknown".into())),
+    };
+    note_store_route(route);
+    if let Some(lost) = lost {
+        if crate::observe::first_sight(route, 0) {
+            crate::observe::fail(format!(
+                "{route} producer={producer} consumer={consumer} capacity={capacity} lost={lost} \
+                 (mapper requests the guest published and this device will not read; a lost \
+                 UNMAP leaves its pages written after the guest freed them)"
+            ));
+        }
+    }
 }
 
 /// Display-side present completion: after `presentFrame` retains the surface,
