@@ -728,7 +728,12 @@ fn translate_air(air: &[u8], stage: Stage) -> M2vResult<CachedShader> {
     // strips, so the post-emit ABI reconciliation below no longer re-reads `k.ll`.
     let (spirv, reflection) =
         metal2vulkan::translate_reflected(path.to_str().unwrap_or(name), stage, &tmp)
-            .map_err(|e| translate_decline(stage, e.to_string()))?;
+            .map_err(|e| {
+                // The next shader reuses the scratch name; keep this one for
+                // the translator.
+                let _ = std::fs::copy(&path, tmp.join(format!("failed-{}-{name}", air.len())));
+                translate_decline(stage, e.to_string())
+            })?;
     finish_translated(spirv, reflection, stage)
 }
 
