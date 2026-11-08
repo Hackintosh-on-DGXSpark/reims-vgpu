@@ -152,6 +152,10 @@ struct MapperMem<'a, H: HostMemory + HostOps> {
     /// The first refusal without a vCPU, and the address it was for.
     refused: std::cell::Cell<Option<(crate::runtime::kernel_walk::Refused, u64)>>,
     log: Option<&'a std::cell::RefCell<crate::runtime::kernel_walk::WalkLog>>,
+    /// Samples taken, against [`crate::runtime::kernel_walk::WalkPolicy::sample_limit`].
+    sampled: std::cell::Cell<u32>,
+    /// Whether this reader took its one boundary-crossing probe.
+    probed: std::cell::Cell<bool>,
 }
 
 impl<'a, H: HostMemory + HostOps> MapperMem<'a, H> {
@@ -171,6 +175,8 @@ impl<'a, H: HostMemory + HostOps> MapperMem<'a, H> {
             walk,
             refused: std::cell::Cell::new(None),
             log,
+            sampled: std::cell::Cell::new(0),
+            probed: std::cell::Cell::new(false),
         }
     }
 
@@ -207,27 +213,40 @@ impl<'a, H: HostMemory + HostOps> MapperMem<'a, H> {
         }
     }
 
-    /// Runtime validation: the bytes the CPU just read, read again through the
-    /// walk, and while no sample has yet crossed a page, a 16-byte read across
-    /// the end of this one through both.
+    /// Runtime validation: the bytes the CPU just read, read through the walk and
+    /// then through the CPU again (see [`crate::runtime::kernel_walk::sample`]),
+    /// and while no sample has yet crossed a page, the same for 16 bytes across
+    /// the end of this one.
     fn validate(&self, address: u64, cpu: &[u8]) {
         use crate::runtime::kernel_walk;
         let (Some(root), Some(log)) = (self.walk.root, self.log) else {
             return;
         };
+        if self.sampled.get() >= self.walk.sample_limit() {
+            return;
+        }
+        self.sampled.set(self.sampled.get() + 1);
         let mut log = log.borrow_mut();
-        log.compares
-            .push(kernel_walk::compare(self.host, &root, address, cpu));
-        if !self.walk.wants_crossing {
+        let again = |at: u64| move |buf: &mut [u8]| self.host.read_kva(at, buf).is_ok();
+        log.compares.push(kernel_walk::sample(
+            self.host,
+            &root,
+            address,
+            cpu,
+            again(address),
+        ));
+        if !self.walk.wants_crossing || self.probed.get() {
             return;
         }
         let Some((at, len)) = kernel_walk::crossing_probe(&root, address) else {
             return;
         };
+        self.probed.set(true);
+        log.probes += 1;
         let mut probe = vec![0u8; len];
         if self.host.read_kva(at, &mut probe).is_ok() {
             log.compares
-                .push(kernel_walk::compare(self.host, &root, at, &probe));
+                .push(kernel_walk::sample(self.host, &root, at, &probe, again(at)));
         }
     }
 }

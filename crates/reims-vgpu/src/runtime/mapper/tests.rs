@@ -1418,18 +1418,22 @@ mod kernel_walk_resolve {
     #[test]
     fn a_walk_that_disagrees_with_the_cpu_is_not_used() {
         let (mut state, mut host) = fixture(entry(0x2_1000));
-        // The CPU now finds the page object somewhere the guest tables do not.
+        // The guest's own tables send the MappingInternal's page somewhere the
+        // CPU does not read: a copy whose size field differs, every time.
         let elsewhere = 0x3_2000_0000u64;
+        let mut page = vec![0u8; G as usize];
+        host.read_gpa(backing(A), &mut page).unwrap();
+        let size = MAPPING_INTERNAL_SIZE as usize;
+        page[size..size + 4].copy_from_slice(&(MAPPING_INTERNAL_EXPECTED_SIZE + 1).to_le_bytes());
         host.map_range(elsewhere, G as usize, 0);
-        host.write_gpa(
-            elsewhere + iosurface_pages::MAPPING_PAGE_TABLE_FROM_F48,
-            &B.to_le_bytes(),
-        )
-        .unwrap();
-        host.write_gpa(elsewhere, b"cpu-only").unwrap();
-        host.kva_cpu_pages.insert(C, elsewhere);
-        let _ = resolve_mapping_backing(&mut state, &host, MID);
-        let _ = resolve_mapping_backing(&mut state, &host, MID);
+        host.write_gpa(elsewhere, &page).unwrap();
+        map_page(&mut host, A, elsewhere);
+        for _ in 0..4 {
+            assert!(
+                resolve_mapping_backing(&mut state, &host, MID),
+                "the CPU path is unaffected"
+            );
+        }
         assert_eq!(state.kernel_walk.gate(), Err(GateRefusal::Mismatched));
 
         host.kva_no_cpu = true;
