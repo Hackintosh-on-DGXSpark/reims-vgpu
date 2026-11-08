@@ -186,6 +186,39 @@ impl<H: HostMemory + HostOps> PagesMemory for MapperMem<'_, H> {
     }
 }
 
+/// The MappingInternal in whichever register holds it.
+///
+/// macOS 26's driver leaves the handoff in other registers than x19/x21/x22.
+/// A MappingInternal names its own mapping id and size, so the register can be
+/// found by asking each one, and its back pointer is the mapper device.
+fn find_mapping_internal<H: HostMemory + HostOps>(
+    host: &H,
+    producer: u32,
+    mid: u32,
+    request_type: u32,
+) -> Option<MapperCapture> {
+    let mem = MapperMem::new(host);
+    (0..=30u32).find_map(|reg| {
+        let internal = host.read_xreg(reg).ok().filter(|&v| guest_kernel_va(v))?;
+        let fields = read_mapper_identity(&mem, internal, false, 0).ok()?;
+        if fields.mapping_id != mid
+            || fields.internal_size != iosurface_pages::MAPPING_INTERNAL_EXPECTED_SIZE
+            || !guest_kernel_va(fields.owner_kva)
+        {
+            return None;
+        }
+        if crate::observe::first_sight("mapper_capture_register", u64::from(reg)) {
+            crate::observe::off(format!("mapper_capture_register reg=x{reg} mapping={mid}"));
+        }
+        Some(MapperCapture {
+            producer,
+            mapper_device_kva: fields.owner_kva,
+            request_type,
+            mapping_internal: internal,
+        })
+    })
+}
+
 /// Capture mapper handoff registers while still on the publishing vCPU.
 ///
 /// Call from the iosfc producer MMIO write path before scheduling the drain BH.
@@ -236,6 +269,11 @@ pub fn capture_at_producer<H: HostMemory + HostOps>(
             return capture_xreg_failed(mid, producer, decline);
         }
     };
+    if rtype != request.request_type || !guest_kernel_va(internal) {
+        if let Some(capture) = find_mapping_internal(host, producer, mid, request.request_type) {
+            return Some(capture);
+        }
+    }
     if rtype != request.request_type {
         let decline = MapperDecline::CaptureRequestTypeMismatch;
         note_capture_fail(
