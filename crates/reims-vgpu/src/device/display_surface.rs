@@ -13,6 +13,7 @@
 //! `crate::runtime::draw::vulkan` gives and `window_publish` repeats: a chapter of the
 //! root lifted out whole should not read as a redesign.
 
+use super::lock_hold::{try_hold, Held, Holder};
 use super::*;
 
 /// Which source owns the host console right now.
@@ -77,7 +78,7 @@ pub fn device_console_feed(id: u64) -> Option<ConsoleFeed> {
     // caller is a display tick, the early console is the pre-boundary source by
     // definition, and the alternative — failing the call — makes the shim invent
     // a policy for "no answer", which is the thing being removed.
-    let Some(d) = slot.inner.try_lock() else {
+    let Some(d) = try_hold(&slot.inner, Holder::Display) else {
         return Some(ConsoleFeed::Firmware);
     };
     Some(
@@ -177,7 +178,7 @@ pub fn device_efi_console_copy(
     let Some(slot) = device_slot(id) else {
         return false;
     };
-    let Some(mut d) = slot.inner.try_lock() else {
+    let Some(mut d) = try_hold(&slot.inner, Holder::Display) else {
         return false;
     };
     if d.device.state.gfx.efi_fb_start == 0 {
@@ -214,9 +215,9 @@ pub fn device_scanout_copy(
         // The worker observes `present_action_pending` before taking this lock
         // and returns immediately. Blocking here is therefore bounded to that
         // short handoff; pre-boundary periodic scanout remains nonblocking.
-        slot.inner.lock()
+        Held::new(slot.inner.lock(), Holder::ScanoutCopy)
     } else {
-        let Some(d) = slot.inner.try_lock() else {
+        let Some(d) = try_hold(&slot.inner, Holder::ScanoutCopy) else {
             return ScanoutCopyResult::Unchanged;
         };
         d
@@ -308,7 +309,7 @@ pub struct CursorGlyphInfo {
 
 pub fn device_cursor_glyph_info(id: u64) -> Option<CursorGlyphInfo> {
     let slot = device_slot(id)?;
-    let d = slot.inner.try_lock()?;
+    let d = try_hold(&slot.inner, Holder::Display)?;
     let c = &d.device.state.cursor;
     if !c.glyph_ready || c.pixels.is_empty() {
         return None;
@@ -325,7 +326,7 @@ pub fn device_cursor_glyph_info(id: u64) -> Option<CursorGlyphInfo> {
 /// Copy QEMUCursor ARGB pixels. Returns number of pixels written.
 pub fn device_cursor_glyph_copy(id: u64, out: &mut [u32]) -> Option<usize> {
     let slot = device_slot(id)?;
-    let d = slot.inner.try_lock()?;
+    let d = try_hold(&slot.inner, Holder::Display)?;
     let c = &d.device.state.cursor;
     if !c.glyph_ready || c.pixels.is_empty() {
         return None;
