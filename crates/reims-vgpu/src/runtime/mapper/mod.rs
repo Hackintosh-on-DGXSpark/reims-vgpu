@@ -976,18 +976,22 @@ pub fn ensure_resolved_for_scanout<H: HostMemory + HostOps>(
     host: &H,
     mapping_id: u32,
 ) -> bool {
-    let (mapped, has_internal, empty_pages, has_geom) = match state.mappings.get(&mapping_id) {
+    let page_shift = state.page_shift;
+    let (mapped, has_internal, empty_pages, has_geom, has_holes) = match state.mappings.get(&mapping_id) {
         Some(m) => (
             m.mapped,
             m.mapping_internal != 0,
             m.page_entries.is_empty(),
             m.has_geom,
+            m.page_entries.iter().any(|&e| {
+                crate::contract::iosurface_pages::entry_gpa_shift(e, page_shift).is_none()
+            }),
         ),
         None => return false,
     };
     let needs = mapped
         && has_internal
-        && (empty_pages || !has_geom || !pages_cover_geom(state, mapping_id));
+        && (empty_pages || has_holes || !has_geom || !pages_cover_geom(state, mapping_id));
     if needs {
         resolve_mapping_backing(state, host, mapping_id)
     } else {

@@ -514,6 +514,27 @@ pub fn sample_window_from_device_desc(
                             }
                         }
                     }
+                    // No plane has the view's own geometry: try a view that
+                    // reinterprets one plane's rows, like a 1024-wide luma
+                    // plane sampled as 256 RGBA8 texels per row. The rows must
+                    // hold the same bytes, and only one plane may qualify.
+                    if matches == 0 {
+                        for p in 0..surf
+                            .plane_count
+                            .min(reims_vgpu_wire::device_desc::TYPE4_PLANE_CAP as u8)
+                        {
+                            if let Some((cand, _)) = device_desc_plane(desc, p as u32) {
+                                if cand.height == height
+                                    && cand.bytes_per_element != 0
+                                    && u64::from(cand.width) * u64::from(cand.bytes_per_element)
+                                        == u64::from(width) * u64::from(bpp)
+                                {
+                                    matches += 1;
+                                    plane = cand;
+                                }
+                            }
+                        }
+                    }
                     if matches == 1 {
                         if let Some(w) =
                             sample_window_from_device_plane(&plane, pixel_format, width, height)
@@ -778,10 +799,13 @@ fn read_table_entries(
     for i in 0..pages {
         let entry = read_u32_at(mem, table_kva, (i as u64) * U32_SIZE as u64)
             .ok_or(Status::ErrPageTableRead("iosurface_page_table_entry_read"))?;
-        let gpa = entry_gpa_shift(entry, page_shift)
-            .ok_or(Status::ErrPageEntry("iosurface_page_table_entry_invalid"))?;
-        if !mem.is_ram_gpa(gpa) {
-            return Err(Status::ErrPageEntry("iosurface_page_table_gpa_not_ram"));
+        // A page the guest has not touched yet has no frame. Keep the entry, so
+        // the mapping resolves now and readers see the hole; a later resolve
+        // picks the frame up once the guest has written it.
+        if let Some(gpa) = entry_gpa_shift(entry, page_shift) {
+            if !mem.is_ram_gpa(gpa) {
+                return Err(Status::ErrPageEntry("iosurface_page_table_gpa_not_ram"));
+            }
         }
         entries.push(entry);
     }

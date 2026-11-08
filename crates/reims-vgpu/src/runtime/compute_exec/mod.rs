@@ -2192,6 +2192,9 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
         #[cfg(feature = "backend-vulkan")]
         let mut seed_generation = m.content_generation;
         let pages_n = m.page_entries.len();
+        let page_holes = m.page_entries.iter().any(|&entry| {
+            crate::contract::iosurface_pages::entry_gpa_shift(entry, state.page_shift).is_none()
+        });
         // Wire type-4 `length` (page-aligned getResidentSize), stashed as device_desc.alloc_size.
         // Independent of plane w/h and of MapMemory2 IOAccelMemory length — measure-only.
         let wire_len = crate::contract::iosurface_pages::decode_device_surface(&m.device_desc)
@@ -2318,7 +2321,13 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
         // renders its wallpaper and backdrops into such surfaces and only ever
         // samples them on the GPU. It starts from zero, lives in the engine,
         // and is never written back.
-        let private = page_bytes < span_end && is_storage && pages_n == 0;
+        // Pages the guest never touched are holes in the page table; a surface
+        // the GPU fills is mostly holes until something on the CPU reads it.
+        let private = is_storage && page_bytes < span_end && pages_n == 0;
+        // A storage window over pages the guest has not touched yet cannot be
+        // seeded from them; it starts from zero, and the writeback lands it
+        // once the guest has wired the pages for the GPU.
+        let unseeded = is_storage && !private && page_holes;
         if private && serve.is_none() {
             crate::observe::off(format!(
                 "compute_stage_tex type11_private mapping={mapping_id} {width}x{height} fmt={stage_fmt:#x} span_end={span_end}"
@@ -2333,6 +2342,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
         let mut bytes = vec![0u8; need];
         if serve.is_none()
             && !private
+            && !unseeded
             && !mapping_write::read_rect_raw_at(
                 state,
                 host,
@@ -2945,6 +2955,22 @@ fn writeback_texture<M: HostMemory + HostOps>(
             height,
             bpp,
         } => {
+            // Pages that were holes when the window was staged may be wired by
+            // now; take the page table again before writing.
+            let _ = crate::runtime::mapper::ensure_resolved_for_scanout(state, host, *mapping_id);
+            if let Some(m) = state.mappings.get(mapping_id) {
+                let holes = m
+                    .page_entries
+                    .iter()
+                    .filter(|&&e| crate::contract::iosurface_pages::entry_gpa_shift(e, state.page_shift).is_none())
+                    .count();
+                if holes > 0 {
+                    crate::observe::off(format!(
+                        "compute_writeback_tex holes mid={mapping_id} holes={holes} of={}",
+                        m.page_entries.len()
+                    ));
+                }
+            }
             let tight = width.saturating_mul(*bpp);
             if !mapping_write::write_full_rect_raw_at(
                 state,
