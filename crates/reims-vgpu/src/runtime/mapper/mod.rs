@@ -154,8 +154,8 @@ struct MapperMem<'a, H: HostMemory + HostOps> {
     log: Option<&'a std::cell::RefCell<crate::runtime::kernel_walk::WalkLog>>,
     /// Samples taken, against [`crate::runtime::kernel_walk::WalkPolicy::sample_limit`].
     sampled: std::cell::Cell<u32>,
-    /// Whether this reader took its one boundary-crossing probe.
-    probed: std::cell::Cell<bool>,
+    /// Kernel pages this reader has sampled, while its root validates.
+    pages: std::cell::RefCell<Vec<u64>>,
 }
 
 impl<'a, H: HostMemory + HostOps> MapperMem<'a, H> {
@@ -176,7 +176,7 @@ impl<'a, H: HostMemory + HostOps> MapperMem<'a, H> {
             refused: std::cell::Cell::new(None),
             log,
             sampled: std::cell::Cell::new(0),
-            probed: std::cell::Cell::new(false),
+            pages: std::cell::RefCell::new(Vec::new()),
         }
     }
 
@@ -214,15 +214,29 @@ impl<'a, H: HostMemory + HostOps> MapperMem<'a, H> {
     }
 
     /// Runtime validation: the bytes the CPU just read, read through the walk and
-    /// then through the CPU again (see [`crate::runtime::kernel_walk::sample`]),
-    /// and while no sample has yet crossed a page, the same for 16 bytes across
-    /// the end of this one.
+    /// then through the CPU again (see [`crate::runtime::kernel_walk::sample`]).
+    ///
+    /// Up to the policy's sample limit, and — while the root validates — also
+    /// the first read of each new kernel page this reader touches, up to
+    /// [`crate::runtime::kernel_walk::PAGES_PER_READER_VALIDATING`] pages, so one
+    /// resolve samples the MappingInternal, its page object and its page table
+    /// rather than one object many times. While a crossing is still owed, each
+    /// new page also gets one probe across its end.
     fn validate(&self, address: u64, cpu: &[u8]) {
-        use crate::runtime::kernel_walk;
+        use crate::runtime::kernel_walk::{self, Source, PAGES_PER_READER_VALIDATING};
         let (Some(root), Some(log)) = (self.walk.root, self.log) else {
             return;
         };
-        if self.sampled.get() >= self.walk.sample_limit() {
+        let page = address & !((1u64 << 14) - 1);
+        let new_page = !self.walk.validated && {
+            let mut pages = self.pages.borrow_mut();
+            let new = pages.len() < PAGES_PER_READER_VALIDATING && !pages.contains(&page);
+            if new {
+                pages.push(page);
+            }
+            new
+        };
+        if !new_page && self.sampled.get() >= self.walk.sample_limit() {
             return;
         }
         self.sampled.set(self.sampled.get() + 1);
@@ -234,19 +248,25 @@ impl<'a, H: HostMemory + HostOps> MapperMem<'a, H> {
             address,
             cpu,
             again(address),
+            Source::Mapper,
         ));
-        if !self.walk.wants_crossing || self.probed.get() {
+        if !self.walk.wants_crossing || !new_page {
             return;
         }
         let Some((at, len)) = kernel_walk::crossing_probe(&root, address) else {
             return;
         };
-        self.probed.set(true);
         log.probes += 1;
         let mut probe = vec![0u8; len];
         if self.host.read_kva(at, &mut probe).is_ok() {
-            log.compares
-                .push(kernel_walk::sample(self.host, &root, at, &probe, again(at)));
+            log.compares.push(kernel_walk::sample(
+                self.host,
+                &root,
+                at,
+                &probe,
+                again(at),
+                Source::Mapper,
+            ));
         }
     }
 }
