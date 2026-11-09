@@ -22,13 +22,42 @@ const VBAR: u64 = TEXT_EXEC;
 const VTABLE_SIGNED: u64 = 0x5b95_7e00_1000_8638;
 
 const MID: u32 = 2;
-const PAGES: u64 = 3;
 const MI: u64 = 0xffff_fe1e_47e6_4c20;
 const SURFACE: u64 = 0xffff_fe24_13d7_1398;
 const TABLE: u64 = 0xffff_fe24_13d7_2048;
 const MIXED: u64 = 0xffff_fe1e_47da_8100;
 const PAGE_TABLE: u64 = 0xffff_fe9a_f64f_c000;
 const KERNEL_TASK: u64 = 0xffff_fe1f_4a04_9c70;
+/// The mapper device every MappingInternal points back to.
+const MAPPER: u64 = 0xffff_fe2a_e214_1800;
+/// Mapping 2's guest pages, apart so each is its own run.
+const G: [u64; 3] = [0x1_0000_0000, 0x1_0010_0000, 0x1_0020_0000];
+
+/// One type-11 mapping as 27.2 lays it out in guest memory.
+struct Surface {
+    mid: u32,
+    mi: u64,
+    surface: u64,
+    table: u64,
+    page_table: u64,
+    gpas: Vec<u64>,
+}
+
+fn old_surface() -> Surface {
+    Surface {
+        mid: MID,
+        mi: MI,
+        surface: SURFACE,
+        table: TABLE,
+        page_table: PAGE_TABLE,
+        gpas: G.to_vec(),
+    }
+}
+
+fn entry(gpa: u64) -> u32 {
+    ((gpa >> 14) as u32) << iosurface_pages::PAGE_ENTRY_PFN_SHIFT
+        | iosurface_pages::PAGE_ENTRY_VALID
+}
 
 fn put64(host: &mut FakeHost, at: u64, v: u64) {
     host.write_gpa(at, &v.to_le_bytes()).unwrap();
@@ -107,16 +136,38 @@ fn put_iomd(host: &mut FakeHost, at: u64, length: u64, wire: u32, pages: u32, bu
 
 /// Mapping 2 as 27.2 lays it out: three pages, surface wired once, page table
 /// twice (it is wired at creation as well).
-fn put_mapping(host: &mut FakeHost) {
-    put32(host, MI + MI_STATE, 5);
-    put64(host, MI + MI_SURFACE_IOMD, SURFACE);
-    put32(host, MI + MI_ID, MID);
-    put32(host, MI + MI_SIZE, MAPPING_INTERNAL_EXPECTED_SIZE);
-    put64(host, MI + MI_TABLE_IOMD, TABLE);
-    put64(host, MI + MI_PAGE_COUNT, PAGES);
-    put_iomd(host, SURFACE, PAGES * PAGE, 1, PAGES as u32, 0);
-    put_iomd(host, TABLE, PAGE, 2, 1, PAGE_TABLE);
+/// A MappingInternal the mapper can resolve and the watch can check: its
+/// surface wired `wire` times, its page table twice (it is wired at creation as
+/// well), its page table in kernel memory and its pages in guest RAM.
+fn put_surface(host: &mut FakeHost, s: &Surface, wire: u32) {
+    let n = s.gpas.len() as u64;
+    put32(host, s.mi + MI_STATE, 5);
+    put64(
+        host,
+        s.mi + iosurface_pages::MAPPING_INTERNAL_BACKPTR,
+        MAPPER,
+    );
+    put64(host, s.mi + MI_SURFACE_IOMD, s.surface);
+    put32(host, s.mi + MI_ID, s.mid);
+    put32(host, s.mi + MI_SIZE, MAPPING_INTERNAL_EXPECTED_SIZE);
+    put64(host, s.mi + MI_TABLE_IOMD, s.table);
+    put64(host, s.mi + MI_PAGE_COUNT, n);
+    put_iomd(host, s.surface, n * PAGE, wire, n as u32, 0);
+    put_iomd(host, s.table, PAGE, 2, 1, s.page_table);
+    for (i, &gpa) in s.gpas.iter().enumerate() {
+        put32(host, s.page_table + 4 * i as u64, entry(gpa));
+        host.map_range(gpa, PAGE as usize, 0);
+    }
     put64(host, MIXED + MIXED_DATA_LENGTH, 0x2000);
+}
+
+/// The device state a resolve of `s` leaves behind.
+fn adopt(state: &mut DeviceState, s: &Surface) {
+    state.map_surface(s.mid);
+    let m = state.mappings.get_mut(&s.mid).unwrap();
+    m.mapping_internal = s.mi;
+    m.page_table_kva = s.page_table;
+    m.page_entries = s.gpas.iter().map(|&g| entry(g)).collect();
 }
 
 fn set_surface_wire(host: &mut FakeHost, wire: i32) {
@@ -127,18 +178,15 @@ fn fixture(version: &str) -> (DeviceState, FakeHost) {
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     put_kernel(&mut host, version);
-    put_mapping(&mut host);
+    put_surface(&mut host, &old_surface(), 1);
+    state.mapper_device_kva = MAPPER;
     state.kernel_walk.root = Some(KernelRoot {
         tcr: TCR_16K_47,
         sctlr: SCTLR_ON,
         vbar: Some(VBAR),
         ..root(0)
     });
-    assert!(state.map_surface(MID));
-    let m = state.mappings.get_mut(&MID).unwrap();
-    m.mapping_internal = MI;
-    m.page_table_kva = PAGE_TABLE;
-    m.page_entries = vec![0x1; PAGES as usize];
+    adopt(&mut state, &old_surface());
     (state, host)
 }
 
@@ -978,4 +1026,271 @@ fn a_burst_of_row_writes_reads_the_counts_once() {
         );
         assert_eq!(state.wire_watch.watched[&MID].refused, 65);
     });
+}
+
+// MARK: - Withdrawn claims and the surface quarantine
+
+use crate::runtime::mapper::{
+    first_surface_page_collision, surface_pages_are_exclusively_owned, vouch_mapping_pages_verdict,
+    write_mapping_bytes,
+};
+use crate::runtime::surface_quarantine::{is_quarantined, is_withdrawn};
+
+/// The surface the guest gave one of mapping 2's pages to, as mid=9 on the
+/// regression boot.
+const NEW: u32 = 9;
+/// A page no other surface in these tests holds.
+const SPARE: u64 = 0x1_0030_0000;
+
+fn new_surface(gpas: &[u64]) -> Surface {
+    Surface {
+        mid: NEW,
+        mi: 0xffff_fe1e_47e7_0000,
+        surface: 0xffff_fe24_13d8_0000,
+        table: 0xffff_fe24_13d8_1000,
+        page_table: 0xffff_fe9a_f650_0000,
+        gpas: gpas.to_vec(),
+    }
+}
+
+fn route(name: &str) -> u64 {
+    crate::runtime::drain::census::store_route_count(name)
+}
+
+/// Regression 1: mapping 2 condemned and withdrawn, then a new mapping over
+/// one of its pages: the new one passes its collision check and is written;
+/// mapping 2 takes nothing.
+#[test]
+fn a_new_mapping_over_a_withdrawn_incarnations_pages_is_written() {
+    with_switches(true, true, || {
+        let (mut state, mut host) = fixture(EXPECTED_KERNEL_VERSION);
+        on_map(&mut state, &host, MID);
+        let new = new_surface(&[G[1]]);
+        put_surface(&mut host, &new, 1);
+        let cap = crate::observe::FailCapture::start();
+        set_surface_wire(&mut host, 0);
+        tick(&mut state, &host);
+        let withdrawn = cap.one("surface_quarantine_withdrawn");
+        assert!(
+            withdrawn.contains("mid=2 ") && withdrawn.contains("evidence=[wire field=surface"),
+            "{withdrawn}"
+        );
+        assert!(is_withdrawn(&state, MID) && is_quarantined(&state, MID));
+
+        adopt(&mut state, &new);
+        on_map(&mut state, &host, NEW);
+        assert!(surface_pages_are_exclusively_owned(
+            &mut state, NEW, "rewire"
+        ));
+        assert!(!is_quarantined(&state, NEW));
+        assert!(cap.one("surface_quarantine_resolved").contains(
+            "reason=owner_condemned old=mid=2 new=mid=9 order=condemned_first site=rewire"
+        ));
+        let token = vouch_mapping_pages_verdict(&mut state, &host, NEW)
+            .1
+            .expect("the new mapping is vouched");
+        assert!(write_mapping_bytes(
+            &mut state, &mut host, NEW, 0, b"NEW", &token
+        ));
+        let mut b = [0u8; 3];
+        host.read_gpa(G[1], &mut b).unwrap();
+        assert_eq!(&b, b"NEW");
+        assert!(vouch_mapping_pages_verdict(&mut state, &host, MID)
+            .1
+            .is_none());
+    });
+}
+
+/// Regression 2: a withdrawn owner is skipped, a valid one is not.
+#[test]
+fn a_third_valid_owner_still_blocks_the_new_mapping() {
+    with_switches(true, true, || {
+        let (mut state, mut host) = fixture(EXPECTED_KERNEL_VERSION);
+        on_map(&mut state, &host, MID);
+        set_surface_wire(&mut host, 0);
+        tick(&mut state, &host);
+        assert!(is_withdrawn(&state, MID));
+        // Mapping 7 holds SPARE, and nothing says it gave it up.
+        host.map_range(SPARE, PAGE as usize, 0);
+        state.map_surface(7);
+        let m = state.mappings.get_mut(&7).unwrap();
+        m.mapping_internal = 0xffff_fe1e_47e8_0000;
+        m.page_entries = vec![entry(SPARE)];
+        let new = new_surface(&[G[1], SPARE]);
+        put_surface(&mut host, &new, 1);
+        adopt(&mut state, &new);
+        let cap = crate::observe::FailCapture::start();
+        assert!(!surface_pages_are_exclusively_owned(
+            &mut state, NEW, "rewire"
+        ));
+        assert!(is_quarantined(&state, NEW) && is_quarantined(&state, 7));
+        let line = cap
+            .lines()
+            .into_iter()
+            .find(|l| l.starts_with("surface_quarantine site=rewire"))
+            .expect("a quarantine line");
+        assert!(line.contains("owner=[mid=7 "), "{line}");
+        assert!(state.mappings[&NEW].quarantine.as_ref().unwrap().partners == vec![7]);
+    });
+}
+
+/// Regression 3: the guest preparing the old incarnation again gives it
+/// nothing back: writes and its owed frame are refused for good.
+#[test]
+fn a_withdrawn_incarnation_stays_refused_when_its_count_recovers() {
+    with_switches(true, true, || {
+        let (mut state, mut host) = fixture(EXPECTED_KERNEL_VERSION);
+        on_map(&mut state, &host, MID);
+        set_surface_wire(&mut host, 0);
+        tick(&mut state, &host);
+        assert!(is_withdrawn(&state, MID));
+        let generation = state.mappings[&MID].map_generation;
+        let _ = state.pending_writebacks.arm(
+            MID,
+            crate::runtime::writeback_debt::test_resident_identity(MID, 4, 4, 1),
+            4,
+            4,
+            generation,
+        );
+        set_surface_wire(&mut host, 1);
+        let cap = crate::observe::FailCapture::start();
+        assert!(!write_now(
+            &mut state,
+            &host,
+            MID,
+            "mapping_write",
+            WriteKind::Cpu
+        ));
+        assert!(cap.one("wire_guard_still_condemned").contains("value=1"));
+        assert!(vouch_mapping_pages_verdict(&mut state, &host, MID)
+            .1
+            .is_none());
+        let dropped = route("wbdebt_dropped_withdrawn");
+        crate::runtime::writeback_debt::pay_for_mapping(&mut state, &mut host, MID);
+        assert!(
+            state.pending_writebacks.get(MID).is_none(),
+            "never lands, never kept"
+        );
+        assert_eq!(route("wbdebt_dropped_withdrawn"), dropped + 1);
+        assert!(is_withdrawn(&state, MID));
+    });
+}
+
+/// Regression 4: a new MappingInternal for the old id is another incarnation.
+/// It is a valid owner again and the guard does not carry over.
+#[test]
+fn a_new_incarnation_of_the_old_id_inherits_nothing() {
+    with_switches(true, true, || {
+        let (mut state, mut host) = fixture(EXPECTED_KERNEL_VERSION);
+        on_map(&mut state, &host, MID);
+        set_surface_wire(&mut host, 0);
+        tick(&mut state, &host);
+        assert!(is_withdrawn(&state, MID));
+        let again = Surface {
+            mid: MID,
+            mi: MI + 0x2000,
+            surface: SURFACE + 0x2000,
+            table: TABLE + 0x2000,
+            page_table: PAGE_TABLE + 0x4000,
+            gpas: vec![SPARE],
+        };
+        put_surface(&mut host, &again, 1);
+        assert!(state.attach_mapping_internal(MID, again.mi));
+        adopt(&mut state, &again);
+        crate::runtime::surface_quarantine::confirm_new_backing(&mut state, MID);
+        assert!(!is_quarantined(&state, MID) && !is_withdrawn(&state, MID));
+        assert!(write_now(
+            &mut state,
+            &host,
+            MID,
+            "mapping_write",
+            WriteKind::Cpu
+        ));
+        // Another mapping over its new page collides with it as with any owner.
+        state.map_surface(11);
+        let m = state.mappings.get_mut(&11).unwrap();
+        m.mapping_internal = 0xffff_fe1e_47e9_0000;
+        m.page_entries = vec![entry(SPARE)];
+        assert_eq!(first_surface_page_collision(&state, 11), Some((SPARE, MID)));
+    });
+}
+
+/// Regression 5 and the reverse order: the collision comes first and
+/// quarantines both. The condemnation alone excludes nothing; the worker's
+/// next tick waits for writes still in flight to mapping 2's pages, and only
+/// then withdraws it and frees mapping 9, after re-resolving it and reading
+/// its own counts.
+#[test]
+fn in_flight_writes_settle_before_a_condemned_owner_is_excluded() {
+    with_switches(true, true, || {
+        let (mut state, mut host) = fixture(EXPECTED_KERNEL_VERSION);
+        on_map(&mut state, &host, MID);
+        let new = new_surface(&[G[1]]);
+        put_surface(&mut host, &new, 1);
+        // Condemned by a write's own sample, not yet withdrawn.
+        set_surface_wire(&mut host, 0);
+        assert!(!write_now(
+            &mut state,
+            &host,
+            MID,
+            "mapping_write",
+            WriteKind::Cpu
+        ));
+        assert!(!is_withdrawn(&state, MID));
+        adopt(&mut state, &new);
+        assert!(
+            !surface_pages_are_exclusively_owned(&mut state, NEW, "rewire"),
+            "until it is withdrawn, mapping 2 still owns its pages"
+        );
+        assert!(is_quarantined(&state, NEW) && is_quarantined(&state, MID));
+        assert!(state.mappings[&NEW].page_entries.is_empty());
+
+        crate::backend::vulkan::engine::test_arm_guest_write(&[G[0]]);
+        assert!(crate::backend::vulkan::engine::guest_writes_outstanding());
+        let settles = route("settle_quarantine_overlap");
+        let cap = crate::observe::FailCapture::start();
+        tick(&mut state, &host);
+        assert!(!crate::backend::vulkan::engine::guest_writes_outstanding());
+        assert_eq!(route("settle_quarantine_overlap"), settles + 1);
+        assert!(cap
+            .one("surface_quarantine_withdrawn")
+            .contains("in_flight_before=overlap"));
+        assert!(is_withdrawn(&state, MID) && is_quarantined(&state, MID));
+        let resolved = cap.one("surface_quarantine_resolved");
+        assert!(
+            resolved.contains("reason=owner_condemned old=mid=2 new=mid=9 order=collision_first")
+                && resolved.contains("evidence=[wire internal=")
+                && resolved.contains("surface_wire=1 table_wire=2"),
+            "{resolved}"
+        );
+        assert!(!is_quarantined(&state, NEW));
+        assert_eq!(state.mappings[&NEW].page_entries, vec![entry(G[1])]);
+    });
+}
+
+/// Without wire evidence for either side, a collision quarantines both and
+/// the worker frees neither: the guard off, or no anomaly.
+#[test]
+fn without_wire_evidence_both_sides_stay_quarantined() {
+    for (guard, wire) in [(false, 0), (true, 1)] {
+        with_switches(true, guard, || {
+            let (mut state, mut host) = fixture(EXPECTED_KERNEL_VERSION);
+            on_map(&mut state, &host, MID);
+            let new = new_surface(&[G[1]]);
+            put_surface(&mut host, &new, 1);
+            set_surface_wire(&mut host, wire);
+            tick(&mut state, &host);
+            adopt(&mut state, &new);
+            let cap = crate::observe::FailCapture::start();
+            assert!(!surface_pages_are_exclusively_owned(
+                &mut state, NEW, "rewire"
+            ));
+            state.wire_watch.all_sampled_us = None;
+            tick(&mut state, &host);
+            assert!(is_quarantined(&state, NEW) && is_quarantined(&state, MID));
+            assert!(!is_withdrawn(&state, MID));
+            assert!(lines_with(&cap, "surface_quarantine_withdrawn").is_empty());
+            assert!(lines_with(&cap, "surface_quarantine_resolved").is_empty());
+        });
+    }
 }

@@ -1375,6 +1375,15 @@ fn arm_guest_write_pages(pages: &[u64]) {
     f.armed.push(sorted);
 }
 
+/// A guest-page write submitted and not yet settled, over `pages`, for a test of
+/// a caller that must wait for one. Settles like any other: with no device the
+/// wait clears it.
+#[cfg(test)]
+pub(crate) fn test_arm_guest_write(pages: &[u64]) {
+    arm_guest_write_pages(pages);
+    GUEST_WRITE_DEBT.store(true, std::sync::atomic::Ordering::Release);
+}
+
 /// Record one resource-owned allocation that an outstanding GPU Store writes.
 /// Repeated writes through the same admitted resource add no ledger work.
 fn arm_guest_write_footprint(

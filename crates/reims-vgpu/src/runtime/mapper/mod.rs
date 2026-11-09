@@ -944,7 +944,16 @@ fn surface_pages_are_exclusively_owned(
     mapping_id: u32,
     site: &str,
 ) -> bool {
-    let Some((gpa, owner)) = first_surface_page_collision(state, mapping_id) else {
+    let (valid, withdrawn) = surface_page_overlaps(state, mapping_id);
+    // An incarnation the wire guard proved the guest unwired owns nothing here;
+    // every other owner still does. See `runtime::surface_quarantine::withdraw`.
+    let held = crate::runtime::surface_quarantine::is_quarantined(state, mapping_id);
+    for (gpa, old) in withdrawn {
+        crate::runtime::surface_quarantine::note_withdrawn_overlap(
+            mapping_id, old, gpa, site, held,
+        );
+    }
+    let Some((gpa, owner)) = valid else {
         return true;
     };
     let mine_pages = state
@@ -968,14 +977,31 @@ fn surface_pages_are_exclusively_owned(
 /// this. It is not measure-only; the doc said so for a while and was wrong,
 /// which is the worse way round for a detector on the guest-corruption rail.
 ///
+/// An owner whose incarnation withdrew its page claims is not counted: see
+/// [`crate::runtime::surface_quarantine::withdraw`].
+///
 /// Cost O(this_pages + Σ other live pages); called only on a rewire.
 fn first_surface_page_collision(state: &DeviceState, mapping_id: u32) -> Option<(u64, u32)> {
+    surface_page_overlaps(state, mapping_id).0
+}
+
+/// `mapping_id`'s overlaps with every other live mapping: the first page it
+/// shares with a valid owner, and one shared page for each owner whose
+/// incarnation withdrew its claims.
+fn surface_page_overlaps(
+    state: &DeviceState,
+    mapping_id: u32,
+) -> (Option<(u64, u32)>, Vec<(u64, u32)>) {
+    let mut valid = None;
+    let mut withdrawn = Vec::new();
     let page_shift = state.page_shift;
     let page = state.page_size();
     let page_base = |gpa: u64| gpa & !(page - 1);
-    let m = state.mappings.get(&mapping_id)?;
+    let Some(m) = state.mappings.get(&mapping_id) else {
+        return (valid, withdrawn);
+    };
     if !m.mapped || m.page_entries.is_empty() {
-        return None;
+        return (valid, withdrawn);
     }
     let mine: std::collections::HashSet<u64> = m
         .page_entries
@@ -984,21 +1010,29 @@ fn first_surface_page_collision(state: &DeviceState, mapping_id: u32) -> Option<
         .map(page_base)
         .collect();
     if mine.is_empty() {
-        return None;
+        return (valid, withdrawn);
     }
     for (&other_id, other) in &state.mappings {
         if other_id == mapping_id || !other.mapped || other.page_entries.is_empty() {
             continue;
         }
-        for &e in &other.page_entries {
-            if let Some(gpa) = crate::contract::iosurface_pages::entry_gpa_shift(e, page_shift) {
-                if mine.contains(&page_base(gpa)) {
-                    return Some((page_base(gpa), other_id));
-                }
-            }
+        let gone = crate::runtime::surface_quarantine::entry_withdrawn(other);
+        if valid.is_some() && !gone {
+            continue;
+        }
+        let shared = other
+            .page_entries
+            .iter()
+            .filter_map(|&e| crate::contract::iosurface_pages::entry_gpa_shift(e, page_shift))
+            .map(page_base)
+            .find(|gpa| mine.contains(gpa));
+        match (shared, gone) {
+            (Some(gpa), true) => withdrawn.push((gpa, other_id)),
+            (Some(gpa), false) => valid = Some((gpa, other_id)),
+            (None, _) => {}
         }
     }
-    None
+    (valid, withdrawn)
 }
 
 /// Always-on, deduped-per-`(mid, owner, gpa)` fail line for a cross-surface

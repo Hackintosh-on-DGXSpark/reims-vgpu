@@ -1442,7 +1442,14 @@ fn pay<M: HostMemory + HostOps>(
     route: &'static str,
 ) {
     // A quarantined mapping's frame is neither written nor dropped: the
-    // collision does not say whose it is, and a release or rebind will.
+    // collision does not say whose it is, and a release or rebind will. One
+    // that withdrew its claims is the exception: the guest let it go, so its
+    // frame never lands. See `runtime::surface_quarantine::withdraw`.
+    if crate::runtime::surface_quarantine::is_withdrawn(state, mapping_id) {
+        crate::runtime::drain::note_store_route("wbdebt_dropped_withdrawn");
+        crate::runtime::surface_quarantine::note_refused(mapping_id, "debt_withdrawn");
+        return;
+    }
     if crate::runtime::surface_quarantine::is_quarantined(state, mapping_id) {
         state.pending_writebacks.restore(mapping_id, debt);
         crate::runtime::surface_quarantine::note_refused(mapping_id, "debt");

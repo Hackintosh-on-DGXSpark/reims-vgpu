@@ -75,6 +75,13 @@
 //! (`wire_guard_still_condemned`). The resident stays, so a later present of the
 //! surface shows it without writing guest memory.
 //!
+//! At the worker's next tick a condemned incarnation also withdraws its page
+//! claims from the surface quarantine
+//! ([`crate::runtime::surface_quarantine::withdraw`]): once in-flight writes to it
+//! have settled it no longer owns any page in a collision check, and a mapping
+//! quarantined only because of it is freed after a fresh validation of its own
+//! (re-resolved, no other owner, its own counts read positive).
+//!
 //! A positive count is not a permission: it is read, then the write happens,
 //! and the guest can complete the descriptor in between, so the guard only
 //! stops writes after a drop it has seen. A render target the GPU writes in
@@ -562,6 +569,33 @@ impl Horizon {
     }
 }
 
+impl Watched {
+    fn pending(internal: u64) -> Self {
+        Self {
+            internal,
+            phase: Phase::Pending,
+            surface_iomd: 0,
+            table_iomd: 0,
+            pages: 0,
+            surface_fields: IomdFields::default(),
+            table_fields: IomdFields::default(),
+            at_map: None,
+            last: Counts::default(),
+            display: false,
+            anomalous: BTreeSet::new(),
+            writes: 0,
+            writes_after_anomaly: 0,
+            lines_after_anomaly: 0,
+            guard_lines: 0,
+            refused: 0,
+            last_write: None,
+            sampled_us: None,
+            condemned: None,
+            recovered_said: false,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct Cost {
     samples: u64,
@@ -606,6 +640,9 @@ pub struct WireWatch {
     /// Mappings the guard condemned whose debts and horizon are still to be
     /// taken, which needs the whole device state.
     condemn_pending: Vec<u32>,
+    /// Condemned mappings whose page claims are still to be withdrawn, which
+    /// waits for in-flight writes and so is left to the worker's tick.
+    withdraw_pending: Vec<u32>,
     /// How often each child FIFO was defined or freed; see [`Horizon`].
     fifo_generations: BTreeMap<u32, u64>,
     cost: Cost,
@@ -1497,6 +1534,7 @@ fn apply_condemnations<H: HostMemory + HostOps>(state: &mut DeviceState, host: &
             })
             .collect();
         ww.cost.condemned += 1;
+        ww.withdraw_pending.push(mapping_id);
         if debt {
             ww.cost.debts_dropped += 1;
             crate::runtime::drain::note_store_route("wbdebt_dropped_condemned");
@@ -1572,6 +1610,10 @@ pub fn on_map<H: HostMemory + HostOps>(state: &mut DeviceState, host: &H, mappin
     };
     with_watch(state, host, |ww, rd, state| {
         if let Some(old) = ww.watched.get(&mapping_id) {
+            // A MAP restating a condemned incarnation does not wash it.
+            if old.internal == internal && old.condemned.is_some() {
+                return;
+            }
             if old.internal != internal {
                 crate::observe::off(format!(
                     "wire_watch retired mapping={mapping_id} reason=remapped internal={:#x}",
@@ -1579,31 +1621,7 @@ pub fn on_map<H: HostMemory + HostOps>(state: &mut DeviceState, host: &H, mappin
                 ));
             }
         }
-        ww.watched.insert(
-            mapping_id,
-            Watched {
-                internal,
-                phase: Phase::Pending,
-                surface_iomd: 0,
-                table_iomd: 0,
-                pages: 0,
-                surface_fields: IomdFields::default(),
-                table_fields: IomdFields::default(),
-                at_map: None,
-                last: Counts::default(),
-                display: false,
-                anomalous: BTreeSet::new(),
-                writes: 0,
-                writes_after_anomaly: 0,
-                lines_after_anomaly: 0,
-                guard_lines: 0,
-                refused: 0,
-                last_write: None,
-                sampled_us: None,
-                condemned: None,
-                recovered_said: false,
-            },
-        );
+        ww.watched.insert(mapping_id, Watched::pending(internal));
         activate(ww, rd, state, mapping_id, true);
     });
 }
@@ -2041,6 +2059,116 @@ pub fn on_hold_release(state: &mut DeviceState, held: u32) {
     crate::observe::off(format!("wire_watch_ev {event}"));
 }
 
+// MARK: - Withdrawn claims
+
+/// Withdraw the page claims of every incarnation condemned since the last
+/// tick, on the worker, where waiting for in-flight writes is allowed; then
+/// free each mapping that was quarantined only because of one of them, once it
+/// passes a fresh validation. See [`crate::runtime::surface_quarantine::withdraw`].
+fn settle_withdrawals<H: HostMemory + HostOps>(state: &mut DeviceState, host: &H) {
+    for old in std::mem::take(&mut state.wire_watch.withdraw_pending) {
+        let Some((internal, evidence)) = state.wire_watch.watched.get(&old).and_then(|w| {
+            let c = w.condemned.as_ref()?;
+            Some((
+                w.internal,
+                format!(
+                    "wire field={} condemned_seq={} t_us={} surface_wire={} table_wire={}",
+                    c.field, c.seq, c.t_us, w.last.surface as i32, w.last.table as i32
+                ),
+            ))
+        }) else {
+            continue;
+        };
+        let Some(freed) =
+            crate::runtime::surface_quarantine::withdraw(state, old, internal, &evidence)
+        else {
+            continue;
+        };
+        for (new, remaining) in freed {
+            if !remaining.is_empty() {
+                crate::observe::off(format!(
+                    "surface_quarantine_partner_withdrawn mid={new} old={old} \
+                     remaining={remaining:?} (still held by its other partners)"
+                ));
+                continue;
+            }
+            match fresh_validation(state, host, new) {
+                Ok(evidence) => crate::runtime::surface_quarantine::release_withdrawn_partner(
+                    state, new, old, &evidence,
+                ),
+                Err(reason) => crate::observe::fail(format!(
+                    "surface_quarantine_kept mid={new} old={old} reason={reason} (its only \
+                     partner withdrew its claims, but this mapping did not validate afresh)"
+                )),
+            }
+        }
+    }
+}
+
+/// The checks a mapping freed by a withdrawal must pass now, not earlier: its
+/// own backing re-read and adopted, no page shared with any other valid
+/// owner, and its own wire counts read positive through a checked layout.
+fn fresh_validation<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &H,
+    mapping_id: u32,
+) -> Result<String, &'static str> {
+    if !crate::runtime::mapper::resolve_mapping_backing(state, host, mapping_id) {
+        return Err("resolve_failed");
+    }
+    if let Some((gpa, owner)) = super::first_surface_page_collision(state, mapping_id) {
+        crate::runtime::surface_quarantine::quarantine_collision(
+            state,
+            mapping_id,
+            owner,
+            gpa,
+            "withdrawal_recheck",
+        );
+        return Err("collision");
+    }
+    verified_live(state, host, mapping_id).ok_or("no_wire_evidence")
+}
+
+/// `mapping_id`'s current incarnation, read now: layout checked, not
+/// condemned, no anomaly, both counts positive. The evidence, or `None`.
+fn verified_live<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &H,
+    mapping_id: u32,
+) -> Option<String> {
+    let internal = state
+        .mappings
+        .get(&mapping_id)
+        .map(|m| m.mapping_internal)
+        .filter(|&i| i != 0)?;
+    with_watch(state, host, |ww, rd, state| {
+        if ww.watched.get(&mapping_id).map(|w| w.internal) != Some(internal) {
+            ww.watched.insert(mapping_id, Watched::pending(internal));
+        }
+        // A pending entry is checked by its first sample and read by its second.
+        let fresh = sample_one(ww, rd, state, mapping_id, "withdrawal_check")
+            || sample_one(ww, rd, state, mapping_id, "withdrawal_check");
+        let w = ww.watched.get(&mapping_id)?;
+        let live = fresh
+            && w.phase == Phase::Active
+            && w.condemned.is_none()
+            && w.anomalous.is_empty()
+            && (w.last.surface as i32) > 0
+            && (w.last.table as i32) > 0;
+        live.then(|| {
+            format!(
+                "wire internal={internal:#x} surface_wire={} table_wire={} map={}",
+                w.last.surface as i32,
+                w.last.table as i32,
+                w.at_map.map_or_else(
+                    || "late".to_string(),
+                    |c| format!("{}/{}", c.surface as i32, c.table as i32)
+                )
+            )
+        })
+    })
+}
+
 // MARK: - Hooks: worker
 
 /// The worker's periodic pass: swap buffers, every mapping, held FIFO heads,
@@ -2107,6 +2235,9 @@ pub fn tick<H: HostMemory + HostOps>(state: &mut DeviceState, host: &H) {
                 sample_where(ww, rd, state, "tick", |w| w.display);
             }
         });
+    }
+    if guard_enabled() && !state.wire_watch.withdraw_pending.is_empty() {
+        settle_withdrawals(state, host);
     }
     if cost {
         state.wire_watch.cost_logged_us = Some(now);
