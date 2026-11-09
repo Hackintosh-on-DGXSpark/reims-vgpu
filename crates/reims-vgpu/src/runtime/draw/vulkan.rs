@@ -1246,6 +1246,17 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
     }
 
     if let Some(mid) = surface {
+        // A condemned incarnation is bound from its resident or not at all:
+        // every rung below reads its pages, seeds from them or merges into them.
+        if mapper::wire_watch::guest_pages_condemned(state, mid) {
+            return condemned_sampled_source(
+                state,
+                mid,
+                resolved_resource.as_ref(),
+                type5_view,
+                may_bind_resident,
+            );
+        }
         // Ensure type-4 pages exist for this surface id.
         let _ = objects::ensure_surface_for_texture_bind(state, host, mid);
         // A type-5 serialized record is the exact Metal texture view over the
@@ -2376,6 +2387,12 @@ fn resolve_type11_load_seed<M: HostMemory + HostOps>(
     target_format: ash::vk::Format,
 ) -> Option<Type11LoadSeed> {
     use crate::backend::vulkan::engine::SeedOrder;
+    // A condemned incarnation is seeded from nothing. Its pages are another
+    // owner's, and the cache is a copy of them; a `LOAD` that could take its
+    // resident took it before coming here.
+    if mapper::wire_watch::refuse_guest_read(state, mapping_id, "load_seed") {
+        return None;
+    }
     // The cache is the other host-side copy of these pages, and it sits above
     // the only rung that reads the pages themselves — so a stale hit here is
     // never corrected by anything below it. It takes the same witness the
@@ -3443,6 +3460,11 @@ fn mapping_window_guest_runs<M: HostMemory + HostOps>(
     base_off: u64,
     span: u64,
 ) -> Option<(Vec<u64>, Vec<crate::backend::vulkan::engine::GuestRun>)> {
+    // The GPU would read these runs; a condemned incarnation's pages are
+    // someone else's. See `mapper::wire_watch::refuse_guest_read`.
+    if mapper::wire_watch::refuse_guest_read(state, mid, "guest_runs") {
+        return None;
+    }
     if !guest_run_alias_available(host) {
         return None;
     }
@@ -7951,18 +7973,32 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         })
                         .map(|resource| resource.resident_target_backing(&identity))
                 });
-                let (resident_current, guest_wrote) =
+                let mapping_id = req.colors.first().map(|c| c.mapping_id).unwrap_or(0);
+                // A condemned incarnation's resident is the surface, whatever
+                // the epoch says, and the guest-write witness sees another
+                // owner's writes. Without a resident it can take, the seed below
+                // refuses the pages too.
+                let condemned = mapper::wire_watch::guest_pages_condemned(state, mapping_id);
+                let (resident_current, guest_wrote) = if condemned {
+                    let backing = backing.unwrap_or_else(|| {
+                        crate::backend::vulkan::engine::resident_content_backing(&identity)
+                    });
+                    (condemned_sample_takes_resident(backing, true), false)
+                } else {
                     type11_load_resident_is_current(backing, || {
                         let resident_epoch =
                             crate::backend::vulkan::engine::resident_content_epoch(&identity);
-                        let mapping_id = req.colors.first().map(|c| c.mapping_id).unwrap_or(0);
                         let guest_wrote = type11_guest_wrote_since_store(state, host, mapping_id);
                         (
                             type11_resident_is_current(mapping_epoch, resident_epoch)
                                 && !guest_wrote,
                             guest_wrote,
                         )
-                    });
+                    })
+                };
+                if condemned && resident_current {
+                    crate::runtime::drain::note_store_route("type11_seed_elided_condemned");
+                }
                 if resident_current {
                     chain_load_from_target = true;
                     crate::runtime::drain::note_store_route("type11_seed_elided");
@@ -9572,6 +9608,72 @@ pub(super) fn type11_guest_wrote_since_store<M: HostOps>(
     }
 }
 
+/// A sampled bind of a surface whose incarnation the wire guard condemned.
+///
+/// From the condemnation on, its pages hold memory the guest gave to someone
+/// else, so every rung of [`resolve_sampled_source`] that touches them — the
+/// YCbCr and view loaders, the zero-copy imports, the page rungs, and the merge
+/// a guest write sends the resident rung to — would bind that someone's bytes.
+/// On 27.2 the merge is what ran (`sampled_resident_merge_fail mid=2 …
+/// stage=writeback`) and the screen filled with noise. The guest-write witness
+/// says nothing about this surface either: the writes it sees are the new
+/// owner's.
+///
+/// So the resident is bound as it is. Without one a bind can take directly, the
+/// bind is refused by name (`wire_guard_read_refused site=sampled`). The host
+/// cache is no rung here: it is a copy of the pages, and the last copy taken
+/// may already hold the other owner's bytes.
+fn condemned_sampled_source(
+    state: &mut DeviceState,
+    mid: u32,
+    resource: Option<&std::sync::Arc<crate::model::TaskResource>>,
+    view: Option<objects::Type5TextureView>,
+    may_bind_resident: bool,
+) -> Option<(u32, u32, u32, SampledSourceRequest)> {
+    let geom = state
+        .mappings
+        .get(&mid)
+        .filter(|m| m.has_geom && m.width > 0 && m.height > 0)
+        .map(|m| (m.width, m.height, m.format));
+    let taken = geom.and_then(|(w, h, format)| {
+        // A view that has to be materialized is not the resident's image.
+        let view_is_base =
+            view.is_none_or(|v| !type5_view_requires_materialization(true, w, h, format, v));
+        let resident_id = crate::runtime::present_identity::surface_identity(state, mid, w, h);
+        let backing = resource
+            .filter(|resource| resource_type_owns_surface_resident(resource.entry.object_type))
+            .map(|resource| resource.resident_target_backing(&resident_id))
+            .unwrap_or_else(|| {
+                crate::backend::vulkan::engine::resident_content_backing(&resident_id)
+            });
+        condemned_sample_takes_resident(backing, may_bind_resident && view_is_base).then(|| {
+            let format = resident_id.resident_format();
+            (w, h, mid, SampledSourceRequest::Target(resident_id, format))
+        })
+    });
+    match taken {
+        Some(source) => {
+            crate::runtime::drain::note_store_route("t11rung_resident_condemned");
+            Some(source)
+        }
+        None => {
+            let _ = mapper::wire_watch::refuse_guest_read(state, mid, "sampled");
+            None
+        }
+    }
+}
+
+/// Whether a condemned surface's bind or `LOAD` takes its resident: only a
+/// ready device allocation, which holds a copy of its own (a guest-allocation
+/// resident *is* the pages), and only for a use that can take a resident
+/// directly.
+fn condemned_sample_takes_resident(
+    backing: crate::backend::vulkan::engine::ResidentContentBacking,
+    direct: bool,
+) -> bool {
+    direct && backing == crate::backend::vulkan::engine::ResidentContentBacking::DeviceAllocation
+}
+
 /// Whether the hypervisor watched the guest write anywhere in the allocation a
 /// type-4 surface's host-side copies were taken from.
 ///
@@ -9696,6 +9798,12 @@ fn merge_guest_writes_into_pages<M: HostMemory + HostOps>(
     identity: &crate::backend::vulkan::engine::TargetIdentity,
     guest_owned: &[(u64, u64)],
 ) -> bool {
+    // The guest's half of a condemned incarnation is another owner's memory.
+    // [`resolve_sampled_source`] does not come here for one; this says so if a
+    // caller ever does.
+    if mapper::wire_watch::refuse_guest_read(state, mapping_id, "sampled_merge") {
+        return false;
+    }
     let readback = match crate::backend::vulkan::engine::read_target(identity) {
         Ok(rb) => rb,
         Err(e) => {
@@ -12184,6 +12292,107 @@ mod vulkan_split_tests {
         // page-table change.
         map_one_gva_page(&mut host, 5);
         assert_eq!(gen_of(&mut host), gen_a);
+    }
+
+    /// A condemned surface's `LOAD` is seeded from nothing, its pages are not
+    /// handed to the GPU, and no merge writes into them, while the host cache
+    /// holds a frame and the pages hold another owner's bytes. Uncondemned,
+    /// the same surface is seeded from the cache, so the refusal is the
+    /// condemnation's and not the fixture's.
+    #[test]
+    fn a_condemned_surface_is_never_seeded_imported_or_merged_from_its_pages() {
+        use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+        use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+        use crate::runtime::host::HostMemory;
+        use crate::runtime::mapper::wire_watch::{test_condemn, with_switches};
+
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        host.stable_map_pages = true;
+        // Unique among the tests: `first_sight` latches for the process.
+        let mid = 919u32;
+        let pfn = 0x2bu32;
+        let gpa = (pfn as u64) << PAGE_SHIFT_X86;
+        // The bytes the pages' next owner left in them.
+        host.map_range(gpa, 0x4000, 0xEE);
+        state.map_surface(mid);
+        {
+            let m = state.mappings.get_mut(&mid).expect("mapped above");
+            m.mapped = true;
+            m.mapping_internal = 0x77;
+            m.page_entries = vec![(pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+        }
+        let (w, h) = (4u32, 2u32);
+        assert!(state.set_mapping_geom(mid, w, h, MTL_FORMAT_BGRA8_UNORM));
+        crate::runtime::surface_cache::store(
+            &mut state,
+            mid,
+            w,
+            h,
+            [0xAA, 0xBB, 0xCC, 0xFF].repeat((w * h) as usize),
+        );
+        let format = gva_resident_format(MTL_FORMAT_BGRA8_UNORM);
+        assert!(
+            matches!(
+                resolve_type11_load_seed(&mut state, &mut host, mid, w, h, format),
+                Some(Type11LoadSeed::Host(..))
+            ),
+            "uncondemned, the cache seeds the LOAD"
+        );
+
+        with_switches(true, true, || {
+            test_condemn(&mut state, mid);
+            let cap = crate::observe::sink::FailCapture::start();
+            assert!(
+                resolve_type11_load_seed(&mut state, &mut host, mid, w, h, format).is_none(),
+                "neither the cache's copy nor the pages may seed a condemned surface"
+            );
+            assert!(mapping_window_guest_runs(&mut state, &mut host, mid, 0, 32).is_none());
+            let identity = crate::runtime::present_identity::surface_identity(&state, mid, w, h);
+            assert!(!merge_guest_writes_into_pages(
+                &mut state,
+                &mut host,
+                mid,
+                w,
+                h,
+                &identity,
+                &[(0, 0x1000)],
+            ));
+            assert!(
+                cap.lines()
+                    .iter()
+                    .all(|l| !l.contains("sampled_resident_merge_fail")),
+                "the merge never started: {:?}",
+                cap.lines()
+            );
+            for site in ["load_seed", "guest_runs", "sampled_merge"] {
+                let needle = format!("wire_guard_read_refused mapping={mid} site={site} n=1 ");
+                let lines: Vec<String> = cap
+                    .lines()
+                    .into_iter()
+                    .filter(|l| l.contains(&needle))
+                    .collect();
+                assert_eq!(lines.len(), 1, "{site}: {:?}", cap.lines());
+            }
+        });
+        let mut page = [0u8; 4];
+        host.read_gpa(gpa, &mut page)
+            .expect("the page is guest RAM");
+        assert_eq!(page, [0xEE; 4], "nothing was written into the pages either");
+    }
+
+    /// What a condemned surface takes as its image: a ready device-allocation
+    /// resident, for a use that can take a resident directly. A guest-allocation
+    /// resident is the pages themselves, and no resident is no image.
+    #[test]
+    fn a_condemned_surface_takes_only_a_device_resident_it_can_bind_directly() {
+        use crate::backend::vulkan::engine::ResidentContentBacking::{
+            DeviceAllocation, GuestAllocation, NotReady,
+        };
+        assert!(condemned_sample_takes_resident(DeviceAllocation, true));
+        assert!(!condemned_sample_takes_resident(DeviceAllocation, false));
+        assert!(!condemned_sample_takes_resident(GuestAllocation, true));
+        assert!(!condemned_sample_takes_resident(NotReady, true));
     }
 }
 

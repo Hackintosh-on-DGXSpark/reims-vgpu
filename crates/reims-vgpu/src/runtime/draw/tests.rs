@@ -4505,6 +4505,106 @@ fn type11_host_cache_rung_identity_tracks_the_cached_frame() {
     );
 }
 
+/// A sampled bind of a surface the wire guard condemned binds its resident or
+/// nothing. With no resident, the host cache's frame is refused with the pages:
+/// both stand for memory the guest gave away. Uncondemned, the same bind is
+/// served from the cache, so the refusal is the condemnation's.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn a_condemned_surface_is_sampled_from_its_resident_or_not_at_all() {
+    use crate::contract::endian::st32;
+    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+    use crate::runtime::decode::resource::{list_object_entry_offset, OBJECT_LIST_ENTRY_LEN};
+    use crate::runtime::gva_mem;
+    use crate::runtime::mapper::wire_watch::{test_condemn, with_switches};
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+    let dir_pfn = 2u32;
+    let root_pfn = 3u32;
+    let dir_gpa = (dir_pfn as u64) << PAGE_SHIFT_X86;
+    let root_gpa = (root_pfn as u64) << PAGE_SHIFT_X86;
+    host.map_range(dir_gpa, 0x20, 0);
+    host.map_range(root_gpa, 0x1000, 0);
+    let mut dir = [0u8; 8];
+    st32(&mut dir[DIRECTORY_ROOT_PFN as usize..], root_pfn);
+    st32(&mut dir[DIRECTORY_DEPTH as usize..], 1);
+    assert!(host.write_gpa(dir_gpa, &dir).is_ok());
+    for i in 0..3u32 {
+        let pfn = 4 + i;
+        host.map_range((pfn as u64) << PAGE_SHIFT_X86, 0x1000, 0);
+        let mut pte = [0u8; 4];
+        st32(&mut pte, pfn);
+        assert!(host.write_gpa(root_gpa + (i as u64) * 4, &pte).is_ok());
+    }
+    state.define_task(1, 0x1000, dir_pfn);
+    assert!(state.set_object_list(1, 0, 32));
+
+    let texture_ref = 2u32;
+    let surface_id = 74u32;
+    let desc_gva = 0x1000u64;
+    let built = reims_vgpu_wire::device_desc::Type5Builder::new(surface_id, 0, 0, 0)
+        .with_len(objects::TYPE5_MIN_LEN);
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        desc_gva,
+        built.bytes(),
+        PAGE_SHIFT_X86,
+    )
+    .is_ok());
+    let list_off = list_object_entry_offset(texture_ref, 32).unwrap();
+    let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
+    let packed = (objects::OBJECT_TYPE_REF_TEXTURE as u32) | ((objects::TYPE5_MIN_LEN as u32) << 8);
+    st32(&mut list_entry, packed);
+    list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        list_off,
+        &list_entry,
+        PAGE_SHIFT_X86,
+    )
+    .is_ok());
+
+    assert!(state.map_surface(surface_id));
+    assert!(state.set_mapping_geom(surface_id, 4, 3, MTL_FORMAT_BGRA8_UNORM));
+    {
+        let m = state.mappings.get_mut(&surface_id).unwrap();
+        m.page_entries = vec![1];
+        m.mapping_internal = 0x91;
+    }
+    crate::runtime::surface_cache::store(
+        &mut state,
+        surface_id,
+        4,
+        3,
+        [255u8, 0, 0, 255].repeat(4 * 3),
+    );
+
+    let served = resolve_sampled_source(&mut state, &mut host, 1, texture_ref, None, true);
+    assert!(
+        matches!(served, Some((_, _, _, SampledSourceRequest::Bytes(..)))),
+        "uncondemned, the host cache serves the bind"
+    );
+
+    with_switches(true, true, || {
+        test_condemn(&mut state, surface_id);
+        let cap = crate::observe::sink::FailCapture::start();
+        assert!(
+            resolve_sampled_source(&mut state, &mut host, 1, texture_ref, None, true).is_none(),
+            "no resident: nothing else may stand in for it"
+        );
+        let needle = format!("wire_guard_read_refused mapping={surface_id} site=sampled n=1 ");
+        let lines: Vec<String> = cap
+            .lines()
+            .into_iter()
+            .filter(|l| l.contains(&needle))
+            .collect();
+        assert_eq!(lines.len(), 1, "{:?}", cap.lines());
+    });
+}
+
 /// Live Safari app-launch class: the type-4 base carries an unknown
 /// 2-byte IOSurface FourCC (`LA08`) while the type-5 descriptor carries
 /// the exact RG8 Metal view. Defaulting the base to BGRA asks for a

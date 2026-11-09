@@ -370,7 +370,8 @@ fn contig_for_write<H: HostMemory + HostOps>(
         ));
         return None;
     }
-    let view = contig_for_span(state, host, mapping_id, span_end)?;
+    // Before the view: a condemned incarnation is refused as a write here, and
+    // the view would refuse it again as a read.
     if !mapper::wire_watch::before_write(
         state,
         &*host,
@@ -380,6 +381,7 @@ fn contig_for_write<H: HostMemory + HostOps>(
     ) {
         return None;
     }
+    let view = contig_for_span(state, host, mapping_id, span_end)?;
     // Every raw-pointer write in this file goes through here, and none of them
     // goes through `mapper::write_mapping_bytes` — they poke rows straight into
     // the view. So this is where those writes enter `observe::footprint`, and
@@ -960,7 +962,11 @@ pub fn write_bgra8_from_resident_gpu<M: HostMemory + HostOps>(
             format,
         });
     };
-    let shared_backing = if host.map_pages_stable() {
+    // A condemned incarnation is refused below as a write; it takes no view of
+    // its pages on the way there.
+    let shared_backing = if host.map_pages_stable()
+        && !mapper::wire_watch::guest_pages_condemned(state, mapping_id)
+    {
         mapper::ensure_contig_view(state, host, mapping_id).map(|(ptr, len)| {
             crate::backend::vulkan::engine::GuestTargetBacking {
                 allocation_host_ptr: ptr,
@@ -2043,6 +2049,11 @@ pub fn read_raw_rows<M: HostMemory + HostOps>(
     width: u32,
     height: u32,
 ) -> bool {
+    // A condemned incarnation's pages hold another owner's bytes; see
+    // `mapper::wire_watch::refuse_guest_read`.
+    if mapper::wire_watch::refuse_guest_read(state, mapping_id, "read_raw_rows") {
+        return false;
+    }
     if !scanout_extent_ok(width, height) || row_bytes == 0 || dst_stride < row_bytes {
         return false;
     }
@@ -2199,6 +2210,11 @@ pub fn read_rect_raw_at<M: HostMemory + HostOps>(
     dst: &mut [u8],
     dst_stride: u32,
 ) -> bool {
+    // A condemned incarnation's pages hold another owner's bytes; see
+    // `mapper::wire_watch::refuse_guest_read`.
+    if mapper::wire_watch::refuse_guest_read(state, mapping_id, "read_rect") {
+        return false;
+    }
     let SurfaceWindow {
         base_off,
         bpr: surface_bpr,

@@ -1294,3 +1294,113 @@ fn without_wire_evidence_both_sides_stay_quarantined() {
         });
     }
 }
+
+// MARK: - Reads of a condemned incarnation
+
+/// After the drop, the bytes another owner left in mapping 2's pages reach no
+/// reader: each read path refuses by site and leaves its buffer as it was.
+/// Before the drop the same read reaches the pages, which is what makes the
+/// refusals mean something, and a new incarnation under the id is read again.
+#[test]
+fn a_condemned_incarnations_pages_are_never_read() {
+    use crate::runtime::mapper::{ensure_contig_view, mapping_page_gpas, read_mapping_bytes};
+    use crate::runtime::mapping_write::{read_raw_rows, read_rect_raw_at, Rect, SurfaceWindow};
+    use crate::runtime::scanout::read_mapping_bgra8;
+
+    with_switches(true, true, || {
+        let (mut state, mut host) = fixture(EXPECTED_KERNEL_VERSION);
+        on_map(&mut state, &host, MID);
+        // What the next owner of the pages wrote into them.
+        for &gpa in &G {
+            host.write_gpa(gpa, &[0xEE; 64]).unwrap();
+        }
+        let mut before = [0x11u8; 16];
+        assert!(read_mapping_bytes(
+            &mut state,
+            &mut host,
+            MID,
+            0,
+            &mut before
+        ));
+        assert_eq!(
+            before, [0xEE; 16],
+            "before the drop the read reaches the pages"
+        );
+        assert!(!guest_pages_condemned(&state, MID));
+
+        let cap = crate::observe::FailCapture::start();
+        set_surface_wire(&mut host, 0);
+        tick(&mut state, &host);
+        assert!(guest_pages_condemned(&state, MID));
+        assert!(is_withdrawn(&state, MID));
+
+        let mut buf = [0x11u8; 16];
+        assert!(!read_mapping_bytes(&mut state, &mut host, MID, 0, &mut buf));
+        assert!(mapping_page_gpas(&mut state, &mut host, MID).is_none());
+        assert!(ensure_contig_view(&mut state, &mut host, MID).is_none());
+        let window = SurfaceWindow {
+            base_off: 0,
+            bpr: 8,
+            span_end: 16,
+            bpp: 4,
+        };
+        let rect = Rect {
+            origin_x: 0,
+            origin_y: 0,
+            width: 2,
+            height: 2,
+        };
+        assert!(!read_rect_raw_at(
+            &mut state, &mut host, MID, window, rect, &mut buf, 8
+        ));
+        assert!(!read_raw_rows(
+            &mut state, &mut host, MID, &mut buf, 8, 8, 2, 2
+        ));
+        assert!(!read_mapping_bgra8(
+            &mut state, &mut host, MID, &mut buf, 8, 2, 2
+        ));
+        assert_eq!(buf, [0x11; 16], "not one byte of the other owner's");
+        for site in [
+            "mapping_read",
+            "page_list",
+            "contig_view",
+            "read_rect",
+            "read_raw_rows",
+            "paint_mapping",
+        ] {
+            let lines = lines_with(
+                &cap,
+                &format!("wire_guard_read_refused mapping=2 site={site} "),
+            );
+            assert_eq!(lines.len(), 1, "{site}: {:?}", cap.lines());
+            assert!(lines[0].contains(" n=1 "), "{}", lines[0]);
+        }
+        assert_eq!(state.wire_watch.cost.reads_refused, 6);
+        // A refusal repeats silently until its site's next power of two.
+        assert!(!read_mapping_bytes(&mut state, &mut host, MID, 0, &mut buf));
+        assert!(!read_mapping_bytes(&mut state, &mut host, MID, 0, &mut buf));
+        assert!(!read_mapping_bytes(&mut state, &mut host, MID, 0, &mut buf));
+        assert_eq!(
+            lines_with(&cap, "wire_guard_read_refused mapping=2 site=mapping_read ").len(),
+            3,
+            "n=1, 2 and 4"
+        );
+
+        // UNMAP ends the incarnation; a new MappingInternal is read as any other.
+        on_unmap(&mut state, &host, MID);
+        assert!(state.unmap_surface(MID));
+        let again = Surface {
+            mi: MI + 0x1000,
+            ..old_surface()
+        };
+        put_surface(&mut host, &again, 1);
+        for &gpa in &G {
+            host.write_gpa(gpa, &[0x5A; 64]).unwrap();
+        }
+        adopt(&mut state, &again);
+        on_map(&mut state, &host, MID);
+        assert!(!guest_pages_condemned(&state, MID));
+        assert!(read_mapping_bytes(&mut state, &mut host, MID, 0, &mut buf));
+        assert_eq!(buf, [0x5A; 16]);
+    });
+}

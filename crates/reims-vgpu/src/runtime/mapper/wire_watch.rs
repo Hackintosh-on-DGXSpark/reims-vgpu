@@ -85,8 +85,16 @@
 //! A positive count is not a permission: it is read, then the write happens,
 //! and the guest can complete the descriptor in between, so the guard only
 //! stops writes after a drop it has seen. A render target the GPU writes in
-//! guest memory (`REIMS_VGPU_SHARED_TARGET`) is not seen at all. A reader of the
-//! mapping reads whatever the guest pages hold.
+//! guest memory (`REIMS_VGPU_SHARED_TARGET`) is not seen at all.
+//!
+//! A condemned incarnation's pages are read no more either
+//! ([`refuse_guest_read`]). The guest gives them to someone else, and on 27.2 it
+//! did within seconds: a sampled bind of the condemned display surface merged
+//! its resident into them (`sampled_resident_merge_fail mid=2 … stage=writeback`)
+//! and the screen filled with another owner's bytes. From the condemnation on,
+//! the resident this device rendered is the only copy of the surface: a bind or
+//! a `LOAD` takes it as it is, and every path that would read, seed from or
+//! merge into the pages is refused instead (`wire_guard_read_refused`, by site).
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -531,6 +539,9 @@ struct Watched {
     condemned: Option<Condemned>,
     /// A count went positive again after the condemnation; said once.
     recovered_said: bool,
+    /// Reads of the condemned pages refused, by site.
+    reads_refused: BTreeMap<String, u64>,
+    read_lines: u32,
 }
 
 /// A mapping incarnation the guest unwired while it was still mapped.
@@ -592,6 +603,8 @@ impl Watched {
             sampled_us: None,
             condemned: None,
             recovered_said: false,
+            reads_refused: BTreeMap::new(),
+            read_lines: 0,
         }
     }
 }
@@ -610,6 +623,7 @@ struct Cost {
     condemned: u64,
     debts_dropped: u64,
     swaps_refused: u64,
+    reads_refused: u64,
 }
 
 /// The watch's state for one boot. Lives in [`DeviceState`] and is replaced
@@ -692,7 +706,7 @@ impl WireWatch {
         format!(
             "wire_watch_cost boot={boot} watched={} samples={} reads={} unreadable={} us={} \
              transitions={} anomalies={} guard_refused={} condemned={} debts_dropped={} \
-             swaps_refused={} peeks={} unstamped_dropped={} kernel={}",
+             swaps_refused={} reads_refused={} peeks={} unstamped_dropped={} kernel={}",
             self.watched.len(),
             c.samples,
             c.reads,
@@ -704,6 +718,7 @@ impl WireWatch {
             c.condemned,
             c.debts_dropped,
             c.swaps_refused,
+            c.reads_refused,
             c.peeks,
             c.unstamped_dropped,
             match self.kernel {
@@ -1640,13 +1655,14 @@ pub fn on_unmap<H: HostMemory + HostOps>(state: &mut DeviceState, host: &H, mapp
         if let Some(w) = ww.watched.remove(&mapping_id) {
             crate::observe::off(format!(
                 "wire_watch unmap mapping={mapping_id} surface_wire={} table_wire={} pages={} \
-                 writes={} writes_after_anomaly={} anomalous={:?} seq={}",
+                 writes={} writes_after_anomaly={} anomalous={:?} reads_refused={:?} seq={}",
                 w.last.surface as i32,
                 w.last.table as i32,
                 w.pages,
                 w.writes,
                 w.writes_after_anomaly,
                 w.anomalous,
+                w.reads_refused,
                 event.seq
             ));
         }
@@ -1737,6 +1753,95 @@ pub fn before_write<H: HostMemory + HostOps>(
         }
         !refuse
     })
+}
+
+// MARK: - Hooks: reads
+
+/// Whether `mapping_id`'s current incarnation is one the guard condemned, or
+/// one that withdrew its page claims after being condemned.
+///
+/// Its pages are then the guest's to hand to someone else, so they hold no
+/// part of this surface: the resident this device rendered is its only copy.
+/// Asked by every path that would read them, seed from them or merge into them;
+/// [`refuse_guest_read`] is the same question with the refusal said.
+pub fn guest_pages_condemned(state: &DeviceState, mapping_id: u32) -> bool {
+    let Some(m) = state.mappings.get(&mapping_id) else {
+        return false;
+    };
+    if crate::runtime::surface_quarantine::entry_withdrawn(m) {
+        return true;
+    }
+    // The incarnation, not the id: a new MappingInternal under the same id is
+    // another surface, read like any other.
+    guard_enabled()
+        && m.mapping_internal != 0
+        && state
+            .wire_watch
+            .watched
+            .get(&mapping_id)
+            .is_some_and(|w| w.condemned.is_some() && w.internal == m.mapping_internal)
+}
+
+/// Right before a read of `mapping_id`'s guest pages at `site`. `true` when the
+/// read must not happen, having said so: the incarnation is condemned (see
+/// [`guest_pages_condemned`]), and the caller uses the resident as it is or
+/// reads nothing.
+///
+/// Every refusal is counted, per mapping and site; a line is written at the
+/// first refusal of each site and at each power of two after it, at most
+/// [`LINES_PER_MAPPING`] per mapping.
+pub fn refuse_guest_read(state: &mut DeviceState, mapping_id: u32, site: &str) -> bool {
+    if !guest_pages_condemned(state, mapping_id) {
+        return false;
+    }
+    crate::runtime::drain::note_store_route("wire_guard_read_refused");
+    let ww = &mut state.wire_watch;
+    ww.cost.reads_refused += 1;
+    let Some(w) = ww.watched.get_mut(&mapping_id) else {
+        // Withdrawn with no watch entry left to count on; refused all the same.
+        return true;
+    };
+    let at_site = {
+        let n = w.reads_refused.entry(site.to_string()).or_insert(0);
+        *n += 1;
+        *n
+    };
+    let total: u64 = w.reads_refused.values().sum();
+    if at_site.is_power_of_two() && w.read_lines < LINES_PER_MAPPING {
+        w.read_lines += 1;
+        crate::observe::fail(format!(
+            "wire_guard_read_refused mapping={mapping_id} site={site} n={at_site} total={total} \
+             condemned_seq={} t_us={} (the guest unwired this incarnation while it was mapped and \
+             its pages are someone else's now; nothing is read from them, and its resident is the \
+             only copy of the surface)",
+            w.condemned.as_ref().map_or(0, |c| c.seq),
+            now_us()
+        ));
+    }
+    true
+}
+
+/// Condemn `mapping_id`'s current incarnation without the kernel and the counts
+/// a real condemnation reads, for a test of a reader that must refuse it.
+#[cfg(test)]
+pub(crate) fn test_condemn(state: &mut DeviceState, mapping_id: u32) {
+    let internal = state
+        .mappings
+        .get(&mapping_id)
+        .map(|m| m.mapping_internal)
+        .expect("a mapping to condemn");
+    assert_ne!(
+        internal, 0,
+        "an incarnation is named by its MappingInternal"
+    );
+    let mut w = Watched::pending(internal);
+    w.condemned = Some(Condemned {
+        seq: 1,
+        t_us: now_us(),
+        field: "surface",
+        horizon: Vec::new(),
+    });
+    state.wire_watch.watched.insert(mapping_id, w);
 }
 
 // MARK: - Hooks: display

@@ -2023,6 +2023,12 @@ pub fn mapping_page_gpas<H: HostMemory + HostOps>(
     host: &mut H,
     mapping_id: u32,
 ) -> Option<Vec<u64>> {
+    // A condemned incarnation's pages belong to someone else now: no list of
+    // them goes to a reader, nor to anything else. See
+    // [`wire_watch::refuse_guest_read`].
+    if wire_watch::refuse_guest_read(state, mapping_id, "page_list") {
+        return None;
+    }
     if !{ revalidate_mapping_pages(state, host, mapping_id) } {
         return None;
     }
@@ -2180,6 +2186,10 @@ pub fn ensure_contig_view_with_pages<H: HostMemory + HostOps>(
     host: &mut H,
     mapping_id: u32,
 ) -> Option<(usize, usize, std::sync::Arc<[u64]>)> {
+    // Nor a view of them, cached or new; see [`mapping_page_gpas`].
+    if wire_watch::refuse_guest_read(state, mapping_id, "contig_view") {
+        return None;
+    }
     // Always revalidate before returning a cached contig (ReplacePhysical /
     // recycle must not leave a live view over freelist PFNs).
     if !revalidate_mapping_pages(state, host, mapping_id) {
@@ -2253,6 +2263,10 @@ pub fn ensure_contig_import_with_footprint<H: HostMemory + HostOps>(
     std::sync::Arc<crate::runtime::guest_ram::GuestRamImport>,
     crate::runtime::guest_ram::GuestPageFootprint,
 )> {
+    // The GPU would read the pages through it; see [`mapping_page_gpas`].
+    if wire_watch::refuse_guest_read(state, mapping_id, "contig_import") {
+        return None;
+    }
     if !host.map_pages_stable() {
         return None;
     }
@@ -2502,6 +2516,9 @@ fn copy_mapping_runs<H: HostMemory + HostOps>(
         // Puts bytes into guest pages the hypervisor's dirty bitmap cannot
         // witness. The read direction shares this walk and writes nothing.
         state.note_host_wrote_mapping(mapping_id);
+    } else if wire_watch::refuse_guest_read(state, mapping_id, site) {
+        // A condemned incarnation's pages hold another owner's bytes.
+        return false;
     }
     let page_size = state.page_size();
     let len = copy.len();

@@ -964,6 +964,12 @@ fn paint_mapping<M: HostMemory + crate::runtime::host::HostOps>(
         false
     };
 
+    // A condemned incarnation's pages hold another owner's bytes: painting them
+    // shows that owner's memory. Its resident is shown, or nothing.
+    if crate::runtime::mapper::wire_watch::refuse_guest_read(state, mapping_id, "paint_mapping") {
+        return false;
+    }
+
     // Deferred-writeback flush-on-access: scanout reads guest pages through a
     // raw contig view below, which bypasses the hooked readers — land any
     // resident-authoritative window (compute or render Store) first.
