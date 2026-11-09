@@ -664,6 +664,31 @@ fn is_display_present(opcode: u16) -> bool {
     )
 }
 
+/// The published tail of each child FIFO in `mask`, read from its registers.
+///
+/// Free-running like the heads `drain_child_fifo` advances, so a packet at
+/// `head` was published before a tail read here iff `tail - head` is positive.
+/// For [`crate::runtime::mapper::wire_watch`], which needs to tell the display
+/// presents submitted before an unwire from those submitted after.
+pub(crate) fn child_tails<M: HostMemory>(
+    state: &DeviceState,
+    mem: &M,
+    mask: u32,
+) -> Vec<(u32, u32)> {
+    if state.gfx.root_page == 0 {
+        return Vec::new();
+    }
+    let root = state.pfn_gpa(state.gfx.root_page);
+    (1..MAX_CHANNELS as u32)
+        .filter(|ch| mask & (1 << ch) != 0)
+        .filter_map(|ch| {
+            let regs = root + child_reg_block_offset(ch)?;
+            let tail = crate::runtime::host::read_u32(mem, regs + CHILD_REG_TAIL).ok()?;
+            Some((ch, tail))
+        })
+        .collect()
+}
+
 /// The packet at a child FIFO's head, read and left where it is.
 pub(crate) struct HeadPeek {
     pub head: u32,
@@ -700,8 +725,15 @@ pub(crate) fn peek_child_head<M: HostMemory>(
         return None;
     }
     let read = |len: u32| {
-        read_child_ring_bytes_inner(mem, &ring.page_gpas, ring.length, head, len, state.page_shift)
-            .ok()
+        read_child_ring_bytes_inner(
+            mem,
+            &ring.page_gpas,
+            ring.length,
+            head,
+            len,
+            state.page_shift,
+        )
+        .ok()
     };
     let header = read(PACKET_HEADER_LEN)?;
     let opcode = ld16(&header[PACKET_OPCODE..]);
@@ -5119,10 +5151,30 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
                 } else {
                     0
                 };
+                // A present the wire guard condemned is completed without running: the
+                // guest cancelled it when it gave its surface up. See
+                // `wire_watch::condemned_swap`.
+                let dropped = watched_present
+                    && crate::runtime::mapper::wire_watch::condemned_swap(
+                        state,
+                        channel_id,
+                        head,
+                        present_surface_id(packet.opcode, &packet.payload),
+                    );
                 let proc_started = std::time::Instant::now();
-                let disposition = process_child_packet(state, host, channel_id, &packet);
+                let disposition = if dropped {
+                    ChildPacketDisposition::Complete
+                } else {
+                    process_child_packet(state, host, channel_id, &packet)
+                };
                 census::note_drain_proc(packet.opcode, proc_started.elapsed().as_nanos() as u64);
                 if watched_present {
+                    use crate::runtime::mapper::wire_watch::SwapHow;
+                    let how = match (dropped, disposition) {
+                        (true, _) => SwapHow::Dropped,
+                        (false, ChildPacketDisposition::Deferred) => SwapHow::Deferred,
+                        (false, _) => SwapHow::Exec,
+                    };
                     let waits: Vec<(u32, u32)> = packet
                         .stamp_waits
                         .iter()
@@ -5142,7 +5194,7 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
                             mapping: present_surface_id(packet.opcode, &packet.payload),
                         },
                         present_started_us,
-                        disposition == ChildPacketDisposition::Deferred,
+                        how,
                     );
                 }
                 if disposition == ChildPacketDisposition::Deferred {

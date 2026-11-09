@@ -205,9 +205,11 @@ pub const KVA_WALK: &str = "REIMS_VGPU_KVA_WALK";
 /// sees. See [`crate::runtime::mapper::wire_watch`].
 pub const WIRE_WATCH: &str = "REIMS_VGPU_WIRE_WATCH";
 
-/// `on`, with [`WIRE_WATCH`] on, refuses a host CPU write into a mapping whose
-/// checked surface wire count reads zero or less right before the write. It only
-/// narrows: a refused write is one this device would have made.
+/// `on`, with [`WIRE_WATCH`] on, condemns a mapping incarnation at the first wire
+/// count anomaly the watch sees: its host writes are refused, its owed frame is
+/// dropped, and display presents naming it that were submitted before are
+/// completed without being shown. It only narrows: everything it stops is
+/// something this device would otherwise have done.
 pub const WIRE_GUARD: &str = "REIMS_VGPU_WIRE_GUARD";
 
 /// `off` stops narrowing a guest buffer bind to the extent the shader's

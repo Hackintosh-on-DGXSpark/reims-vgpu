@@ -302,13 +302,6 @@ impl PendingWritebacks {
         self.debts.insert(mapping_id, debt);
     }
 
-    /// Put back a debt that was taken and not paid, unless a newer one was
-    /// armed for the mapping meanwhile.
-    pub fn keep(&mut self, mapping_id: u32, debt: WritebackDebt) {
-        self.debts.entry(mapping_id).or_insert(debt);
-        crate::runtime::drain::note_store_route("wbdebt_kept");
-    }
-
     /// Every mapping owed a frame, oldest arm first.
     pub fn mappings_by_age(&self) -> Vec<u32> {
         let mut all: Vec<(u64, u32)> = self.debts.iter().map(|(id, d)| (d.seq, *id)).collect();
@@ -1465,9 +1458,7 @@ fn pay<M: HostMemory + HostOps>(
         return;
     }
     // The resident the draw registered, not the one a fresh derivation would
-    // name today. See `WritebackDebt::identity`. Cloned, because a debt that
-    // cannot be paid goes back into the ledger whole: a quarantined store, or
-    // one the wire guard will not let land.
+    // name today. See `WritebackDebt::identity`.
     let identity = debt.identity.clone();
     if crate::runtime::resource_validity::licence_of(validity)
         == crate::runtime::resource_validity::WritebackLicence::Superseded
@@ -1477,7 +1468,8 @@ fn pay<M: HostMemory + HostOps>(
         return;
     }
     // Asked before the readback the Store would start with. A refusal is the
-    // wire guard's diagnostic, and the frame stays owed rather than lost.
+    // wire guard's diagnostic: the guest let this incarnation go, so its frame
+    // is dropped, and the resident is kept for the display.
     if !crate::runtime::mapper::wire_watch::before_write(
         state,
         &*host,
@@ -1485,7 +1477,7 @@ fn pay<M: HostMemory + HostOps>(
         "wbdebt_pay",
         crate::runtime::mapper::wire_watch::WriteKind::Cpu,
     ) {
-        state.pending_writebacks.keep(mapping_id, debt);
+        crate::runtime::drain::note_store_route("wbdebt_dropped_condemned");
         return;
     }
     crate::runtime::drain::note_store_route(route);

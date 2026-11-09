@@ -1113,13 +1113,16 @@ pub fn write_bgra8_from_resident_gpu<M: HostMemory + HostOps>(
     // than from zero, because unlike the contig view this rail knows its own
     // rows and has no pointer whose coverage it is restating.
     mapper::note_mapping_write_footprint(state, mapping_id, base_off, span_end - base_off);
-    mapper::wire_watch::before_write(
+    // The wire guard's pages are not ours either: the guest let them go.
+    if !mapper::wire_watch::before_write(
         state,
         &*host,
         mapping_id,
         "gpu_writeback",
         mapper::wire_watch::WriteKind::Gpu,
-    );
+    ) {
+        return Err(GpuWritebackDecline::PagesNotOurs);
+    }
     state.note_host_wrote_mapping(mapping_id);
     note_readback_phase(
         ReadbackPhase::Resolve,

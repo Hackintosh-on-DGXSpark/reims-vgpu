@@ -61,14 +61,23 @@
 //!
 //! # The guard, and what it is not
 //!
-//! With `REIMS_VGPU_WIRE_GUARD` on as well, a host CPU write into a mapping
-//! whose validated surface count reads zero or less right before the write is
-//! refused (`wire_guard_refused`), and an owed frame stays owed. A positive count
-//! is not a permission: it is read, then the write happens, and the guest can
-//! complete the descriptor in between. GPU-direct writes into guest pages are
-//! sampled but not refused, and a render target the GPU writes in guest memory
-//! (`REIMS_VGPU_SHARED_TARGET`) is not seen at all. A reader of the mapping
-//! that settles an owed frame the guard kept reads the older guest bytes.
+//! With `REIMS_VGPU_WIRE_GUARD` on as well, the first anomaly condemns the
+//! mapping's incarnation (`wire_guard_condemned`): the guest completed a
+//! descriptor it still had mapped, which on 27.2 is IOMFB cancelling a swap that
+//! waited on this device past its five-second limit. From then on, for as long
+//! as the `MappingInternal` is the same, every host write into it, CPU or GPU,
+//! is refused (`wire_guard_refused`), its owed frame is dropped rather than
+//! landed, and a display present naming it that was submitted before the drop
+//! was seen is completed without being shown (`wire_guard_swap_dropped`). None
+//! of that is undone if a count turns positive again
+//! (`wire_guard_still_condemned`). The resident stays, so a later present of the
+//! surface shows it without writing guest memory.
+//!
+//! A positive count is not a permission: it is read, then the write happens,
+//! and the guest can complete the descriptor in between, so the guard only
+//! stops writes after a drop it has seen. A render target the GPU writes in
+//! guest memory (`REIMS_VGPU_SHARED_TARGET`) is not seen at all. A reader of the
+//! mapping reads whatever the guest pages hold.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -226,7 +235,7 @@ enum Ev {
         stamp: u32,
         slot: u32,
         mapping: u32,
-        deferred: bool,
+        how: SwapHow,
         present: &'static str,
     },
     SwapHeld {
@@ -290,13 +299,13 @@ impl std::fmt::Display for Event {
                 stamp,
                 slot,
                 mapping,
-                deferred,
+                how,
                 present,
             } => write!(
                 f,
                 "ev=swap ch={channel} head={head:#x} op={opcode:#x} stamp={stamp:#x} slot={slot} \
                  mapping={mapping} how={} present={present}",
-                if *deferred { "deferred" } else { "exec" }
+                how.name()
             ),
             Ev::SwapHeld {
                 cause,
@@ -508,6 +517,22 @@ struct Watched {
     last_write: Option<WriteNote>,
     /// When the counts were last read.
     sampled_us: Option<u64>,
+    /// Set by the guard at the first anomaly: this incarnation is the guest's no
+    /// longer, whatever its counts read afterwards.
+    condemned: Option<Condemned>,
+    /// A count went positive again after the condemnation; said once.
+    recovered_said: bool,
+}
+
+/// A mapping incarnation the guest unwired while it was still mapped.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Condemned {
+    seq: u64,
+    t_us: u64,
+    field: &'static str,
+    /// Each child FIFO's published tail when the unwire was seen: a display
+    /// present before it was submitted before the guest cancelled.
+    horizon: Vec<(u32, u32)>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -521,6 +546,9 @@ struct Cost {
     guard_refused: u64,
     unstamped_dropped: u64,
     peeks: u64,
+    condemned: u64,
+    debts_dropped: u64,
+    swaps_dropped: u64,
 }
 
 /// The watch's state for one boot. Lives in [`DeviceState`] and is replaced
@@ -548,6 +576,9 @@ pub struct WireWatch {
     all_sampled_us: Option<u64>,
     peeked_us: Option<u64>,
     cost_logged_us: Option<u64>,
+    /// Mappings the guard condemned whose debts and horizon are still to be
+    /// taken, which needs the whole device state.
+    condemn_pending: Vec<u32>,
     cost: Cost,
 }
 
@@ -590,7 +621,8 @@ impl WireWatch {
         let c = self.cost;
         format!(
             "wire_watch_cost boot={boot} watched={} samples={} reads={} unreadable={} us={} \
-             transitions={} anomalies={} guard_refused={} peeks={} unstamped_dropped={} kernel={}",
+             transitions={} anomalies={} guard_refused={} condemned={} debts_dropped={} \
+             swaps_dropped={} peeks={} unstamped_dropped={} kernel={}",
             self.watched.len(),
             c.samples,
             c.reads,
@@ -599,6 +631,9 @@ impl WireWatch {
             c.transitions,
             c.anomalies,
             c.guard_refused,
+            c.condemned,
+            c.debts_dropped,
+            c.swaps_dropped,
             c.peeks,
             c.unstamped_dropped,
             match self.kernel {
@@ -1242,6 +1277,23 @@ fn sample_one<H: HostMemory + HostOps>(
         if field != Field::MiState && ((new as i32) <= 0 || below_map) {
             first_anomaly(ww, rd, mapping_id, field, new, at);
         }
+        // A condemned incarnation stays condemned: the guest completed a
+        // descriptor it still had mapped, and a later prepare does not say the
+        // frames this device holds for it are the guest's again.
+        let w = ww.watched.get_mut(&mapping_id).expect("checked above");
+        if field != Field::MiState
+            && (new as i32) > 0
+            && w.condemned.is_some()
+            && !std::mem::replace(&mut w.recovered_said, true)
+        {
+            crate::observe::fail(format!(
+                "wire_guard_still_condemned mapping={mapping_id} field={} value={} t_us={} \
+                 (the count is positive again; the incarnation stays condemned)",
+                field.name(),
+                new as i32,
+                now_us()
+            ));
+        }
     }
     if let Some(w) = ww.watched.get_mut(&mapping_id) {
         w.last = now;
@@ -1291,6 +1343,20 @@ fn first_anomaly<H: HostMemory + HostOps>(
         None => "unreadable".to_string(),
     };
     let md_len = mixed_data_len(rd, iomd);
+    let condemned = guard_enabled() && {
+        let w = ww.watched.get_mut(&mapping_id).expect("looked up above");
+        let fresh = w.condemned.is_none();
+        if fresh {
+            w.condemned = Some(Condemned {
+                seq: ww.seq,
+                t_us: now_us(),
+                field: field.name(),
+                horizon: Vec::new(),
+            });
+            ww.condemn_pending.push(mapping_id);
+        }
+        fresh
+    };
     let map = at_map.map_or_else(
         || "?".to_string(),
         |c| match field {
@@ -1302,12 +1368,13 @@ fn first_anomaly<H: HostMemory + HostOps>(
         "wire_watch first_anomaly mapping={mapping_id} field={} value={} map={map} iomd={iomd:#x} \
          internal={internal:#x} boot_first={} iomd_fields={fields} md_len={md_len} \
          device_wrote_iomd_frame={} device_writes_to_mapping={writes} own_last_write={own_write} \
-         t_us={} at={at} {} ring={}",
+         t_us={} at={at} guard={} {} ring={}",
         field.name(),
         value as i32,
         boot_first as u8,
         rd.device_wrote(iomd),
         now_us(),
+        if condemned { "condemned" } else { "off" },
         ww.context(),
         ww.ring.len()
     ));
@@ -1366,7 +1433,56 @@ fn with_watch<H: HostMemory + HostOps, R>(
     let out = f(&mut ww, &rd, state);
     rd.fold(&mut ww.cost, started);
     state.wire_watch = ww;
+    if !state.wire_watch.condemn_pending.is_empty() {
+        apply_condemnations(state, host);
+    }
     out
+}
+
+/// What a condemnation does that needs the whole device: the horizon of every
+/// child FIFO, so the display presents already submitted can be told from
+/// later ones, and the frame owed to the mapping, which is dropped rather than
+/// landed in pages the guest has let go of. The resident stays: a later present
+/// of the surface shows it without writing guest memory.
+fn apply_condemnations<H: HostMemory + HostOps>(state: &mut DeviceState, host: &H) {
+    for mapping_id in std::mem::take(&mut state.wire_watch.condemn_pending) {
+        let horizon = crate::runtime::drain::child_tails(
+            state,
+            host,
+            state.active_child_mask | state.pending.child_mask,
+        );
+        let debt = state.pending_writebacks.take(mapping_id).is_some();
+        let ww = &mut state.wire_watch;
+        ww.cost.condemned += 1;
+        if debt {
+            ww.cost.debts_dropped += 1;
+            crate::runtime::drain::note_store_route("wbdebt_dropped_condemned");
+        }
+        let Some(c) = ww
+            .watched
+            .get_mut(&mapping_id)
+            .and_then(|w| w.condemned.as_mut())
+        else {
+            continue;
+        };
+        c.horizon = horizon;
+        let tails: Vec<String> = c
+            .horizon
+            .iter()
+            .map(|(ch, tail)| format!("{ch}:{tail:#x}"))
+            .collect();
+        crate::observe::fail(format!(
+            "wire_guard_condemned mapping={mapping_id} field={} seq={} t_us={} horizon=[{}] \
+             debt={} (the guest unwired a surface it still has mapped: writes into this \
+             incarnation are refused, its owed frame is dropped, and the display presents \
+             submitted before now that name it are completed without being shown)",
+            c.field,
+            c.seq,
+            c.t_us,
+            tails.join(","),
+            if debt { "dropped" } else { "none" }
+        ));
+    }
 }
 
 // MARK: - Hooks: mapper ring
@@ -1414,6 +1530,8 @@ pub fn on_map<H: HostMemory + HostOps>(state: &mut DeviceState, host: &H, mappin
                 refused: 0,
                 last_write: None,
                 sampled_us: None,
+                condemned: None,
+                recovered_said: false,
             },
         );
         activate(ww, rd, state, mapping_id, true);
@@ -1452,14 +1570,16 @@ pub fn on_unmap<H: HostMemory + HostOps>(state: &mut DeviceState, host: &H, mapp
 /// Which rail is about to put bytes into a mapping's guest pages.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WriteKind {
-    /// The host CPU copies into the pages; the guard may refuse it.
+    /// The host CPU copies into the pages.
     Cpu,
-    /// The GPU copies into the pages; sampled, never refused.
+    /// The GPU copies into the pages. Refused only where the guard has
+    /// condemned the incarnation, like a CPU write.
     Gpu,
 }
 
 /// Right before a write into `mapping_id`'s guest pages. `false` only when the
-/// guard is on and refuses it, having said so.
+/// guard is on and has condemned this incarnation, having said so. This read
+/// can itself be what condemns it.
 pub fn before_write<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &H,
@@ -1509,11 +1629,9 @@ pub fn before_write<H: HostMemory + HostOps>(
                 ));
             }
         }
-        let refuse = kind == WriteKind::Cpu
-            && guard_enabled()
-            && fresh
-            && w.phase == Phase::Active
-            && surface <= 0;
+        // Latched, not read off the count: a positive count after the guest
+        // unwired a mapped surface does not hand its frames back.
+        let refuse = guard_enabled() && w.condemned.is_some();
         if refuse {
             ww.cost.guard_refused += 1;
             let w = ww.watched.get_mut(&mapping_id).expect("checked above");
@@ -1521,9 +1639,9 @@ pub fn before_write<H: HostMemory + HostOps>(
             if w.refused.is_power_of_two() && w.guard_lines < LINES_PER_MAPPING {
                 w.guard_lines += 1;
                 crate::observe::fail(format!(
-                    "wire_guard_refused mapping={mapping_id} site={site} surface_wire={surface} \
-                     n={} t_us={t_us} (the guest no longer holds this surface wired; the write \
-                     is refused and an owed frame stays owed)",
+                    "wire_guard_refused mapping={mapping_id} site={site} kind={kind:?} \
+                     surface_wire={surface} n={} t_us={t_us} (the guest unwired this incarnation \
+                     while it was mapped; the write is refused)",
                     w.refused
                 ));
             }
@@ -1534,6 +1652,81 @@ pub fn before_write<H: HostMemory + HostOps>(
 }
 
 // MARK: - Hooks: display
+
+/// What became of a display present packet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SwapHow {
+    /// It ran.
+    Exec,
+    /// It stays at its head and runs again later.
+    Deferred,
+    /// The guard completed it without running it: it names a condemned
+    /// incarnation and was submitted before the unwire was seen.
+    Dropped,
+}
+
+impl SwapHow {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Exec => "exec",
+            Self::Deferred => "deferred",
+            Self::Dropped => "dropped",
+        }
+    }
+}
+
+/// Whether the guard completes this display present without running it.
+///
+/// It does for a present that names a condemned incarnation and sits before
+/// its FIFO's horizon, i.e. was submitted before the unwire was seen: the
+/// guest cancelled that swap when it gave the surface up, and showing it now
+/// would retain a buffer the guest no longer holds and raise a present event
+/// for a swap it already cleared. Its stamp is still written by the drain, as
+/// for any completed packet. A present submitted after the horizon runs: it
+/// shows the resident and writes no guest memory.
+///
+/// The horizon is taken when the watch sees the drop, up to
+/// [`DISPLAY_SAMPLE_US`] after the guest made it, so a present the guest
+/// submitted inside that window is counted as older.
+pub fn condemned_swap(
+    state: &mut DeviceState,
+    channel: u32,
+    head: u32,
+    mapping: Option<u32>,
+) -> bool {
+    if !guard_enabled() {
+        return false;
+    }
+    let Some(mapping) = mapping else {
+        return false;
+    };
+    let internal = state.mappings.get(&mapping).map(|m| m.mapping_internal);
+    let ww = &mut state.wire_watch;
+    let Some(w) = ww.watched.get(&mapping) else {
+        return false;
+    };
+    let Some(c) = w.condemned.as_ref() else {
+        return false;
+    };
+    if internal != Some(w.internal) {
+        return false;
+    }
+    let Some(&(_, tail)) = c.horizon.iter().find(|(ch, _)| *ch == channel) else {
+        return false;
+    };
+    if tail.wrapping_sub(head) as i32 <= 0 {
+        return false;
+    }
+    ww.cost.swaps_dropped += 1;
+    crate::observe::fail(format!(
+        "wire_guard_swap_dropped mapping={mapping} ch={channel} head={head:#x} \
+         horizon_tail={tail:#x} condemned_seq={} t_us={} (submitted before the guest \
+         unwired the surface; completed without being shown)",
+        c.seq,
+        now_us()
+    ));
+    true
+}
 
 /// What a display present packet named, as the drain decoded it.
 pub struct SwapPacket<'a> {
@@ -1559,13 +1752,14 @@ pub fn before_swap<H: HostMemory + HostOps>(state: &mut DeviceState, host: &H) {
     });
 }
 
-/// After a display present packet ran (`deferred` when it will run again).
+/// After a display present packet ran, will run again, or was completed without
+/// running.
 pub fn after_swap<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &H,
     packet: SwapPacket<'_>,
     started_us: u64,
-    deferred: bool,
+    how: SwapHow,
 ) {
     if !enabled() || state.wire_watch.off() {
         return;
@@ -1582,7 +1776,7 @@ pub fn after_swap<H: HostMemory + HostOps>(
             stamp: packet.stamp,
             slot: packet.slot,
             mapping,
-            deferred,
+            how,
             present,
         });
         let words: Vec<String> = packet
@@ -1605,7 +1799,7 @@ pub fn after_swap<H: HostMemory + HostOps>(
             ww.hold_since_us.is_some() as u8
         ));
         ww.last_swap = Some(event.clone());
-        if !deferred {
+        if how != SwapHow::Deferred {
             if ww.unstamped.len() == UNSTAMPED_MAX {
                 ww.unstamped.pop_front();
                 ww.cost.unstamped_dropped += 1;
@@ -1642,6 +1836,10 @@ fn swap_held_packet(
         return;
     }
     let ww = &mut state.wire_watch;
+    // A buffer waiting to be shown is sampled at the display cadence from now.
+    if let Some(w) = ww.watched.get_mut(&mapping) {
+        w.display = true;
+    }
     if !ww.held_seen.insert((channel, head, stamp)) {
         return;
     }

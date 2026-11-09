@@ -193,7 +193,7 @@ fn swap(state: &mut DeviceState, host: &FakeHost, stamp: u32) {
             mapping: Some(MID),
         },
         now_us(),
-        false,
+        SwapHow::Exec,
     );
 }
 
@@ -435,7 +435,7 @@ fn a_count_that_cannot_be_read_is_neither_a_transition_nor_a_refusal() {
 }
 
 #[test]
-fn the_guard_refuses_a_cpu_write_only_while_the_checked_count_is_not_positive() {
+fn the_guard_condemns_at_the_first_drop_and_never_lets_go() {
     with_switches(true, true, || {
         let (mut state, mut host) = fixture(EXPECTED_KERNEL_VERSION);
         let cap = crate::observe::FailCapture::start();
@@ -447,6 +447,13 @@ fn the_guard_refuses_a_cpu_write_only_while_the_checked_count_is_not_positive() 
             "mapping_write",
             WriteKind::Cpu
         ));
+        assert!(write_now(
+            &mut state,
+            &host,
+            MID,
+            "gpu_writeback",
+            WriteKind::Gpu
+        ));
         set_surface_wire(&mut host, 0);
         assert!(!write_now(
             &mut state,
@@ -455,16 +462,23 @@ fn the_guard_refuses_a_cpu_write_only_while_the_checked_count_is_not_positive() 
             "mapping_write",
             WriteKind::Cpu
         ));
+        let condemned = cap.one("wire_guard_condemned");
+        assert!(
+            condemned.contains("mapping=2 field=surface") && condemned.contains("debt=none"),
+            "{condemned}"
+        );
+        assert!(lines_with(&cap, "wire_watch first_anomaly ")[0].contains("guard=condemned"));
         let refused = cap.one("wire_guard_refused");
         assert!(
-            refused.contains("mapping=2 site=mapping_write surface_wire=0"),
+            refused.contains("mapping=2 site=mapping_write kind=Cpu surface_wire=0"),
             "{refused}"
         );
         assert!(
-            write_now(&mut state, &host, MID, "gpu_writeback", WriteKind::Gpu),
-            "a GPU copy is sampled, not refused"
+            !write_now(&mut state, &host, MID, "gpu_writeback", WriteKind::Gpu),
+            "a GPU copy into a condemned incarnation is refused too"
         );
-        set_surface_wire(&mut host, -1);
+        // The guest prepares it again; the incarnation stays condemned.
+        set_surface_wire(&mut host, 1);
         assert!(!write_now(
             &mut state,
             &host,
@@ -472,15 +486,11 @@ fn the_guard_refuses_a_cpu_write_only_while_the_checked_count_is_not_positive() 
             "wbdebt_pay",
             WriteKind::Cpu
         ));
-        set_surface_wire(&mut host, 1);
-        assert!(write_now(
-            &mut state,
-            &host,
-            MID,
-            "mapping_write",
-            WriteKind::Cpu
-        ));
-        assert_eq!(state.wire_watch.cost.guard_refused, 2);
+        assert!(cap
+            .one("wire_guard_still_condemned")
+            .contains("mapping=2 field=surface value=1"));
+        assert_eq!(state.wire_watch.cost.guard_refused, 3);
+        assert_eq!(state.wire_watch.cost.condemned, 1);
         // Another mapping is none of the guard's business.
         assert!(write_now(
             &mut state,
@@ -489,15 +499,29 @@ fn the_guard_refuses_a_cpu_write_only_while_the_checked_count_is_not_positive() 
             "mapping_write",
             WriteKind::Cpu
         ));
+        // A new incarnation under the same id starts clean.
+        on_unmap(&mut state, &host, MID);
+        state.mappings.get_mut(&MID).unwrap().mapping_internal = MI;
+        on_map(&mut state, &host, MID);
+        assert!(write_now(
+            &mut state,
+            &host,
+            MID,
+            "mapping_write",
+            WriteKind::Cpu
+        ));
     });
     with_switches(true, false, || {
         let (mut state, mut host) = fixture(EXPECTED_KERNEL_VERSION);
+        let cap = crate::observe::FailCapture::start();
         on_map(&mut state, &host, MID);
         set_surface_wire(&mut host, 0);
         assert!(
             write_now(&mut state, &host, MID, "mapping_write", WriteKind::Cpu),
             "the watch alone never refuses"
         );
+        assert!(lines_with(&cap, "wire_guard").is_empty());
+        assert!(lines_with(&cap, "wire_watch first_anomaly ")[0].contains("guard=off"));
     });
 }
 
@@ -716,22 +740,95 @@ fn a_display_swap_held_behind_a_translation_is_seen_before_it_runs() {
             held[0]
         );
         assert_eq!(ev_lines(&cap, "hold").len(), 1);
+        assert!(
+            state.wire_watch.watched[&MID].display,
+            "a buffer seen waiting to be shown is sampled at the display cadence"
+        );
     });
 }
 
-/// A frame the guard would not let land stays owed.
+/// The frame owed to a condemned incarnation is dropped, not landed later.
 #[test]
-fn a_kept_debt_does_not_replace_a_newer_one() {
-    use crate::runtime::writeback_debt::{test_resident_identity, PendingWritebacks};
-    let mut ledger = PendingWritebacks::default();
-    let _ = ledger.arm(MID, test_resident_identity(MID, 4, 4, 1), 4, 4, 1);
-    let old = ledger.take(MID).unwrap();
-    ledger.keep(MID, old.clone());
-    assert_eq!(ledger.get(MID), Some(old.clone()));
-    let _ = ledger.take(MID);
-    let _ = ledger.arm(MID, test_resident_identity(MID, 8, 8, 2), 8, 8, 2);
-    ledger.keep(MID, old);
-    assert_eq!(ledger.get(MID).map(|d| d.width), Some(8));
+fn a_condemned_mapping_drops_its_owed_frame() {
+    use crate::runtime::writeback_debt::test_resident_identity;
+    with_switches(true, true, || {
+        let (mut state, mut host) = fixture(EXPECTED_KERNEL_VERSION);
+        on_map(&mut state, &host, MID);
+        let _ = state
+            .pending_writebacks
+            .arm(MID, test_resident_identity(MID, 4, 4, 1), 4, 4, 1);
+        let cap = crate::observe::FailCapture::start();
+        set_surface_wire(&mut host, 0);
+        tick(&mut state, &host);
+        assert!(cap.one("wire_guard_condemned").contains("debt=dropped"));
+        assert!(state.pending_writebacks.get(MID).is_none());
+        assert_eq!(state.wire_watch.cost.debts_dropped, 1);
+    });
+}
+
+/// A display present that names a condemned incarnation and was submitted
+/// before the drop is completed without being shown; one submitted after it
+/// runs. Both stamps reach the guest.
+#[test]
+fn a_swap_submitted_before_the_drop_is_completed_without_being_shown() {
+    use crate::model::{CHILD_REG_HEAD, CHILD_REG_TAIL};
+    with_switches(true, true, || {
+        let (mut state, mut host) = fixture(EXPECTED_KERNEL_VERSION);
+        let (regs, first) = put_display_fifo(&mut state, &mut host);
+        on_map(&mut state, &host, MID);
+        state.kernel_walk.root = None;
+        state.active_child_mask = 1 << CHANNEL;
+        // The guest cancels: the drop is seen while the swap is still queued.
+        set_surface_wire(&mut host, 0);
+        let cap = crate::observe::FailCapture::start();
+        tick(&mut state, &host);
+        let condemned = cap.one("wire_guard_condemned");
+        assert!(
+            condemned.contains(&format!("horizon=[{CHANNEL}:{:#x}]", first.len())),
+            "{condemned}"
+        );
+        // A later swap of the same surface, published after the drop.
+        let mut second = first.clone();
+        second[8..12].copy_from_slice(&(SWAP_STAMP + 0x100).to_le_bytes());
+        let ring = state.child_rings[CHANNEL as usize].page_gpas[0];
+        host.write_gpa(ring + first.len() as u64, &second).unwrap();
+        host.put_u32(regs + CHILD_REG_TAIL, (first.len() + second.len()) as u32);
+        state.pending.child_mask = 1 << CHANNEL;
+        state.wire_watch.all_sampled_us = Some(u64::MAX);
+        state.wire_watch.display_sampled_us = Some(u64::MAX);
+        crate::runtime::drain::drain_pending(&mut state, &mut host);
+        assert_eq!(
+            host.get_u32(regs + CHILD_REG_HEAD),
+            (first.len() + second.len()) as u32,
+            "{:?}",
+            cap.lines()
+        );
+        let dropped = cap.one("wire_guard_swap_dropped");
+        assert!(
+            dropped.contains(&format!(
+                "mapping=2 ch={CHANNEL} head=0x0 horizon_tail={:#x}",
+                first.len()
+            )),
+            "{dropped}"
+        );
+        let swaps = ev_lines(&cap, "swap");
+        assert_eq!(swaps.len(), 2, "{:?}", cap.lines());
+        assert!(
+            swaps[0].contains("head=0x0") && swaps[0].contains("how=dropped"),
+            "{}",
+            swaps[0]
+        );
+        assert!(swaps[1].contains("how=exec"), "{}", swaps[1]);
+        assert!(
+            ev_lines(&cap, "stamp")
+                .last()
+                .unwrap()
+                .contains(&format!("value={:#x}", SWAP_STAMP + 0x100)),
+            "{:?}",
+            cap.lines()
+        );
+        assert_eq!(state.wire_watch.cost.swaps_dropped, 1);
+    });
 }
 
 /// A frame landed a row at a time reads the counts once for the burst, and
