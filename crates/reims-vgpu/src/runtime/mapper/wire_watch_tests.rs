@@ -615,6 +615,9 @@ fn a_stamp_completes_only_the_swaps_it_reaches() {
 
 const CHANNEL: u32 = 4;
 const SWAP_STAMP: u32 = 0x55;
+/// The display FIFO's page list and the ring page it names.
+const LIST_PFN: u32 = 0x20;
+const RING_PFN: u32 = 0x30;
 
 /// The display channel's FIFO holding one `CmdDisplaySwapMapping` for mapping
 /// 2, as the guest publishes it.
@@ -624,7 +627,7 @@ fn put_display_fifo(state: &mut DeviceState, host: &mut FakeHost) -> (u64, Vec<u
         CHILD_REG_STAMP_INDEX, CHILD_REG_TAIL,
     };
     let page = state.page_size() as usize;
-    let (root_pfn, list_pfn, ring_pfn, stamp_pfn) = (0x10u32, 0x20u32, 0x30u32, 0x40u32);
+    let (root_pfn, list_pfn, ring_pfn, stamp_pfn) = (0x10u32, LIST_PFN, RING_PFN, 0x40u32);
     for pfn in [root_pfn, list_pfn, ring_pfn, stamp_pfn] {
         host.map_range(state.pfn_gpa(pfn), page, 0);
     }
@@ -766,11 +769,12 @@ fn a_condemned_mapping_drops_its_owed_frame() {
     });
 }
 
-/// A display present that names a condemned incarnation and was submitted
-/// before the drop is completed without being shown; one submitted after it
-/// runs. Both stamps reach the guest.
+/// A display present that names a condemned incarnation and was already
+/// published when the drop was seen is refused: consumed and stamped, never
+/// shown, no present event. One published after it runs. Both stamps reach the
+/// guest.
 #[test]
-fn a_swap_submitted_before_the_drop_is_completed_without_being_shown() {
+fn a_swap_published_before_the_drop_is_refused_and_still_stamped() {
     use crate::model::{CHILD_REG_HEAD, CHILD_REG_TAIL};
     with_switches(true, true, || {
         let (mut state, mut host) = fixture(EXPECTED_KERNEL_VERSION);
@@ -778,13 +782,16 @@ fn a_swap_submitted_before_the_drop_is_completed_without_being_shown() {
         on_map(&mut state, &host, MID);
         state.kernel_walk.root = None;
         state.active_child_mask = 1 << CHANNEL;
-        // The guest cancels: the drop is seen while the swap is still queued.
+        // The drop is seen while the swap is still queued.
         set_surface_wire(&mut host, 0);
         let cap = crate::observe::FailCapture::start();
         tick(&mut state, &host);
         let condemned = cap.one("wire_guard_condemned");
         assert!(
-            condemned.contains(&format!("horizon=[{CHANNEL}:{:#x}]", first.len())),
+            condemned.contains(&format!(
+                "horizon=[{CHANNEL}:gen0:pfn{LIST_PFN:#x}:0x0..{:#x}]",
+                first.len()
+            )),
             "{condemned}"
         );
         // A later swap of the same surface, published after the drop.
@@ -803,22 +810,24 @@ fn a_swap_submitted_before_the_drop_is_completed_without_being_shown() {
             "{:?}",
             cap.lines()
         );
-        let dropped = cap.one("wire_guard_swap_dropped");
+        let refused = cap.one("wire_guard_swap_refused");
         assert!(
-            dropped.contains(&format!(
-                "mapping=2 ch={CHANNEL} head=0x0 horizon_tail={:#x}",
+            refused.contains(&format!(
+                "mapping=2 ch={CHANNEL} head=0x0 horizon=0x0..{:#x} gen=0",
                 first.len()
             )),
-            "{dropped}"
+            "{refused}"
         );
         let swaps = ev_lines(&cap, "swap");
         assert_eq!(swaps.len(), 2, "{:?}", cap.lines());
         assert!(
-            swaps[0].contains("head=0x0") && swaps[0].contains("how=dropped"),
-            "{}",
+            swaps[0].contains("head=0x0")
+                && swaps[0].contains("how=refused")
+                && swaps[0].contains("present=-"),
+            "a refused present raises no present event: {}",
             swaps[0]
         );
-        assert!(swaps[1].contains("how=exec"), "{}", swaps[1]);
+        assert!(swaps[1].contains("how=exec") && swaps[1].contains("present=no_gpa"));
         assert!(
             ev_lines(&cap, "stamp")
                 .last()
@@ -827,7 +836,118 @@ fn a_swap_submitted_before_the_drop_is_completed_without_being_shown() {
             "{:?}",
             cap.lines()
         );
-        assert_eq!(state.wire_watch.cost.swaps_dropped, 1);
+        assert_eq!(state.wire_watch.cost.swaps_refused, 1);
+    });
+}
+
+/// A FIFO that was freed and defined again starts its positions over. A
+/// horizon taken on the old one (tail 0x100) must not refuse the new
+/// incarnation's swap at head 0.
+#[test]
+fn a_rebuilt_fifo_is_not_judged_by_the_old_horizon() {
+    use crate::model::{
+        CHILD_REG_HEAD, CHILD_REG_TAIL, PACKET_HEADER_LEN, ROOT_OP_DEFINE_FIFO, ROOT_OP_FREE_FIFO,
+    };
+    with_switches(true, true, || {
+        let (mut state, mut host) = fixture(EXPECTED_KERNEL_VERSION);
+        let (regs, packet) = put_display_fifo(&mut state, &mut host);
+        on_map(&mut state, &host, MID);
+        state.kernel_walk.root = None;
+        state.active_child_mask = 1 << CHANNEL;
+        host.put_u32(regs + CHILD_REG_TAIL, 0x100);
+        set_surface_wire(&mut host, 0);
+        let cap = crate::observe::FailCapture::start();
+        tick(&mut state, &host);
+        assert!(cap
+            .one("wire_guard_condemned")
+            .contains(&format!("{CHANNEL}:gen0:pfn{LIST_PFN:#x}:0x0..0x100")));
+        // The guest restarts: the channel is freed and defined again, and the
+        // new incarnation publishes a swap of the same surface from offset 0.
+        for opcode in [ROOT_OP_FREE_FIFO, ROOT_OP_DEFINE_FIFO] {
+            crate::runtime::drain::process_root_packet(
+                &mut state,
+                &mut host,
+                &crate::runtime::drain::Packet {
+                    opcode,
+                    stamp_waits: Vec::new(),
+                    total_size: PACKET_HEADER_LEN + 4,
+                    completion_stamp: 0,
+                    payload: CHANNEL.to_le_bytes().to_vec(),
+                    next_head: 0,
+                },
+            );
+        }
+        assert_eq!(
+            lines_with(
+                &cap,
+                "wire_guard_horizon_retired mapping=2 ch=4 reason=free_fifo"
+            )
+            .len(),
+            1,
+            "{:?}",
+            cap.lines()
+        );
+        host.put_u32(regs + CHILD_REG_HEAD, 0);
+        host.put_u32(regs + CHILD_REG_TAIL, packet.len() as u32);
+        state.pending.child_mask = 1 << CHANNEL;
+        state.wire_watch.all_sampled_us = Some(u64::MAX);
+        state.wire_watch.display_sampled_us = Some(u64::MAX);
+        crate::runtime::drain::drain_pending(&mut state, &mut host);
+        assert_eq!(host.get_u32(regs + CHILD_REG_HEAD), packet.len() as u32);
+        assert!(
+            lines_with(&cap, "wire_guard_swap_refused").is_empty(),
+            "{:?}",
+            cap.lines()
+        );
+        let swaps = ev_lines(&cap, "swap");
+        assert_eq!(swaps.len(), 1, "{:?}", cap.lines());
+        assert!(
+            swaps[0].contains("head=0x0") && swaps[0].contains("how=exec"),
+            "{}",
+            swaps[0]
+        );
+    });
+}
+
+/// The same, when the guest points the FIFO at another ring without a
+/// define: the ring is a different identity and the old horizon is retired.
+#[test]
+fn a_fifo_moved_to_another_ring_is_not_judged_by_the_old_horizon() {
+    use crate::model::{CHILD_REG_BASE_PFN, CHILD_REG_HEAD, CHILD_REG_TAIL};
+    with_switches(true, true, || {
+        let (mut state, mut host) = fixture(EXPECTED_KERNEL_VERSION);
+        let (regs, packet) = put_display_fifo(&mut state, &mut host);
+        on_map(&mut state, &host, MID);
+        state.kernel_walk.root = None;
+        state.active_child_mask = 1 << CHANNEL;
+        host.put_u32(regs + CHILD_REG_TAIL, 0x100);
+        set_surface_wire(&mut host, 0);
+        let cap = crate::observe::FailCapture::start();
+        tick(&mut state, &host);
+        // A second page list naming the same ring page.
+        let list2 = state.pfn_gpa(LIST_PFN + 1);
+        host.map_range(list2, state.page_size() as usize, 0);
+        host.put_u32(list2, RING_PFN);
+        host.put_u32(regs + CHILD_REG_BASE_PFN, LIST_PFN + 1);
+        host.put_u32(regs + CHILD_REG_HEAD, 0);
+        host.put_u32(regs + CHILD_REG_TAIL, packet.len() as u32);
+        state.pending.child_mask = 1 << CHANNEL;
+        state.wire_watch.all_sampled_us = Some(u64::MAX);
+        state.wire_watch.display_sampled_us = Some(u64::MAX);
+        crate::runtime::drain::drain_pending(&mut state, &mut host);
+        assert_eq!(host.get_u32(regs + CHILD_REG_HEAD), packet.len() as u32);
+        assert_eq!(
+            lines_with(
+                &cap,
+                "wire_guard_horizon_retired mapping=2 ch=4 reason=ring_changed"
+            )
+            .len(),
+            1,
+            "{:?}",
+            cap.lines()
+        );
+        assert!(lines_with(&cap, "wire_guard_swap_refused").is_empty());
+        assert!(ev_lines(&cap, "swap")[0].contains("how=exec"));
     });
 }
 
