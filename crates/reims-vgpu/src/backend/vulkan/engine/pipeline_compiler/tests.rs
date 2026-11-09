@@ -387,3 +387,24 @@ fn a_refused_compile_is_remembered_and_not_compiled_again() {
     }
     assert_eq!(CENSUS.jobs.load(Ordering::Relaxed), jobs_before);
 }
+
+/// `REIMS_VGPU_PIPELINE_ASYNC=off` builds a cold pipeline inside its draw:
+/// the draw draws on its first ask, no ticket is handed out, and the compile is
+/// counted as built in the draw.
+#[test]
+fn with_the_switch_off_a_cold_pipeline_is_built_inside_its_draw() {
+    crate::observe::redirect_logs_for_tests();
+    let seed = 5;
+    let frag = frag_variant(seed);
+    let req = request(&frag);
+    let _in_draw = super::test_hooks::InDraw::force();
+    let jobs_before = CENSUS.jobs.load(Ordering::Relaxed);
+    let in_draw_before = CENSUS.in_draw.load(Ordering::Relaxed);
+    match ask(&req) {
+        Asked::Drawn(pixels) => assert_drawn_color(&pixels, seed),
+        Asked::Pending(_) => panic!("the switch is off and the draw still waited"),
+        Asked::NoDevice => return,
+    }
+    assert_eq!(CENSUS.jobs.load(Ordering::Relaxed), jobs_before + 1);
+    assert_eq!(CENSUS.in_draw.load(Ordering::Relaxed), in_draw_before + 1);
+}

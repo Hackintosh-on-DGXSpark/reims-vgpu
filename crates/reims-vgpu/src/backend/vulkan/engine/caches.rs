@@ -2169,8 +2169,7 @@ impl ObjectCaches {
         counters.pipeline_misses.fetch_add(1, Ordering::Relaxed);
         let attribute_formats = self.graphics_pipeline_formats(ctx, key, ask.vert)?;
         let ticket = super::pipeline_compiler::PipelineTicket::new(key.clone());
-        self.flights.insert(key.clone(), ticket.clone());
-        super::pipeline_compiler::submit(super::pipeline_compiler::GraphicsCompileJob {
+        let job = super::pipeline_compiler::GraphicsCompileJob {
             ticket: ticket.clone(),
             life: std::sync::Arc::clone(&ctx.life),
             recipe: GraphicsRecipe {
@@ -2185,7 +2184,29 @@ impl ObjectCaches {
             pipeline_object: ask
                 .pipeline_object
                 .map(|identity| (identity.id(), identity.downgrade())),
-        });
+        };
+        if !super::pipeline_compiler::off_the_draw() {
+            // `REIMS_VGPU_PIPELINE_ASYNC=off`: built here, under the locks, and
+            // filed before this draw goes on, as before the compiler thread.
+            let done = super::pipeline_compiler::compile_in_draw(job);
+            self.publish_one(Some(ctx), pools, counters, done);
+            return match ticket.outcome() {
+                Some(super::pipeline_compiler::PipelineOutcome::Ready) => Ok(PipelineReady::Built(
+                    self.pipelines
+                        .get(key)
+                        .expect("a pipeline answered Ready was filed under its key"),
+                )),
+                Some(super::pipeline_compiler::PipelineOutcome::Failed(error)) => Err(error.clone()),
+                // Only a compile that returned `VK_ERROR_DEVICE_LOST` is answered
+                // `DeviceRebuilt` on the device it ran on; the loss is latched.
+                _ => Err(DrawError::VkCall(VkCall::new(
+                    VkOp::CachesCreateGraphicsPipelines,
+                    vk::Result::ERROR_DEVICE_LOST,
+                ))),
+            };
+        }
+        self.flights.insert(key.clone(), ticket.clone());
+        super::pipeline_compiler::submit(job);
         Ok(PipelineReady::Pending(ticket))
     }
 
@@ -2206,8 +2227,22 @@ impl ObjectCaches {
         pools: &mut ResourcePools,
         counters: &EngineCounters,
     ) {
-        use super::pipeline_compiler::{CompileFailure, PipelineOutcome};
         for done in super::pipeline_compiler::take_finished() {
+            self.publish_one(ctx, pools, counters, done);
+        }
+    }
+
+    /// File one finished compile and answer its ticket. See
+    /// [`Self::publish_compiled`].
+    unsafe fn publish_one(
+        &mut self,
+        ctx: Option<&DeviceContext>,
+        pools: &mut ResourcePools,
+        counters: &EngineCounters,
+        done: super::pipeline_compiler::CompiledPipeline,
+    ) {
+        use super::pipeline_compiler::{CompileFailure, PipelineOutcome};
+        {
             let key = done.ticket.key();
             if self.flights.get(key).is_some_and(|t| t.is(&done.ticket)) {
                 self.flights.remove(key);
@@ -2221,7 +2256,7 @@ impl ObjectCaches {
                 }
                 done.ticket.settle(PipelineOutcome::DeviceRebuilt);
                 super::pipeline_compiler::note_published_stale();
-                continue;
+                return;
             };
             match done.result {
                 Ok(pipeline) => {
@@ -2246,7 +2281,7 @@ impl ObjectCaches {
                     if lost {
                         super::device_lost::note_device_lost_seen();
                         done.ticket.settle(PipelineOutcome::DeviceRebuilt);
-                        continue;
+                        return;
                     }
                     if let Some(module) = module {
                         self.shaders.insert_negative(module, error.clone());
@@ -2711,6 +2746,7 @@ pub(crate) struct GraphicsRecipe {
 /// remembering a refusal and persisting the pipeline cache belong to the
 /// callers on either side of the call.
 pub(crate) unsafe fn create_graphics_pipeline(
+    lane: super::driver_breadcrumb::DriverLane,
     device: &ash::Device,
     cache: vk::PipelineCache,
     recipe: &GraphicsRecipe,
@@ -2919,7 +2955,7 @@ pub(crate) unsafe fn create_graphics_pipeline(
     // here for over ten minutes; see `crate::observe::driver_watch`, which
     // this arming also starts on the compiler's lane.
     let breadcrumb = match super::driver_breadcrumb::DriverBreadcrumb::arm(
-        super::driver_breadcrumb::DriverLane::Compiler,
+        lane,
         &format!(
             "create_graphics_pipelines vert_words={} frag_words={}",
             vert.spirv.len(),

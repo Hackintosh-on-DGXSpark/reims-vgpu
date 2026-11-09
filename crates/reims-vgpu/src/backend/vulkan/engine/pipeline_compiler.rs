@@ -219,6 +219,37 @@ fn compiler() -> &'static Compiler {
     })
 }
 
+/// Whether graphics pipelines are built on the compiler thread, the default, or
+/// inside the draw that first needs them under `REIMS_VGPU_PIPELINE_ASYNC=off`.
+/// Read once; the boot line says which.
+pub(crate) fn off_the_draw() -> bool {
+    #[cfg(test)]
+    if test_hooks::in_draw_forced() {
+        return false;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let (state, value) = crate::env::read(crate::env::PIPELINE_ASYNC);
+        let on = !matches!(state, crate::env::Switch::Off);
+        crate::observe::off(format!(
+            "pipeline_async on={on} switch={state:?} value={}",
+            value.unwrap_or_else(|| "<unset>".into())
+        ));
+        on
+    })
+}
+
+/// Build `job` here and now, on the calling thread and under whatever locks it
+/// holds: the `REIMS_VGPU_PIPELINE_ASYNC=off` arm, which is how every graphics
+/// pipeline was built before the compiler thread existed.
+pub(crate) fn compile_in_draw(job: GraphicsCompileJob) -> CompiledPipeline {
+    CENSUS.jobs.fetch_add(1, Ordering::Relaxed);
+    CENSUS.in_draw.fetch_add(1, Ordering::Relaxed);
+    let done = compile(job, super::driver_breadcrumb::DriverLane::Drain);
+    done.ticket.0.compiled.store(true, Ordering::Release);
+    done
+}
+
 /// Queue a compile. Never waits for one.
 pub(crate) fn submit(job: GraphicsCompileJob) {
     let compiler = compiler();
@@ -270,7 +301,7 @@ impl Compiler {
                 }
             };
             let ticket = job.ticket.clone();
-            let done = compile(job);
+            let done = compile(job, super::driver_breadcrumb::DriverLane::Compiler);
             self.finished
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -284,7 +315,7 @@ impl Compiler {
     }
 }
 
-fn compile(job: GraphicsCompileJob) -> CompiledPipeline {
+fn compile(job: GraphicsCompileJob, lane: super::driver_breadcrumb::DriverLane) -> CompiledPipeline {
     let started = Instant::now();
     CENSUS.note_max(
         &CENSUS.queue_wait_max_ns,
@@ -297,7 +328,7 @@ fn compile(job: GraphicsCompileJob) -> CompiledPipeline {
         #[cfg(test)]
         test_hooks::wait_at_gate();
         let built =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { build(&job) }));
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { build(&job, lane) }));
         built.unwrap_or_else(|panic| {
             let message = panic
                 .downcast_ref::<&str>()
@@ -334,9 +365,12 @@ fn compile(job: GraphicsCompileJob) -> CompiledPipeline {
     }
 }
 
-unsafe fn build(job: &GraphicsCompileJob) -> Result<vk::Pipeline, CompileFailure> {
-    let vert = module(&job.life, &job.vert, job.caps)?;
-    let frag = module(&job.life, &job.frag, job.caps)?;
+unsafe fn build(
+    job: &GraphicsCompileJob,
+    lane: super::driver_breadcrumb::DriverLane,
+) -> Result<vk::Pipeline, CompileFailure> {
+    let vert = module(&job.life, &job.vert, job.caps, lane)?;
+    let frag = module(&job.life, &job.frag, job.caps, lane)?;
     #[cfg(test)]
     if let Some(result) = test_hooks::forced_result() {
         return Err(CompileFailure::Refused {
@@ -345,6 +379,7 @@ unsafe fn build(job: &GraphicsCompileJob) -> Result<vk::Pipeline, CompileFailure
         });
     }
     let pipeline = create_graphics_pipeline(
+        lane,
         &job.life.device,
         job.life.pipeline_cache,
         &job.recipe,
@@ -378,6 +413,7 @@ unsafe fn module(
     life: &DeviceLife,
     words: &[u32],
     caps: SpirvStorageCaps,
+    lane: super::driver_breadcrumb::DriverLane,
 ) -> Result<vk::ShaderModule, CompileFailure> {
     let declared =
         declare_image_capabilities(words, caps).map_err(|error| CompileFailure::Refused {
@@ -402,7 +438,7 @@ unsafe fn module(
     let built = (|| {
         refuse_invalid_module(&declared, digest)?;
         let breadcrumb = super::driver_breadcrumb::DriverBreadcrumb::arm(
-            super::driver_breadcrumb::DriverLane::Compiler,
+            lane,
             "create_shader_module",
             &[("module", &declared)],
         )
@@ -430,6 +466,8 @@ unsafe fn module(
 /// What the compiler and the draws around it did over one census window.
 struct Census {
     jobs: AtomicU64,
+    /// Of `jobs`, the ones built inside their draw (`REIMS_VGPU_PIPELINE_ASYNC=off`).
+    in_draw: AtomicU64,
     built: AtomicU64,
     refused: AtomicU64,
     stale_skipped: AtomicU64,
@@ -452,6 +490,7 @@ impl Census {
 
 static CENSUS: Census = Census {
     jobs: AtomicU64::new(0),
+    in_draw: AtomicU64::new(0),
     built: AtomicU64::new(0),
     refused: AtomicU64::new(0),
     stale_skipped: AtomicU64::new(0),
@@ -496,6 +535,7 @@ pub(crate) fn take_census(win_ms: u64) -> Option<String> {
     let take = |slot: &AtomicU64| slot.swap(0, Ordering::Relaxed);
     let us = |ns: u64| ns / 1000;
     let jobs = take(&CENSUS.jobs);
+    let in_draw = take(&CENSUS.in_draw);
     let built = take(&CENSUS.built);
     let refused = take(&CENSUS.refused);
     let stale = take(&CENSUS.stale_skipped);
@@ -512,7 +552,7 @@ pub(crate) fn take_census(win_ms: u64) -> Option<String> {
         return None;
     }
     Some(format!(
-        "pipeline_compile win_ms={win_ms} jobs={jobs} built={built} refused={refused} \
+        "pipeline_compile win_ms={win_ms} jobs={jobs} in_draw={in_draw} built={built} refused={refused} \
          stale_skipped={stale} compile_us={} compile_max_us={} module_us={} \
          queue_wait_max_us={} published_stale={published_stale} \
          failures_delivered={delivered} cp_compiles={cp} cp_compile_us={} cp_compile_max_us={}",
@@ -612,6 +652,29 @@ pub(crate) mod test_hooks {
 
     pub(super) fn forced_result() -> Option<ash::vk::Result> {
         *FORCED.lock().unwrap()
+    }
+
+    static IN_DRAW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    /// Builds every pipeline inside its draw, as `REIMS_VGPU_PIPELINE_ASYNC=off`
+    /// does, until dropped.
+    pub(crate) struct InDraw(());
+
+    impl InDraw {
+        pub(crate) fn force() -> Self {
+            IN_DRAW.store(true, std::sync::atomic::Ordering::Release);
+            Self(())
+        }
+    }
+
+    impl Drop for InDraw {
+        fn drop(&mut self) {
+            IN_DRAW.store(false, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    pub(super) fn in_draw_forced() -> bool {
+        IN_DRAW.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Wait until `ticket`'s compile has finished on the compiler thread.

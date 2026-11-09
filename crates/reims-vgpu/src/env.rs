@@ -342,6 +342,17 @@ pub const PRESENT_DEPTH: &str = "REIMS_VGPU_PRESENT_DEPTH";
 /// A/B'd on one binary.
 pub const STAMP_COALESCE: &str = "REIMS_VGPU_STAMP_COALESCE";
 
+/// **Default on.** Setting this off builds a graphics pipeline inside the draw
+/// that first needs it — on the drain thread, under the device and engine
+/// locks — instead of on the pipeline compiler thread with the draw's packet
+/// waiting at its FIFO head. See `backend::vulkan::engine::pipeline_compiler`.
+///
+/// It exists so the two can be A/B'd on one binary: moving a compile off the
+/// draw changes when a packet runs relative to the others, and a regression in
+/// what the guest sees has to be attributable to that or ruled out without a
+/// rebuild. Off is the old behaviour exactly, long holds included.
+pub const PIPELINE_ASYNC: &str = "REIMS_VGPU_PIPELINE_ASYNC";
+
 /// **Probe, default off.** Setting this *on* cuts every guest-page scatter run
 /// into four contiguous sub-ranges that tile it exactly.
 ///
@@ -1239,7 +1250,7 @@ pub fn switch(name: &str) -> Switch {
 /// Nothing enforces that a new `pub const` above is added to this list; the rule
 /// is stated and honestly unenforced. What keeps it small is that the list is
 /// next to the constants, and [`report_line`] is the only consumer.
-pub const ALL: [&str; 31] = [
+pub const ALL: [&str; 32] = [
     COLOR_GENERAL,
     LAZY_WRITEBACK,
     SLAB_RETAIN,
@@ -1267,6 +1278,7 @@ pub const ALL: [&str; 31] = [
     UNUSED_BINDS,
     PRESENT_DEPTH,
     STAMP_COALESCE,
+    PIPELINE_ASYNC,
     SCATTER_SPLIT,
     COMPUTE_SCATTER,
     // Absent from this list until 2026-08-11, which made the boot line silent
