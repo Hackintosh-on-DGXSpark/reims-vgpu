@@ -25,14 +25,19 @@
 //! # What it reads, and why it believes it
 //!
 //! The offsets below are 27.2's (26B123), inferred from the driver's code and
-//! checked against both dumps. Nothing here is trusted before it is checked:
+//! checked against both dumps. macOS 26.6.2 (25G83) has the same offsets, checked
+//! on every wired mapping of one panic dump. Nothing here is trusted before it
+//! is checked:
 //!
 //! 1. The kernel. The Mach-O header of the kernel is found by stepping down
 //!    page by page from `VBAR_EL1` (captured with the kernel root, see
-//!    [`crate::runtime::kernel_walk`]); its `__TEXT` must start at the header
-//!    itself, `VBAR_EL1` must lie in one of its segments, and `__TEXT,__const`
-//!    must hold exactly [`EXPECTED_KERNEL_VERSION`]. Any other kernel turns the
-//!    watch off for the boot.
+//!    [`crate::runtime::kernel_walk`]), passing over any header that is not
+//!    `MH_EXECUTE` (26.6.2 has a kext's on the way); its `__TEXT` must start at
+//!    the header itself, `VBAR_EL1` must lie in one of its segments (27.2 enters
+//!    at `__TEXT_EXEC`'s start, 26.6.2 0x6000 into it), and `__TEXT,__const`
+//!    must hold one of [`KNOWN_KERNEL_VERSIONS`] exactly. Any other kernel turns
+//!    the watch off for the boot: 13.6 and 14.6.1 lay the mapping out
+//!    differently, and 15.6.1 has not been checked.
 //! 2. Each mapping. The `MappingInternal` must name the mapping's id, the
 //!    `0x200` descriptor size and the page count this device resolved; the
 //!    page-table descriptor's buffer must be the page table this device reads;
@@ -159,9 +164,16 @@ pub(crate) fn with_switches<R>(watch: bool, guard: bool, f: impl FnOnce() -> R) 
 
 // MARK: - Layout
 
-/// `version[]` of the kernel the offsets below were read from.
-pub const EXPECTED_KERNEL_VERSION: &str = "Darwin Kernel Version 27.2.0: Wed Oct 14 23:44:09 PDT \
+/// `version[]` of macOS 27.2 (26B123), the kernel the offsets below were read
+/// from.
+pub const KERNEL_VERSION_27_2: &str = "Darwin Kernel Version 27.2.0: Wed Oct 14 23:44:09 PDT \
      2026; root:xnu-13432.41.4~25/RELEASE_ARM64_VMAPPLE";
+/// `version[]` of macOS 26.6.2 (25G83), whose offsets are 27.2's; see
+/// `~/forensics/layouts.txt` on dgx for what was checked.
+pub const KERNEL_VERSION_26_6_2: &str = "Darwin Kernel Version 25.6.0: Fri Jul 31 19:16:43 PDT \
+     2026; root:xnu-12377.161.14~5/RELEASE_ARM64_VMAPPLE";
+/// The kernels the watch believes, matched exactly.
+pub const KNOWN_KERNEL_VERSIONS: [&str; 2] = [KERNEL_VERSION_27_2, KERNEL_VERSION_26_6_2];
 const VERSION_PREFIX: &[u8] = b"Darwin Kernel Version ";
 /// Longest version string read back for the log.
 const VERSION_MAX: usize = 256;
@@ -178,13 +190,14 @@ const LOAD_COMMANDS_MAX: usize = 0x10000;
 /// `__TEXT,__const` larger than this is not read.
 const TEXT_CONST_MAX: u64 = 8 << 20;
 /// How far below `VBAR_EL1` the kernel header is looked for. On 27.2 it is
-/// 0x2ec0000 below; this is a bound on the search, not a guess at the answer.
+/// 0x2ec0000 below, on 26.6.2 0x2c06000; this is a bound on the search, not a
+/// guess at the answer.
 const KERNEL_SCAN_BYTES: u64 = 256 << 20;
 
-/// `IOSurfaceParavirtMappingInternal`, 27.2. `+0x10` is the driver's own
-/// `refs * 4 | wired` word, `+0x20` the surface descriptor, `+0x58` the
-/// page-table descriptor (macOS 14 and later moved the page fields by
-/// [`iosurface_pages::MAPPING_INTERNAL_SONOMA_SHIFT`]).
+/// `IOSurfaceParavirtMappingInternal`, 27.2 and 26.6.2. `+0x10` is the
+/// driver's own `refs * 4 | wired` word, `+0x20` the surface descriptor,
+/// `+0x58` the page-table descriptor (macOS 14 and later moved the page fields
+/// by [`iosurface_pages::MAPPING_INTERNAL_SONOMA_SHIFT`]).
 const MI_STATE: u64 = 0x10;
 const MI_SURFACE_IOMD: u64 = 0x20;
 const MI_ID: u64 = iosurface_pages::MAPPING_INTERNAL_ID;
@@ -198,9 +211,10 @@ const MI_PAGE_COUNT: u64 =
 /// One read covers every field above.
 const MI_WINDOW: std::ops::Range<u64> = MI_STATE..MI_PAGE_COUNT + 8;
 
-/// `IOBufferMemoryDescriptor` on 27.2's xnu: `IOMemoryDescriptor::_length`,
-/// `IOGeneralMemoryDescriptor::_task`, `_wireCount`, `_initialized`,
-/// `_memoryEntries`, `_pages`, and `IOBufferMemoryDescriptor::_buffer`.
+/// `IOBufferMemoryDescriptor` on 27.2's and 26.6.2's xnu:
+/// `IOMemoryDescriptor::_length`, `IOGeneralMemoryDescriptor::_task`,
+/// `_wireCount`, `_initialized`, `_memoryEntries`, `_pages`, and
+/// `IOBufferMemoryDescriptor::_buffer`.
 const IOMD_LENGTH: u64 = 0x50;
 const IOMD_TASK: u64 = 0x70;
 const IOMD_WIRE_COUNT: u64 = 0x88;
@@ -926,6 +940,8 @@ fn check_kernel<H: HostMemory + HostOps>(
         let mut b = [0u8; 16];
         if rd.bytes(at, &mut b) {
             let word = |i: usize| u32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap());
+            // Only the kernel's own header: a kext's (`MH_KEXT_BUNDLE`) can
+            // sit between it and `VBAR_EL1`, and does on 26.6.2.
             if word(0) == MH_MAGIC_64 && word(1) == CPU_TYPE_ARM64 && word(3) == MH_EXECUTE {
                 header = Some(at);
                 break;
@@ -999,7 +1015,7 @@ fn check_kernel<H: HostMemory + HostOps>(
             }
         })
         .collect();
-    if version != EXPECTED_KERNEL_VERSION {
+    if !KNOWN_KERNEL_VERSIONS.contains(&version.as_str()) {
         return KernelVerdict::Wrong(
             "kernel_version_mismatch",
             format!("version=\"{version}\" {at_header}"),
@@ -1045,7 +1061,7 @@ fn kernel_image<H: HostMemory + HostOps>(
             crate::observe::fail(format!(
                 "wire_watch_layout_unverified scope=kernel reason={reason} {seen} expected=\"{}\" \
                  (the watch is off for this boot)",
-                EXPECTED_KERNEL_VERSION
+                KNOWN_KERNEL_VERSIONS.join("\" | \"")
             ));
             ww.kernel = KernelCheck::Unverified;
             None
