@@ -179,6 +179,64 @@ fn fifo_read_counter_is_live_while_device_lock_held() {
     assert!(device_destroy(id));
 }
 
+/// The guest reads the protocol version straight back after writing it. A
+/// write that had to queue, the lock busy for a moment, must not leave that
+/// read answering 0: the 14.6.1 warm boot of 2026-11-09 read 0 there, and its
+/// GPU driver never started.
+#[test]
+fn a_version_read_back_sees_a_queued_write() {
+    use crate::model::{negotiate_protocol_version, GFX_REG_VERSION};
+    let id = device_create(None, PAGE_SHIFT_ARM64E).expect("create");
+    let slot = device_slot(id).expect("slot");
+    let negotiated = u64::from(negotiate_protocol_version(113));
+    assert_ne!(negotiated, 0);
+    let busy = slot.inner.lock();
+    assert!(device_gfx_write(id, GFX_REG_VERSION, 113, 4));
+    assert_eq!(
+        slot.gfx_ingress.lock().len(),
+        1,
+        "the write waits for the lock"
+    );
+    assert_eq!(
+        device_gfx_read(id, GFX_REG_VERSION, 4),
+        Some(negotiated),
+        "read back while the lock is still held"
+    );
+    drop(busy);
+    assert_eq!(
+        device_gfx_read(id, GFX_REG_VERSION, 4),
+        Some(negotiated),
+        "read back once the lock is free, before any drain"
+    );
+    assert!(device_reset(id));
+    assert_eq!(
+        device_gfx_read(id, GFX_REG_VERSION, 4),
+        Some(0),
+        "a reset forgets the negotiation"
+    );
+    assert!(device_destroy(id));
+}
+
+/// No register read overtakes a write the guest made before it: a read that
+/// finds the lock free applies the queued writes first, in order.
+#[test]
+fn a_read_applies_the_writes_queued_before_it() {
+    use crate::model::GFX_REG_ROOT_PAGE;
+    let id = device_create(None, PAGE_SHIFT_ARM64E).expect("create");
+    let slot = device_slot(id).expect("slot");
+    let busy = slot.inner.lock();
+    assert!(device_gfx_write(id, GFX_REG_ROOT_PAGE, 0x1234, 4));
+    assert!(device_gfx_write(id, GFX_REG_ROOT_PAGE, 0x5678, 4));
+    drop(busy);
+    assert_eq!(device_gfx_read(id, GFX_REG_ROOT_PAGE, 4), Some(0x5678));
+    assert!(
+        slot.gfx_ingress.lock().is_empty(),
+        "applied by the read, once"
+    );
+    assert_eq!(slot.inner.lock().device.state.gfx.root_page, 0x5678);
+    assert!(device_destroy(id));
+}
+
 /// Interrupt-status mask-clear writes apply lock-free too.
 #[test]
 fn intr_status_write_clears_mask_while_device_lock_held() {

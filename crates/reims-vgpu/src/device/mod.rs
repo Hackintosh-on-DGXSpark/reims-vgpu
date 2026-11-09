@@ -107,6 +107,9 @@ struct BoundDevice {
     /// `writeFifo` producer spin must observe drain progress live, not a
     /// cached snapshot from before the tranche.
     fifo_read_live: Arc<AtomicU32>,
+    /// Lock-free clone of the negotiated protocol version (0x1034); see
+    /// [`crate::model::GfxRegs::version_live`].
+    version_live: Arc<AtomicU32>,
     /// The IOSurface mapper registers, read by a vCPU with no lock; published
     /// by whoever changes them under the device lock.
     iosfc_live: Arc<crate::model::IosfcLive>,
@@ -251,6 +254,7 @@ pub fn device_create(ops: Option<ReimsVgpuHostOps>, page_shift: u32) -> Option<u
     let child_doorbell_rung = Arc::clone(&dev.state.gfx.child_doorbell_rung);
     let intr_fault = Arc::clone(&dev.state.gfx.interrupt_fault);
     let fifo_read_live = Arc::clone(&dev.state.gfx.fifo_read);
+    let version_live = Arc::clone(&dev.state.gfx.version_live);
     let iosfc_live = Arc::clone(&dev.state.iosfc.live);
     DEVICES.lock().insert(
         id,
@@ -268,6 +272,7 @@ pub fn device_create(ops: Option<ReimsVgpuHostOps>, page_shift: u32) -> Option<u
             child_doorbell_rung,
             intr_fault,
             fifo_read_live,
+            version_live,
             iosfc_live,
             present_action_pending: AtomicBool::new(false),
             present_boundary_seen: AtomicBool::new(false),
@@ -396,13 +401,29 @@ pub fn device_gfx_read(id: u64, offset: u64, size: u32) -> Option<u64> {
         if offset == GFX_REG_INTR_FAULT {
             return Some(slot.intr_fault.load(Ordering::Acquire) as u64);
         }
+        // The guest reads it straight after writing it, while that write may
+        // still be queued; see `crate::model::GfxRegs::version_live`.
+        if offset == crate::model::GFX_REG_VERSION {
+            return Some(slot.version_live.load(Ordering::Acquire) as u64);
+        }
     }
+    // A read must not overtake a write the guest made before it. Writes that
+    // could not take the lock wait in the ingress queue for the drain, so a
+    // read that can take the lock applies them first, in order, as the drain
+    // would have. Lock order is ingress then inner, as everywhere.
+    let mut ingress = slot.gfx_ingress.lock();
     if let Some(mut d) = try_hold(&slot.inner, Holder::VcpuGfxRead) {
+        while let Some(write) = ingress.pop_front() {
+            apply_gfx_write(&mut d, &slot, write);
+        }
+        drop(ingress);
         let value = d.device.gfx_read(offset, size);
         slot.gfx_read_cache.lock().insert((offset, size), value);
         slot.gfx_read_busy_logged.store(false, Ordering::Relaxed);
         return Some(value);
     }
+    let queued = ingress.len();
+    drop(ingress);
     let value = slot
         .gfx_read_cache
         .lock()
@@ -411,7 +432,8 @@ pub fn device_gfx_read(id: u64, offset: u64, size: u32) -> Option<u64> {
         .unwrap_or(0);
     if !slot.gfx_read_busy_logged.swap(true, Ordering::Relaxed) {
         crate::observe::fail(format!(
-            "device_lock_busy reason=gfx_read_deferred offset={offset:#x} size={size} cached={value:#x}"
+            "device_lock_busy reason=gfx_read_deferred offset={offset:#x} size={size} \
+             cached={value:#x} queued_writes={queued}"
         ));
     }
     Some(value)
@@ -463,6 +485,14 @@ pub fn device_gfx_write(id: u64, offset: u64, data: u64, size: u32) -> bool {
             }
             return true;
         }
+    }
+    // Before the write can wait: the guest reads the negotiated version back at
+    // once. The write itself still runs below, queued or not.
+    if offset == crate::model::GFX_REG_VERSION && (size == 4 || size == 8) {
+        slot.version_live.store(
+            crate::model::negotiate_protocol_version(data as u32),
+            Ordering::Release,
+        );
     }
     let mut write = QueuedGfxWrite {
         offset,

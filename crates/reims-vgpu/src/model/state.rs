@@ -394,6 +394,20 @@ pub struct GfxRegs {
     /// The `Arc` is shared with the device registry slot and survives reset,
     /// like the three above.
     pub child_doorbell_rung: Arc<AtomicU32>,
+    /// The negotiated protocol version (0x1034), as the guest reads it back.
+    ///
+    /// The guest driver writes the version it speaks and reads the register
+    /// straight back; what it reads selects its whole feature set, and 0 makes
+    /// it give the device up. `device_gfx_write` queues a write it cannot
+    /// apply at once, so a read could find the lock free and the write still
+    /// waiting, and answer 0: the 14.6.1 warm boot of 2026-11-09 stopped there,
+    /// with the GPU never started. So the vCPU that writes the register
+    /// publishes the negotiated value here before its write can wait, and the
+    /// read takes it from here with no lock.
+    ///
+    /// The `Arc` is shared with the device registry slot and survives reset,
+    /// like the four above.
+    pub version_live: Arc<AtomicU32>,
     pub efi_display: u32,
     pub efi_mode_select: u32,
     pub efi_fb_start: u64,
@@ -420,6 +434,7 @@ impl Default for GfxRegs {
             interrupt_status_gpu: Arc::new(AtomicU32::new(0)),
             interrupt_fault: Arc::new(AtomicU32::new(0)),
             child_doorbell_rung: Arc::new(AtomicU32::new(0)),
+            version_live: Arc::new(AtomicU32::new(0)),
             efi_display: 0,
             efi_mode_select: 0,
             efi_fb_start: 0,
@@ -3215,10 +3230,13 @@ impl DeviceState {
         let intr_fault = Arc::clone(&self.gfx.interrupt_fault);
         let fifo_read = Arc::clone(&self.gfx.fifo_read);
         let child_rung = Arc::clone(&self.gfx.child_doorbell_rung);
+        let version_live = Arc::clone(&self.gfx.version_live);
         intr_disp.store(0, Ordering::Release);
         intr_gpu.store(0, Ordering::Release);
         intr_fault.store(0, Ordering::Release);
         fifo_read.store(0, Ordering::Release);
+        // A reset forgets the negotiation; the guest negotiates again.
+        version_live.store(0, Ordering::Release);
         // Cleared as well as kept: a reset drops every channel, so a bit rung
         // before it names a channel that no longer exists.
         child_rung.store(0, Ordering::Release);
@@ -3240,6 +3258,7 @@ impl DeviceState {
         self.gfx.interrupt_fault = intr_fault;
         self.gfx.fifo_read = fifo_read;
         self.gfx.child_doorbell_rung = child_rung;
+        self.gfx.version_live = version_live;
     }
 
     /// Queue the engine-unpin for a dying linear cache entry that still owns a

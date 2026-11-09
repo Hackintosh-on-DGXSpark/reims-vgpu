@@ -174,6 +174,12 @@ pub fn gfx_write<H: HostMemory + HostOps>(
                 ));
             }
             state.gfx.version = negotiated;
+            // `device_gfx_write` has already published it for a write from a
+            // vCPU; this covers every other writer.
+            state
+                .gfx
+                .version_live
+                .store(negotiated, std::sync::atomic::Ordering::Release);
             // Take the guest-RAM import here rather than letting the first
             // gather take it. This handshake is the guest driver's first act
             // and its display pipe does not exist yet, so the seconds the
