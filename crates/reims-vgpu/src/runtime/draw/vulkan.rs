@@ -1306,6 +1306,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
     }
 
     if let Some(mid) = surface {
+        state.note_surface_read_by_host(mid);
         // A condemned incarnation is bound from its resident or not at all:
         // every rung below reads its pages, seeds from them or merges into them.
         if mapper::wire_watch::guest_pages_condemned(state, mid) {
@@ -10444,7 +10445,8 @@ fn store_surface_resident<M: HostMemory + HostOps>(
     // and makes correctness depend on the texture identity outliving the
     // command that synchronized it. Publish the existing alias eagerly and let
     // the completion stamp carry its queue ordering.
-    let lazy = crate::runtime::writeback_debt::lazy_writeback_enabled();
+    let lazy = crate::runtime::writeback_debt::lazy_writeback_enabled()
+        && state.surface_read_by_host(mapping_id);
     let plan = surface_store_plan(lazy, guest_store.guest_backed);
     if plan == SurfaceStorePlan::DeferCopy
         && arm_surface_writeback_debt(state, host, mapping_id, identity, width, height)
@@ -11588,6 +11590,27 @@ mod vulkan_split_tests {
             "the bump has to change what a second derivation answers or this \
              test cannot see the defect"
         );
+
+        // A surface nobody but the guest reads is not deferred: the guest
+        // reads an IOSurface with no command to ask for it. There is no engine
+        // here to copy from, so the Store reports the frame unwritten.
+        assert!(
+            !store_surface_resident(
+                &mut state,
+                &mut host,
+                &drawn,
+                mid,
+                w,
+                h,
+                GuestStoreStatus::default(),
+            ),
+            "a surface this device has not read is copied, not deferred"
+        );
+        assert!(state.pending_writebacks.get(mid).is_none());
+
+        // The compositor samples it, at the generation it now has.
+        state.note_surface_read_by_host(mid);
+        assert!(state.surface_read_by_host(mid));
 
         assert!(
             store_surface_resident(

@@ -5186,6 +5186,11 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
                     state.pending.child_mask |= bit;
                     break;
                 }
+                if is_display_present(packet.opcode) {
+                    if let Some(mapping) = present_surface_id(packet.opcode, &packet.payload) {
+                        state.note_surface_read_by_host(mapping);
+                    }
+                }
                 let watched_present = is_display_present(packet.opcode)
                     && crate::runtime::mapper::wire_watch::enabled();
                 let present_started_us = if watched_present {

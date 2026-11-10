@@ -2816,6 +2816,12 @@ pub struct DeviceState {
     /// so the drain must not write them a second time. See
     /// [`crate::runtime::reply_fence`].
     pub heap_queries_answered: std::collections::HashSet<(u32, u32)>,
+    /// Surface mappings this device has itself read, sampled in a draw or
+    /// presented, as mapping id to the map generation it was read at. A render
+    /// Store into one of these may stay in the host image; into any other it
+    /// is copied to the guest's pages at once. See
+    /// [`Self::surface_read_by_host`].
+    pub surfaces_read_by_host: HashMap<u32, u32>,
     /// Total stale views the reuse verify caught (fail-logged as
     /// `gva_view_stale`; the view self-heals via retire + rebuild).
     pub view_stale_reads: u64,
@@ -2915,6 +2921,7 @@ impl DeviceState {
             completion_stamp_seq: 0,
             stamp_ledger: Default::default(),
             heap_queries_answered: Default::default(),
+            surfaces_read_by_host: Default::default(),
             gva_resident_backing: std::collections::BTreeMap::new(),
             guest_linear_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),
             #[cfg(feature = "backend-vulkan")]
@@ -4028,6 +4035,37 @@ impl DeviceState {
     /// Also advances [`MappingEntry::surface_content_epoch`], so every one of
     /// this crate's guest-page writers keeps that epoch closed for free — the
     /// completeness property the type-11 `LoadFromTarget` gate rests on.
+    /// Record that this device read `mapping_id` itself: a draw sampled it or
+    /// the display presented it.
+    pub fn note_surface_read_by_host(&mut self, mapping_id: u32) {
+        let Some(generation) = self.mappings.get(&mapping_id).map(|m| m.map_generation) else {
+            return;
+        };
+        if self.surfaces_read_by_host.insert(mapping_id, generation) != Some(generation)
+            && self.surfaces_read_by_host.len() > 4096
+        {
+            let mappings = &self.mappings;
+            self.surfaces_read_by_host
+                .retain(|id, at| mappings.get(id).is_some_and(|m| m.map_generation == *at));
+        }
+    }
+
+    /// Whether this device has read `mapping_id` since the guest mapped it.
+    ///
+    /// The guest reads an IOSurface it rendered into with no command at all:
+    /// on Apple's host the attachment is the surface's own memory. So a Store
+    /// may only stay in the host image for a surface whose reader is this
+    /// device, a window backing the compositor samples or a framebuffer the
+    /// display presents. macOS 27.2's iconservicesagent draws each icon into
+    /// a surface and reads it back; left in the host image, every icon read as
+    /// transparent and the Dock showed placeholders.
+    pub fn surface_read_by_host(&self, mapping_id: u32) -> bool {
+        self.surfaces_read_by_host
+            .get(&mapping_id)
+            .zip(self.mappings.get(&mapping_id))
+            .is_some_and(|(at, m)| *at == m.map_generation)
+    }
+
     pub fn mark_mapping_written(&mut self, mapping_id: u32) -> u32 {
         let seq = self.next_validity_seq();
         let Some(m) = self.mappings.get_mut(&mapping_id) else {
