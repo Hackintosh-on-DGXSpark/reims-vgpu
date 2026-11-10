@@ -332,6 +332,32 @@ fn decode_texture_view_hop_reasoned<M: HostMemory + HostOps>(
     Ok((view.base_texture_ref, level, swizzle, pixel_format))
 }
 
+/// Whether a type-8 object is a texture of its own, buffer-backed (opcode 9 or
+/// its wide form) or placed in a heap, rather than a view. Those share the
+/// tag, and end a view chain as its base.
+fn is_own_texture<M: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    texture_ref: u32,
+) -> bool {
+    use crate::runtime::decode::resource::{
+        texture_type8_opcode, HEAP_TEXTURE_OPCODE, HEAP_TEXTURE_WIDE_OPCODE,
+        TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE, TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE_WIDE,
+    };
+    objects::resolve_resource(state, host, task_id, texture_ref)
+        .ok()
+        .is_some_and(|resource| {
+            matches!(
+                texture_type8_opcode(&resource.descriptor),
+                Some(TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE)
+                    | Some(TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE_WIDE)
+                    | Some(HEAP_TEXTURE_OPCODE)
+                    | Some(HEAP_TEXTURE_WIDE_OPCODE)
+            )
+        })
+}
+
 /// Resolve type-8 view to non-view base + mip + format override + swizzle.
 ///
 /// The `Result` carries a specific failure slug (`reason=view_resolve` sub-case)
@@ -359,7 +385,9 @@ pub(crate) fn resolve_texture_view_reasoned<M: HostMemory + HostOps>(
             // visibly (same as a one-hop miss on an unmapped base).
             break;
         };
-        if entry.object_type != OBJECT_TYPE_TEXTURE_VIEW {
+        if entry.object_type != OBJECT_TYPE_TEXTURE_VIEW
+            || is_own_texture(state, host, task_id, base)
+        {
             break;
         }
         depth += 1;
@@ -372,7 +400,9 @@ pub(crate) fn resolve_texture_view_reasoned<M: HostMemory + HostOps>(
 
     // Final base must not still be a type-8 view past the chain cap.
     if let Some(entry) = objects::lookup_list_entry(state, host, task_id, base) {
-        if entry.object_type == OBJECT_TYPE_TEXTURE_VIEW {
+        if entry.object_type == OBJECT_TYPE_TEXTURE_VIEW
+            && !is_own_texture(state, host, task_id, base)
+        {
             return Err(TextureViewDecline::ChainOverflow { base, depth });
         }
     }

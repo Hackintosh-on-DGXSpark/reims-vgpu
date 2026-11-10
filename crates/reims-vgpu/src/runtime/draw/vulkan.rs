@@ -1190,6 +1190,66 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
         ));
     }
 
+    // A view over a buffer-backed or heap texture samples what that texture
+    // does. Either has one level. A view that renames a buffer's texels, A8
+    // over R8 as RenderBox does for its masks, reads the same bytes under the
+    // view's format; any other override would need a conversion nothing here
+    // makes. The view's swizzle is the bind's to apply, as for every view.
+    let is_view = resource
+        .as_deref()
+        .map(|resource| resource.entry.object_type)
+        .or_else(|| {
+            objects::lookup_list_entry(state, host, task_id, texture_ref)
+                .map(|entry| entry.object_type)
+        })
+        == Some(OBJECT_TYPE_TEXTURE_VIEW);
+    if is_view {
+        if let Some(view) = resolve_texture_view(state, host, task_id, texture_ref) {
+            let base = view.base_texture_ref;
+            if let Some(mut bt) = buffer_texture_descriptor(state, host, task_id, base, None) {
+                let own = bt.desc.pixel_format;
+                let format = view.pixel_format.unwrap_or(own);
+                let (width, _) = (bt.desc.width, bt.desc.height);
+                let same_texels = format == own
+                    || pixel_format::tight_row_bytes(width, format)
+                        .is_some_and(|row| Some(row) == pixel_format::tight_row_bytes(width, own));
+                if view.level != 0 || !same_texels {
+                    crate::runtime::drain::note_store_route("buftex_view_refused");
+                    return None;
+                }
+                crate::runtime::drain::note_store_route("buftex_view");
+                bt.desc.pixel_format = format;
+                let (w, h, rgba) = load_buffer_texture_rgba(state, host, task_id, base, &bt)?;
+                return Some((
+                    w,
+                    h,
+                    0,
+                    SampledSourceRequest::Bytes(
+                        std::sync::Arc::new(rgba),
+                        None,
+                        SampledByteFormat::from_source(TexelLayout::Rgba8, format),
+                        crate::backend::vulkan::engine::SampledByteOrigin::BufferBackedTexture,
+                    ),
+                ));
+            }
+            let heap = objects::resolve_resource(state, host, task_id, base)
+                .ok()
+                .and_then(|resource| heap_texture_of(&resource.descriptor));
+            if let Some(heap) = heap {
+                if view.level != 0 || view.pixel_format.is_some_and(|f| f != heap.format) {
+                    crate::runtime::drain::note_store_route("heaptex_view_refused");
+                    crate::observe::fail(format!(
+                        "heaptex_view_refused ref={texture_ref} base={base} level={} view_fmt={:?} base_fmt={:#x}",
+                        view.level, view.pixel_format, heap.format
+                    ));
+                    return None;
+                }
+                crate::runtime::drain::note_store_route("heaptex_view");
+                return resolve_sampled_source(state, host, task_id, base, None, may_bind_resident);
+            }
+        }
+    }
+
     // The object list names exactly ONE surface for a sampled ref. Which one is
     // decided by the entry's `object_type`, and the cases below are distinct
     // values of that single u8 field, so they cannot both apply:

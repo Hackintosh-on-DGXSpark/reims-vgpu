@@ -7213,3 +7213,68 @@ fn the_buffer_backed_texture_rail_pays_for_its_texture_reference() {
         "the sampled bind never asked the ledger what its texture reference owed"
     );
 }
+
+/// A view over a buffer-backed texture ends its chain at that texture.
+///
+/// The opcode-9 record shares the type-8 tag with a view, and the chain walk
+/// read it as one more hop and refused it (`res_texture_view_opcode`). macOS 27
+/// samples such views when it draws icons, and every one of those draws was
+/// dropped. The base below is the record a 27.2 guest sent, refs and all.
+#[test]
+fn a_view_chain_ends_at_a_buffer_backed_texture() {
+    use crate::contract::endian::{st16, st32, st64};
+    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::runtime::decode::resource::{
+        list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_TEXTURE_VIEW,
+        TEXTURE_VIEW_DESC_BASE_REF, TEXTURE_VIEW_DESC_LEN, TEXTURE_VIEW_DESC_LEVEL_BASE,
+        TEXTURE_VIEW_DESC_LEVEL_COUNT, TEXTURE_VIEW_DESC_OPCODE, TEXTURE_VIEW_DESC_PIXEL_FORMAT,
+        TEXTURE_VIEW_DESC_SLICE_BASE, TEXTURE_VIEW_DESC_SLICE_COUNT, TEXTURE_VIEW_DESC_TEXTURE_REF,
+        TEXTURE_VIEW_DESC_TEXTURE_TYPE, TEXTURE_VIEW_MIN_RANGED, TEXTURE_VIEW_MTL_TYPE_2D,
+        TEXTURE_VIEW_OPCODE_RANGED,
+    };
+
+    fn write_type8(host: &mut FakeHost, state: &DeviceState, object_ref: u32, gva: u64, desc: &[u8]) {
+        write_task_gva_arm64e(&mut *host, &state.tasks[1], gva, desc);
+        let off = list_object_entry_offset(object_ref, 256).unwrap();
+        let mut entry = [0u8; OBJECT_LIST_ENTRY_LEN];
+        st32(&mut entry[0..], (OBJECT_TYPE_TEXTURE_VIEW as u32) | ((desc.len() as u32) << 8));
+        entry[4..12].copy_from_slice(&gva.to_le_bytes());
+        write_task_gva_arm64e(&mut *host, &state.tasks[1], off, &entry);
+    }
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+    assert!(state.set_object_list(1, 0, 256));
+
+    // `newTextureWithBuffer:` record 0x76 over buffer 0x75, 104x104, as sent.
+    let buffer_texture: Vec<u8> = (0..64)
+        .map(|i| {
+            u8::from_str_radix(
+                &"090000004000000076000000750000000000000000000000000100000000000042170a0068000000680000000100000001000100010010000000000000000000"[i * 2..i * 2 + 2],
+                16,
+            )
+            .unwrap()
+        })
+        .collect();
+    write_type8(&mut host, &state, 0x76, 0x280, &buffer_texture);
+
+    let len = TEXTURE_VIEW_MIN_RANGED;
+    let mut view = vec![0u8; len];
+    st32(&mut view[TEXTURE_VIEW_DESC_OPCODE..], TEXTURE_VIEW_OPCODE_RANGED);
+    st32(&mut view[TEXTURE_VIEW_DESC_LEN..], len as u32);
+    st32(&mut view[TEXTURE_VIEW_DESC_TEXTURE_REF..], 211);
+    st32(&mut view[TEXTURE_VIEW_DESC_BASE_REF..], 0x76);
+    st16(&mut view[TEXTURE_VIEW_DESC_PIXEL_FORMAT..], MTL_FORMAT_BGRA8_UNORM);
+    st16(&mut view[TEXTURE_VIEW_DESC_TEXTURE_TYPE..], TEXTURE_VIEW_MTL_TYPE_2D);
+    st64(&mut view[TEXTURE_VIEW_DESC_LEVEL_BASE..], 0);
+    st64(&mut view[TEXTURE_VIEW_DESC_LEVEL_COUNT..], 1);
+    st64(&mut view[TEXTURE_VIEW_DESC_SLICE_BASE..], 0);
+    st64(&mut view[TEXTURE_VIEW_DESC_SLICE_COUNT..], 1);
+    write_type8(&mut host, &state, 211, 0x300, &view);
+
+    let resolved = resolve_texture_view_reasoned(&state, &host, 1, 211)
+        .expect("a view over a buffer-backed texture must resolve");
+    assert_eq!(resolved.base_texture_ref, 0x76);
+    assert_eq!(resolved.level, 0);
+}
