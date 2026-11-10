@@ -1197,6 +1197,15 @@ pub const DEVICE_INFO_KEY_RGB10A2_GAMMA: u32 = 8;
 /// out on, so it is a promise about what this device can address rather than a
 /// capability it can decline later.
 ///
+/// **16, the number the guest already uses elsewhere.** macOS 27.2 answers
+/// `minimumLinearTextureAlignmentForPixelFormat:` from a 16 of its own, the
+/// alignment of the Apple GPUs it is built for, and checks the rows a caller
+/// then asks for against this key. Served 256, the two disagreed: RenderBox
+/// laid a 100 pixel RGBA8 row out on 400 bytes as it was told it could, Metal
+/// refused it (`bytesPerRow (112) must be aligned to 256 bytes`), and
+/// iconservicesagent drew no icon. Every buffer texture command carries its
+/// own row pitch, so nothing in this device depends on the larger number.
+///
 /// Distinct from [`crate::contract::iosurface_pages::ROW_BYTES_ALIGN`], which is
 /// an IOSurface row estimate for counting pages and is deliberately not a pitch.
 /// Do not relate the two: one is Metal's linear-texture rule and the other is
@@ -1473,7 +1482,7 @@ pub const DEVICE_INFO_CAPS: &[(u32, u32)] = &[
         crate::contract::draw::EXECUTABLE_PRIMITIVE_TYPES,
     ),
     (DEVICE_INFO_KEY_DUAL_PLANE_TEXTURES, 1),
-    (DEVICE_INFO_KEY_LINEAR_TEXTURE_ALIGN, 256),
+    (DEVICE_INFO_KEY_LINEAR_TEXTURE_ALIGN, 16),
     (DEVICE_INFO_KEY_HEAPS, 1),
     (DEVICE_INFO_KEY_HEAP_BUFFER_GRANULARITY, 32),
     (DEVICE_INFO_KEY_HEAP_TEXTURES, 1),
