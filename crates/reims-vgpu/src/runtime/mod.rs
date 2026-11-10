@@ -108,6 +108,8 @@ pub mod present_identity;
 /// edit of them requires — the direction that is ordered is the map.
 pub mod range_coverage;
 pub mod released_pages;
+/// The reply commands a child FIFO holds when its doorbell rings.
+pub mod reply_fence;
 /// Type-11 mappings that claim one guest page, held out of writing until the
 /// guest says which one it released.
 pub mod surface_quarantine;

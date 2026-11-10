@@ -110,6 +110,11 @@ struct BoundDevice {
     /// Lock-free clone of the negotiated protocol version (0x1034); see
     /// [`crate::model::GfxRegs::version_live`].
     version_live: Arc<AtomicU32>,
+    /// Lock-free clone of the root page (0x101c), the guest page size, and the
+    /// child rings the doorbell path has read; see [`wait_for_replies`].
+    root_page_live: Arc<AtomicU32>,
+    page_shift: u32,
+    reply_rings: Mutex<HashMap<u32, crate::runtime::reply_fence::RingPages>>,
     /// The IOSurface mapper registers, read by a vCPU with no lock; published
     /// by whoever changes them under the device lock.
     iosfc_live: Arc<crate::model::IosfcLive>,
@@ -180,6 +185,79 @@ fn schedule_device(slot: &BoundDevice) {
 fn publish_present_boundary(slot: &BoundDevice, frame_flush_seen: bool) {
     if frame_flush_seen {
         slot.present_boundary_seen.store(true, Ordering::Release);
+    }
+}
+
+/// How long a doorbell waits to answer a reply command. The vCPU holds the BQL
+/// here, so the wait is bounded: past it the guest reads zeros, as it did for
+/// every such command before.
+const REPLY_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Answer the reply commands a child ring holds before its doorbell returns;
+/// see [`crate::runtime::reply_fence`]. A ring without one, nearly every
+/// doorbell, costs three register reads and returns.
+///
+/// This is the one place a vCPU waits for the device lock. It waits for the
+/// drain's tranche to end, not for the channel: the answer is written from
+/// here, so a channel held behind a shader translation does not hold it up.
+/// Only a command this cannot answer, its reply address not mapped yet, waits
+/// for the drain to reach it.
+fn wait_for_replies(slot: &BoundDevice, channel: u32) {
+    let Some(ops) = slot.ops else {
+        return;
+    };
+    let root_page = slot.root_page_live.load(Ordering::Acquire);
+    let mut scratch = VecDeque::new();
+    let peek = QemuHost::new(&ops, &mut scratch, &slot.prompt_actions);
+    let pending = {
+        let mut rings = slot.reply_rings.lock();
+        crate::runtime::reply_fence::find(
+            &peek,
+            root_page,
+            slot.page_shift,
+            channel,
+            rings.entry(channel).or_default(),
+        )
+    };
+    let Some(pending) = pending else {
+        return;
+    };
+    let started = std::time::Instant::now();
+    let pause = || {
+        if started.elapsed() < std::time::Duration::from_micros(200) {
+            std::hint::spin_loop();
+        } else {
+            std::thread::sleep(std::time::Duration::from_micros(50));
+        }
+    };
+    let mut answered = None;
+    while answered.is_none() && started.elapsed() < REPLY_WAIT {
+        match try_hold(&slot.inner, Holder::VcpuGfxWrite) {
+            Some(mut inner) => {
+                let DeviceInner { device, actions } = &mut *inner;
+                let mut host = QemuHost::new(&ops, actions, &slot.prompt_actions);
+                answered = Some(crate::runtime::drain::answer_heap_queries(
+                    &mut device.state,
+                    &mut host,
+                    channel,
+                    &pending.queries,
+                ));
+            }
+            None => pause(),
+        }
+    }
+    if answered == Some(true) {
+        return;
+    }
+    while !pending.drained(&peek) {
+        if started.elapsed() >= REPLY_WAIT {
+            crate::observe::fail(format!(
+                "reply_wait_timeout ch={channel} queries={} answered_here={answered:?}",
+                pending.queries.len()
+            ));
+            return;
+        }
+        pause();
     }
 }
 
@@ -255,6 +333,7 @@ pub fn device_create(ops: Option<ReimsVgpuHostOps>, page_shift: u32) -> Option<u
     let intr_fault = Arc::clone(&dev.state.gfx.interrupt_fault);
     let fifo_read_live = Arc::clone(&dev.state.gfx.fifo_read);
     let version_live = Arc::clone(&dev.state.gfx.version_live);
+    let root_page_live = Arc::clone(&dev.state.gfx.root_page_live);
     let iosfc_live = Arc::clone(&dev.state.iosfc.live);
     DEVICES.lock().insert(
         id,
@@ -273,6 +352,9 @@ pub fn device_create(ops: Option<ReimsVgpuHostOps>, page_shift: u32) -> Option<u
             intr_fault,
             fifo_read_live,
             version_live,
+            root_page_live,
+            page_shift,
+            reply_rings: Mutex::new(HashMap::new()),
             iosfc_live,
             present_action_pending: AtomicBool::new(false),
             present_boundary_seen: AtomicBool::new(false),
@@ -482,6 +564,7 @@ pub fn device_gfx_write(id: u64, offset: u64, data: u64, size: u32) -> bool {
                     .fetch_or(1u32 << channel, Ordering::AcqRel);
                 crate::runtime::drain::note_doorbell_lock_free();
                 schedule_device(&slot);
+                wait_for_replies(&slot, channel);
             }
             return true;
         }

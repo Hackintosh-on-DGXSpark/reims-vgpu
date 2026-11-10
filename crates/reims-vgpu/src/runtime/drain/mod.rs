@@ -2472,6 +2472,30 @@ fn reply_compute_info<H: HostMemory + HostOps>(
     true
 }
 
+/// Answer the heap queries a vCPU found in `channel`'s ring when it rang the
+/// doorbell, ahead of the drain. Returns whether every one now has its reply;
+/// one that could not be answered here is left for the drain.
+pub(crate) fn answer_heap_queries<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    channel: u32,
+    queries: &[crate::runtime::reply_fence::Query],
+) -> bool {
+    let mut all = true;
+    for query in queries {
+        let key = (channel, query.head);
+        if state.heap_queries_answered.contains(&key) {
+            continue;
+        }
+        if reply_heap_texture_size_and_align(state, host, &query.payload) {
+            state.heap_queries_answered.insert(key);
+        } else {
+            all = false;
+        }
+    }
+    all
+}
+
 fn reply_heap_texture_size_and_align<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut H,
@@ -4736,7 +4760,10 @@ fn process_child_packet<H: HostMemory + HostOps>(
             }
         }
         CHILD_OP_HEAP_TEXTURE_SIZE_AND_ALIGN => {
-            let _ = reply_heap_texture_size_and_align(state, host, &packet.payload);
+            let head = packet.next_head.wrapping_sub(packet.total_size);
+            if !state.heap_queries_answered.remove(&(channel_id, head)) {
+                let _ = reply_heap_texture_size_and_align(state, host, &packet.payload);
+            }
         }
         // The one packet that says a cached page list has gone stale, and the
         // only arm that consumes it. A second handler used to sit inside the

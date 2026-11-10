@@ -408,6 +408,11 @@ pub struct GfxRegs {
     /// The `Arc` is shared with the device registry slot and survives reset,
     /// like the four above.
     pub version_live: Arc<AtomicU32>,
+    /// Lock-free clone of [`Self::root_page`], for the vCPU that rings a child
+    /// doorbell and must find that channel's ring with no device lock; see
+    /// [`crate::runtime::reply_fence`]. Shared with the registry slot, kept
+    /// across reset and cleared by it, like the five above.
+    pub root_page_live: Arc<AtomicU32>,
     pub efi_display: u32,
     pub efi_mode_select: u32,
     pub efi_fb_start: u64,
@@ -435,6 +440,7 @@ impl Default for GfxRegs {
             interrupt_fault: Arc::new(AtomicU32::new(0)),
             child_doorbell_rung: Arc::new(AtomicU32::new(0)),
             version_live: Arc::new(AtomicU32::new(0)),
+            root_page_live: Arc::new(AtomicU32::new(0)),
             efi_display: 0,
             efi_mode_select: 0,
             efi_fb_start: 0,
@@ -2804,6 +2810,12 @@ pub struct DeviceState {
     /// unmet waits are honest. Feeds no verdict — see
     /// [`crate::runtime::drain::StampLedger`].
     pub stamp_ledger: crate::runtime::drain::StampLedger,
+    /// The `CmdHeapTextureSizeAndAlign` packets a vCPU answered from its
+    /// doorbell, as (channel, packet head), until the drain reaches each and
+    /// leaves it alone. The guest may have reused the reply's bytes by then,
+    /// so the drain must not write them a second time. See
+    /// [`crate::runtime::reply_fence`].
+    pub heap_queries_answered: std::collections::HashSet<(u32, u32)>,
     /// Total stale views the reuse verify caught (fail-logged as
     /// `gva_view_stale`; the view self-heals via retire + rebuild).
     pub view_stale_reads: u64,
@@ -2902,6 +2914,7 @@ impl DeviceState {
             pending_writebacks: crate::runtime::writeback_debt::PendingWritebacks::default(),
             completion_stamp_seq: 0,
             stamp_ledger: Default::default(),
+            heap_queries_answered: Default::default(),
             gva_resident_backing: std::collections::BTreeMap::new(),
             guest_linear_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),
             #[cfg(feature = "backend-vulkan")]
@@ -3231,12 +3244,14 @@ impl DeviceState {
         let fifo_read = Arc::clone(&self.gfx.fifo_read);
         let child_rung = Arc::clone(&self.gfx.child_doorbell_rung);
         let version_live = Arc::clone(&self.gfx.version_live);
+        let root_page_live = Arc::clone(&self.gfx.root_page_live);
         intr_disp.store(0, Ordering::Release);
         intr_gpu.store(0, Ordering::Release);
         intr_fault.store(0, Ordering::Release);
         fifo_read.store(0, Ordering::Release);
         // A reset forgets the negotiation; the guest negotiates again.
         version_live.store(0, Ordering::Release);
+        root_page_live.store(0, Ordering::Release);
         // Cleared as well as kept: a reset drops every channel, so a bit rung
         // before it names a channel that no longer exists.
         child_rung.store(0, Ordering::Release);
@@ -3259,6 +3274,7 @@ impl DeviceState {
         self.gfx.fifo_read = fifo_read;
         self.gfx.child_doorbell_rung = child_rung;
         self.gfx.version_live = version_live;
+        self.gfx.root_page_live = root_page_live;
     }
 
     /// Queue the engine-unpin for a dying linear cache entry that still owns a

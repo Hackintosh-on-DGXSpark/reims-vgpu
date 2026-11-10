@@ -140,7 +140,13 @@ pub fn gfx_write<H: HostMemory + HostOps>(
                 .interrupt_status_gpu
                 .fetch_and(!val, std::sync::atomic::Ordering::AcqRel);
         }
-        GFX_REG_ROOT_PAGE => state.gfx.root_page = val,
+        GFX_REG_ROOT_PAGE => {
+            state.gfx.root_page = val;
+            state
+                .gfx
+                .root_page_live
+                .store(val, std::sync::atomic::Ordering::Release);
+        }
         GFX_REG_CHILD_DOORBELL | GFX_REG_CHILD_REPLAY_DOORBELL => {
             if crate::model::accept_child_channel(val, "mmio_child_doorbell") {
                 state.active_child_mask |= 1u32 << val;
