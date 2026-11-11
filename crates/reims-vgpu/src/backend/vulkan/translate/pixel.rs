@@ -164,6 +164,13 @@ pub fn translate(mtl: u16) -> Result<PixelFormat, TranslateReason> {
         p::MTL_FORMAT_RGBA16_UNORM => linear(vk::Format::R16G16B16A16_UNORM, 8),
         p::MTL_FORMAT_RGBA16_UINT => linear(vk::Format::R16G16B16A16_UINT, 8),
         p::MTL_FORMAT_RGBA16_FLOAT => linear(vk::Format::R16G16B16A16_SFLOAT, 8),
+        p::MTL_FORMAT_RGB10A8_2P_XR10
+        | p::MTL_FORMAT_RGB10A8_2P_XR10_SRGB
+        | p::MTL_FORMAT_BGR10_XR
+        | p::MTL_FORMAT_BGR10_XR_SRGB => linear(vk::Format::R16G16B16A16_SFLOAT, 4),
+        p::MTL_FORMAT_BGRA10_XR | p::MTL_FORMAT_BGRA10_XR_SRGB => {
+            linear(vk::Format::R16G16B16A16_SFLOAT, 8)
+        }
         p::MTL_FORMAT_RGBA32_UINT => linear(vk::Format::R32G32B32A32_UINT, 16),
         p::MTL_FORMAT_RGBA32_FLOAT => linear(vk::Format::R32G32B32A32_SFLOAT, 16),
         p::MTL_FORMAT_DEPTH16_UNORM => linear(vk::Format::D16_UNORM, 2),
@@ -215,6 +222,13 @@ pub fn sampled_pixels(
     mtl: u16,
 ) -> Result<(TexelLayout, Option<TranslateReason>, SwizzlePlan), TranslateReason> {
     let f = translate(mtl)?;
+    // XR10 guest memory stores 10-bit fixed-point (plus a separate Plane 1 alpha
+    // on 550/551), never raw IEEE binary16 texels; decline raw guest-RAM import
+    // so sampled loads decode into `Rgba16Float` on the CPU upload rail while
+    // GPU-resident targets still sample `R16G16B16A16_SFLOAT` directly.
+    if pixel_format::is_xr10(mtl) {
+        return Err(TranslateReason::NoSampledLayout(mtl));
+    }
     // A format whose Metal channels do not sit identically on its Vulkan
     // channels needs a component mapping on the view to sample correctly.
     let layout = match f.linear_vk {
@@ -1335,6 +1349,42 @@ mod tests {
             4,
             TransferFunction::Linear,
         ),
+        (
+            p::MTL_FORMAT_RGB10A8_2P_XR10,
+            vk::Format::R16G16B16A16_SFLOAT,
+            4,
+            TransferFunction::Linear,
+        ),
+        (
+            p::MTL_FORMAT_RGB10A8_2P_XR10_SRGB,
+            vk::Format::R16G16B16A16_SFLOAT,
+            4,
+            TransferFunction::Linear,
+        ),
+        (
+            p::MTL_FORMAT_BGRA10_XR,
+            vk::Format::R16G16B16A16_SFLOAT,
+            8,
+            TransferFunction::Linear,
+        ),
+        (
+            p::MTL_FORMAT_BGRA10_XR_SRGB,
+            vk::Format::R16G16B16A16_SFLOAT,
+            8,
+            TransferFunction::Linear,
+        ),
+        (
+            p::MTL_FORMAT_BGR10_XR,
+            vk::Format::R16G16B16A16_SFLOAT,
+            4,
+            TransferFunction::Linear,
+        ),
+        (
+            p::MTL_FORMAT_BGR10_XR_SRGB,
+            vk::Format::R16G16B16A16_SFLOAT,
+            4,
+            TransferFunction::Linear,
+        ),
     ];
 
     /// The table is total over the contract: every defined value maps, with the
@@ -2003,6 +2053,12 @@ mod tests {
                 // half-float primary was not.
                 p::MTL_FORMAT_RGBA16_UNORM,
                 p::MTL_FORMAT_RGBA16_FLOAT,
+                p::MTL_FORMAT_RGB10A8_2P_XR10,
+                p::MTL_FORMAT_RGB10A8_2P_XR10_SRGB,
+                p::MTL_FORMAT_BGRA10_XR,
+                p::MTL_FORMAT_BGRA10_XR_SRGB,
+                p::MTL_FORMAT_BGR10_XR,
+                p::MTL_FORMAT_BGR10_XR_SRGB,
             ]
         );
     }

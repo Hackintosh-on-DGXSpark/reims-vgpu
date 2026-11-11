@@ -338,6 +338,7 @@ pub fn query_size_and_align(desc: &TextureDescriptor) -> Result<SizeAndAlign, Qu
     }
     let bpp = crate::contract::pixel_format::bytes_per_pixel(desc.pixel_format)
         .ok_or(QueryError::UnknownPixelFormat)?;
+    let alpha_bpp = crate::contract::pixel_format::alpha_plane_bytes_per_pixel(desc.pixel_format);
     let layers = u64::from(desc.array_length.max(1)) * faces * u64::from(desc.sample_count.max(1));
     let mut size = 0u64;
     for level in 0..u32::from(desc.mipmap_level_count.max(1)).min(32) {
@@ -357,6 +358,19 @@ pub fn query_size_and_align(desc: &TextureDescriptor) -> Result<SizeAndAlign, Qu
         size = size
             .checked_add(level_size)
             .ok_or(QueryError::ZeroRequirement)?;
+        if let Some(alpha_bpp) = alpha_bpp {
+            let alpha_row =
+                (extent(desc.width) * u64::from(alpha_bpp)).div_ceil(ROW_ALIGN) * ROW_ALIGN;
+            let alpha_level_size = alpha_row
+                .checked_mul(extent(desc.height))
+                .and_then(|n| n.checked_mul(depth))
+                .and_then(|n| n.checked_mul(layers))
+                .map(|n| n.div_ceil(PAGE) * PAGE)
+                .ok_or(QueryError::ZeroRequirement)?;
+            size = size
+                .checked_add(alpha_level_size)
+                .ok_or(QueryError::ZeroRequirement)?;
+        }
     }
     if size == 0 {
         return Err(QueryError::ZeroRequirement);
@@ -519,6 +533,13 @@ mod tests {
         // Six faces: 30 720 bytes at level 0 and 7 680 at level 1.
         desc.texture_type = 5;
         assert_eq!(query_size_and_align(&desc).unwrap().size, 3 * 16384);
+        // Two-plane `RGB10A8_2P_XR10` (`550`) reserves a page-aligned Plane 1
+        // alpha allocation alongside Plane 0 so adjacent heap textures cannot
+        // overlap Plane 1.
+        desc.texture_type = 2;
+        desc.mipmap_level_count = 1;
+        desc.pixel_format = crate::contract::pixel_format::MTL_FORMAT_RGB10A8_2P_XR10;
+        assert_eq!(query_size_and_align(&desc).unwrap().size, 2 * 16384);
     }
 
     #[cfg(target_os = "macos")]

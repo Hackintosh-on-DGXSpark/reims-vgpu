@@ -879,6 +879,122 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
     crate::runtime::writeback_debt::settle_for_texture(
         state, host, task_id, texture_ref, gva, span, site,
     );
+    if pixel_format::is_xr10(sample_fmt) {
+        let alpha_plane = (level == 0 && pixel_format::is_two_plane_xr10(sample_fmt))
+            .then(|| tex.alpha_plane_gva(state.page_shift))
+            .flatten();
+        if let Some((alpha_gva, alpha_layout)) = alpha_plane {
+            if alpha_gva == 0
+                || alpha_layout.width != w
+                || alpha_layout.height != h
+                || alpha_layout.planes() != planes
+                || alpha_layout.row_stride > u64::from(u32::MAX)
+            {
+                return Err(R::SizeOverflow);
+            }
+            if alpha_layout.row_stride < u64::from(w) {
+                return Err(R::RowStrideBelowTight {
+                    stride: alpha_layout.row_stride,
+                    tight: w,
+                });
+            }
+            let alpha_span = alpha_layout.slice_read_span(w).ok_or(R::SizeOverflow)?;
+            let alpha_end = alpha_layout.offset.saturating_add(alpha_span);
+            if tex.allocation_size != 0 && alpha_end > tex.allocation_size {
+                return Err(R::SpanExceedsAllocation {
+                    end: alpha_end,
+                    allocation: tex.allocation_size,
+                });
+            }
+            crate::runtime::writeback_debt::settle_for_texture(
+                state,
+                host,
+                task_id,
+                texture_ref,
+                alpha_gva,
+                alpha_span,
+                site,
+            );
+        }
+        let (out_layout, out_bpp) = if native.float16 {
+            (TexelLayout::Rgba16Float, pixel_format::RGBA16F_BPP as usize)
+        } else {
+            (TexelLayout::Rgba8, RGBA8_BPP as usize)
+        };
+        let rows = (h as usize)
+            .checked_mul(planes as usize)
+            .ok_or(R::SizeOverflow)?;
+        let out_row = (w as usize).checked_mul(out_bpp).ok_or(R::SizeOverflow)?;
+        let out_len = out_row.checked_mul(rows).ok_or(R::SizeOverflow)?;
+        let mut out = vec![0u8; out_len];
+        let mut row_p0 = vec![0u8; tight as usize];
+        let mut row_p1 = alpha_plane.map(|_| vec![0u8; w as usize]);
+        for row_index in 0..rows {
+            let p0_gva = (row_index as u64)
+                .checked_mul(bpr)
+                .and_then(|off| gva.checked_add(off))
+                .ok_or(R::SizeOverflow)?;
+            gva_mem::read_task_gva_by_id(
+                host,
+                &state.tasks,
+                task_id,
+                p0_gva,
+                &mut row_p0,
+                state.page_shift,
+            )
+            .map_err(|_| {
+                if bpr_u32 == tight {
+                    R::TightImageUnreadable
+                } else {
+                    R::PaddedRowUnreadable {
+                        row: u32::try_from(row_index).unwrap_or(u32::MAX),
+                    }
+                }
+            })?;
+            if let (Some((alpha_gva, alpha_layout)), Some(p1)) =
+                (alpha_plane, row_p1.as_deref_mut())
+            {
+                let p1_gva = (row_index as u64)
+                    .checked_mul(alpha_layout.row_stride)
+                    .and_then(|off| alpha_gva.checked_add(off))
+                    .ok_or(R::SizeOverflow)?;
+                gva_mem::read_task_gva_by_id(
+                    host,
+                    &state.tasks,
+                    task_id,
+                    p1_gva,
+                    p1,
+                    state.page_shift,
+                )
+                .map_err(|_| R::PaddedRowUnreadable {
+                    row: u32::try_from(row_index).unwrap_or(u32::MAX),
+                })?;
+            }
+            let dst = &mut out[row_index * out_row..(row_index + 1) * out_row];
+            let ok = if native.float16 {
+                pixel_format::decode_xr10_row_to_rgba16f(
+                    sample_fmt,
+                    w,
+                    &row_p0,
+                    row_p1.as_deref(),
+                    dst,
+                )
+            } else {
+                crate::runtime::draw::note_sampled_narrowing(site.route(), 0, sample_fmt, w, h);
+                pixel_format::decode_xr10_row_to_rgba8(
+                    sample_fmt,
+                    w,
+                    &row_p0,
+                    row_p1.as_deref(),
+                    dst,
+                )
+            };
+            if !ok {
+                return Err(R::RowConvertUnsupported { format: sample_fmt });
+            }
+        }
+        return Ok((out, SampledByteFormat::from_source(out_layout, sample_fmt)));
+    }
     // Tight display textures are the common compositor source. Read the whole
     // image with one task-root/cache lifetime: the row loop below otherwise
     // rebuilds the GVA walker cache once per row (1,080 times for the live

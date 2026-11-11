@@ -86,20 +86,59 @@ pub const MTL_FORMAT_RGBA8_UNORM_SRGB: u16 = 0x47;
 pub const MTL_FORMAT_RGBA8_UINT: u16 = 0x49;
 pub const MTL_FORMAT_RGBA8_SINT: u16 = 0x4a;
 pub const MTL_FORMAT_BGRA8_UNORM: u16 = 0x50;
-/// A private format macOS 27 declares its Setup Assistant icon, panel and
-/// memoryless textures in, and asks heap placement for. Four bytes a texel; it
-/// is only ever rendered and sampled on the GPU, so it is stored as BGRA8.
-pub const MTL_FORMAT_PRIVATE_550: u16 = 550;
+/// Apple Silicon extended-range (XR10) pixel formats (`MTLPixelFormat.h` 550..=555).
+///
+/// `550` (`RGB10A8_2p_XR10`, FourCC `'b3a8'` / `'&b38'`) and `551` (its mirrored-sRGB
+/// sibling) store a 32-bit `BGR10_XR` Plane 0 (`4` Bpp: `b10 | (g10 << 10) | (r10 << 20)`)
+/// paired with an 8-bit `R8Unorm` alpha Plane 1 (`1` Bpp) carried in the second
+/// level-0 layout record of an [`OBJECT_TYPE_TWIN_LAYOUT_TEXTURE`] (`type-12`)
+/// descriptor. `552`/`553` (`BGRA10_XR`) store four 16-bit words `[B, G, R, A]`
+/// with each 10-bit XR code in bits `[6..15]`. `554`/`555` (`BGR10_XR`) store the
+/// single-plane 32-bit `b10 | (g10 << 10) | (r10 << 20)` word with opaque alpha.
+///
+/// On the GPU, all six render and sample as `VK_FORMAT_R16G16B16A16_SFLOAT` so
+/// negative and `> 1.0` extended-range channels survive without `[0, 1]` clamping.
+pub const MTL_FORMAT_RGB10A8_2P_XR10: u16 = 550;
+pub const MTL_FORMAT_RGB10A8_2P_XR10_SRGB: u16 = 551;
+pub const MTL_FORMAT_BGRA10_XR: u16 = 552;
+pub const MTL_FORMAT_BGRA10_XR_SRGB: u16 = 553;
+pub const MTL_FORMAT_BGR10_XR: u16 = 554;
+pub const MTL_FORMAT_BGR10_XR_SRGB: u16 = 555;
 
-/// The format a texture declared in `raw` is stored and drawn in. The identity
-/// for every format but [`MTL_FORMAT_PRIVATE_550`]; every wire decode passes
-/// its pixel format through here, so no table below needs to name 550.
+/// Identity wire-format pass-through. Kept so wire decoders continue to funnel
+/// raw `u16` pixel formats through one contract entry point.
 pub fn stored_format(raw: u16) -> u16 {
-    if raw == MTL_FORMAT_PRIVATE_550 {
-        MTL_FORMAT_BGRA8_UNORM
-    } else {
-        raw
-    }
+    raw
+}
+
+pub fn is_xr10(format: u16) -> bool {
+    matches!(
+        format,
+        MTL_FORMAT_RGB10A8_2P_XR10
+            | MTL_FORMAT_RGB10A8_2P_XR10_SRGB
+            | MTL_FORMAT_BGRA10_XR
+            | MTL_FORMAT_BGRA10_XR_SRGB
+            | MTL_FORMAT_BGR10_XR
+            | MTL_FORMAT_BGR10_XR_SRGB
+    )
+}
+
+pub fn is_two_plane_xr10(format: u16) -> bool {
+    matches!(
+        format,
+        MTL_FORMAT_RGB10A8_2P_XR10 | MTL_FORMAT_RGB10A8_2P_XR10_SRGB
+    )
+}
+
+pub fn alpha_plane_bytes_per_pixel(format: u16) -> Option<u32> {
+    is_two_plane_xr10(format).then_some(R8_BPP)
+}
+
+fn is_xr10_srgb(format: u16) -> bool {
+    matches!(
+        format,
+        MTL_FORMAT_RGB10A8_2P_XR10_SRGB | MTL_FORMAT_BGRA10_XR_SRGB | MTL_FORMAT_BGR10_XR_SRGB
+    )
 }
 pub const MTL_FORMAT_BGRA8_UNORM_SRGB: u16 = 0x51;
 /// `MTLPixelFormatRGB10A2Unorm`. Ten bits per colour channel and two of alpha,
@@ -795,6 +834,10 @@ pub fn bytes_per_pixel(format: u16) -> Option<u32> {
         | MTL_FORMAT_RGB10A2_UINT
         | MTL_FORMAT_RG11B10_FLOAT
         | MTL_FORMAT_BGR10A2_UNORM
+        | MTL_FORMAT_RGB10A8_2P_XR10
+        | MTL_FORMAT_RGB10A8_2P_XR10_SRGB
+        | MTL_FORMAT_BGR10_XR
+        | MTL_FORMAT_BGR10_XR_SRGB
         | MTL_FORMAT_DEPTH32_FLOAT
         | MTL_FORMAT_DEPTH24_UNORM_STENCIL8
         | MTL_FORMAT_X24_STENCIL8 => RGBA8_BPP,
@@ -804,7 +847,9 @@ pub fn bytes_per_pixel(format: u16) -> Option<u32> {
         MTL_FORMAT_RGBA16_UNORM
         | MTL_FORMAT_RGBA16_UINT
         | MTL_FORMAT_RGBA16_FLOAT
-        | MTL_FORMAT_RG32_FLOAT => RGBA16_BPP,
+        | MTL_FORMAT_RG32_FLOAT
+        | MTL_FORMAT_BGRA10_XR
+        | MTL_FORMAT_BGRA10_XR_SRGB => RGBA16_BPP,
         MTL_FORMAT_RGBA32_UINT | MTL_FORMAT_RGBA32_FLOAT => RGBA32_BPP,
         _ => return None,
     })
@@ -1312,7 +1357,14 @@ pub fn render_target_bpp(format: u16) -> Option<u32> {
     Some(match format {
         MTL_FORMAT_RGBA8_UNORM | MTL_FORMAT_RGBA8_UNORM_SRGB => RGBA8_BPP,
         MTL_FORMAT_BGRA8_UNORM | MTL_FORMAT_BGRA8_UNORM_SRGB => BGRA8_BPP,
-        MTL_FORMAT_RGBA16_FLOAT | MTL_FORMAT_RGBA16_UNORM => RGBA16F_BPP,
+        MTL_FORMAT_RGBA16_FLOAT
+        | MTL_FORMAT_RGBA16_UNORM
+        | MTL_FORMAT_RGB10A8_2P_XR10
+        | MTL_FORMAT_RGB10A8_2P_XR10_SRGB
+        | MTL_FORMAT_BGRA10_XR
+        | MTL_FORMAT_BGRA10_XR_SRGB
+        | MTL_FORMAT_BGR10_XR
+        | MTL_FORMAT_BGR10_XR_SRGB => RGBA16F_BPP,
         MTL_FORMAT_RG16_FLOAT => RG16F_BPP,
         MTL_FORMAT_RG16_UINT => RG16_BPP,
         MTL_FORMAT_R16_FLOAT => R16F_BPP,
@@ -1731,6 +1783,9 @@ pub fn encode_solid_native_row(
     if pixels == 0 {
         return true;
     }
+    if is_xr10(format) {
+        return encode_solid_xr10_plane0_row(format, pixels, clear, dst);
+    }
     if let Some(layout) = store_texel_order(format) {
         if let Some(bytes) = solid_native_texels(pixels, 1, layout, clear) {
             if dst.len() < bytes.len() {
@@ -1742,6 +1797,315 @@ pub fn encode_solid_native_row(
     }
     let rgba = solid_rgba8(pixels, 1, clear);
     convert_rgba8_to_row(format, &rgba, pixels, dst)
+}
+
+fn srgb_to_linear_mirrored(v: f32) -> f32 {
+    let a = v.abs();
+    let lin = if a <= 0.04045 {
+        a / 12.92
+    } else {
+        ((a + 0.055) / 1.055).powf(2.4)
+    };
+    v.copysign(lin)
+}
+
+fn linear_to_srgb_mirrored(v: f32) -> f32 {
+    let a = v.abs();
+    let enc = if a <= 0.0031308 {
+        a * 12.92
+    } else {
+        1.055 * a.powf(1.0 / 2.4) - 0.055
+    };
+    v.copysign(enc)
+}
+
+#[inline]
+pub fn xr10_code_to_float(code: u32, srgb: bool) -> f32 {
+    let v = ((code & 0x3ff) as f32 - 384.0) / 510.0;
+    if srgb { srgb_to_linear_mirrored(v) } else { v }
+}
+
+#[inline]
+pub fn float_to_xr10_code(val: f32, srgb: bool) -> u32 {
+    if val.is_nan() {
+        return 384;
+    }
+    if val == f32::NEG_INFINITY {
+        return 0;
+    }
+    if val == f32::INFINITY {
+        return 1023;
+    }
+    let v = if srgb { linear_to_srgb_mirrored(val) } else { val };
+    (v * 510.0 + 384.0).round().clamp(0.0, 1023.0) as u32
+}
+
+#[inline]
+fn f32_to_unorm8(val: f32) -> u8 {
+    if !matches!(val.partial_cmp(&0.0), Some(std::cmp::Ordering::Greater)) {
+        UNORM8_MIN
+    } else if val >= 1.0 {
+        UNORM8_MAX
+    } else {
+        (val * 255.0 + 0.5) as u8
+    }
+}
+
+fn encode_xr10_texel_from_f32(format: u16, rgba: [f32; 4], dst: &mut [u8]) -> Option<Option<u8>> {
+    let srgb = is_xr10_srgb(format);
+    let r10 = float_to_xr10_code(rgba[COMPONENT_R], srgb);
+    let g10 = float_to_xr10_code(rgba[COMPONENT_G], srgb);
+    let b10 = float_to_xr10_code(rgba[COMPONENT_B], srgb);
+    match format {
+        MTL_FORMAT_RGB10A8_2P_XR10 | MTL_FORMAT_RGB10A8_2P_XR10_SRGB => {
+            if dst.len() < 4 {
+                return None;
+            }
+            let word = b10 | (g10 << 10) | (r10 << 20);
+            dst[..4].copy_from_slice(&word.to_le_bytes());
+            Some(Some(f32_to_unorm8(rgba[COMPONENT_A])))
+        }
+        MTL_FORMAT_BGR10_XR | MTL_FORMAT_BGR10_XR_SRGB => {
+            if dst.len() < 4 {
+                return None;
+            }
+            let word = b10 | (g10 << 10) | (r10 << 20);
+            dst[..4].copy_from_slice(&word.to_le_bytes());
+            Some(None)
+        }
+        MTL_FORMAT_BGRA10_XR | MTL_FORMAT_BGRA10_XR_SRGB => {
+            if dst.len() < 8 {
+                return None;
+            }
+            let a10 = float_to_xr10_code(rgba[COMPONENT_A], false);
+            st16(&mut dst[0..2], (b10 as u16) << 6);
+            st16(&mut dst[2..4], (g10 as u16) << 6);
+            st16(&mut dst[4..6], (r10 as u16) << 6);
+            st16(&mut dst[6..8], (a10 as u16) << 6);
+            Some(None)
+        }
+        _ => None,
+    }
+}
+
+fn decode_xr10_texel_to_f32(format: u16, src: &[u8], alpha_byte: Option<u8>) -> Option<[f32; 4]> {
+    let srgb = is_xr10_srgb(format);
+    match format {
+        MTL_FORMAT_RGB10A8_2P_XR10 | MTL_FORMAT_RGB10A8_2P_XR10_SRGB => {
+            if src.len() < 4 {
+                return None;
+            }
+            let word = u32::from_le_bytes([src[0], src[1], src[2], src[3]]);
+            let b = xr10_code_to_float(word & 0x3ff, srgb);
+            let g = xr10_code_to_float((word >> 10) & 0x3ff, srgb);
+            let r = xr10_code_to_float((word >> 20) & 0x3ff, srgb);
+            let a = alpha_byte.map_or(1.0, |v| f32::from(v) / 255.0);
+            Some([r, g, b, a])
+        }
+        MTL_FORMAT_BGR10_XR | MTL_FORMAT_BGR10_XR_SRGB => {
+            if src.len() < 4 {
+                return None;
+            }
+            let word = u32::from_le_bytes([src[0], src[1], src[2], src[3]]);
+            let b = xr10_code_to_float(word & 0x3ff, srgb);
+            let g = xr10_code_to_float((word >> 10) & 0x3ff, srgb);
+            let r = xr10_code_to_float((word >> 20) & 0x3ff, srgb);
+            Some([r, g, b, 1.0])
+        }
+        MTL_FORMAT_BGRA10_XR | MTL_FORMAT_BGRA10_XR_SRGB => {
+            if src.len() < 8 {
+                return None;
+            }
+            let b = xr10_code_to_float(u32::from(ld16(&src[0..2]) >> 6), srgb);
+            let g = xr10_code_to_float(u32::from(ld16(&src[2..4]) >> 6), srgb);
+            let r = xr10_code_to_float(u32::from(ld16(&src[4..6]) >> 6), srgb);
+            let a = xr10_code_to_float(u32::from(ld16(&src[6..8]) >> 6), false);
+            Some([r, g, b, a])
+        }
+        _ => None,
+    }
+}
+
+fn encode_solid_xr10_plane0_row(
+    format: u16,
+    pixels: u32,
+    clear: &[f64; 4],
+    dst: &mut [u8],
+) -> bool {
+    let Some(bpp) = bytes_per_pixel(format).map(|b| b as usize) else {
+        return false;
+    };
+    let Some(need) = (pixels as usize).checked_mul(bpp) else {
+        return false;
+    };
+    if dst.len() < need {
+        return false;
+    }
+    let rgba = [
+        clear[COMPONENT_R] as f32,
+        clear[COMPONENT_G] as f32,
+        clear[COMPONENT_B] as f32,
+        clear[COMPONENT_A] as f32,
+    ];
+    let mut pat = [0u8; 8];
+    if encode_xr10_texel_from_f32(format, rgba, &mut pat[..bpp]).is_none() {
+        return false;
+    }
+    for chunk in dst[..need].chunks_exact_mut(bpp) {
+        chunk.copy_from_slice(&pat[..bpp]);
+    }
+    true
+}
+
+/// Encode one row (`pixels` texels) of `Rgba16Float` (`f16x4`) into an XR10
+/// Plane 0 row and, for two-plane `550`/`551`, an optional Plane 1 `R8Unorm`
+/// alpha row, preserving extended-range channels without `[0, 1]` clamping.
+pub fn encode_xr10_row_from_rgba16f(
+    format: u16,
+    pixels: u32,
+    src_rgba16f: &[u8],
+    dst_plane0: &mut [u8],
+    mut dst_plane1: Option<&mut [u8]>,
+) -> bool {
+    if !is_xr10(format) {
+        return false;
+    }
+    if pixels == 0 {
+        return true;
+    }
+    let Some(bpp) = bytes_per_pixel(format).map(|b| b as usize) else {
+        return false;
+    };
+    let px = pixels as usize;
+    let Some(src_len) = px.checked_mul(RGBA16F_BPP as usize) else {
+        return false;
+    };
+    let Some(p0_len) = px.checked_mul(bpp) else {
+        return false;
+    };
+    if src_rgba16f.len() < src_len || dst_plane0.len() < p0_len {
+        return false;
+    }
+    if let Some(p1) = dst_plane1.as_deref() {
+        if p1.len() < px {
+            return false;
+        }
+    }
+    for i in 0..px {
+        let s = i * RGBA16F_BPP as usize;
+        let rgba = [
+            f16_to_f32(ld16(&src_rgba16f[s..s + 2])),
+            f16_to_f32(ld16(&src_rgba16f[s + 2..s + 4])),
+            f16_to_f32(ld16(&src_rgba16f[s + 4..s + 6])),
+            f16_to_f32(ld16(&src_rgba16f[s + 6..s + 8])),
+        ];
+        let d = i * bpp;
+        let Some(alpha) = encode_xr10_texel_from_f32(format, rgba, &mut dst_plane0[d..d + bpp])
+        else {
+            return false;
+        };
+        if let (Some(a8), Some(p1)) = (alpha, dst_plane1.as_deref_mut()) {
+            p1[i] = a8;
+        }
+    }
+    true
+}
+
+/// Decode one row (`pixels` texels) of an XR10 Plane 0 (+ optional Plane 1
+/// alpha) source into `Rgba16Float` (`f16x4`), keeping full extended range.
+pub fn decode_xr10_row_to_rgba16f(
+    format: u16,
+    pixels: u32,
+    src_plane0: &[u8],
+    src_plane1: Option<&[u8]>,
+    dst_rgba16f: &mut [u8],
+) -> bool {
+    if !is_xr10(format) {
+        return false;
+    }
+    if pixels == 0 {
+        return true;
+    }
+    let Some(bpp) = bytes_per_pixel(format).map(|b| b as usize) else {
+        return false;
+    };
+    let px = pixels as usize;
+    let Some(p0_len) = px.checked_mul(bpp) else {
+        return false;
+    };
+    let Some(dst_len) = px.checked_mul(RGBA16F_BPP as usize) else {
+        return false;
+    };
+    if src_plane0.len() < p0_len || dst_rgba16f.len() < dst_len {
+        return false;
+    }
+    if let Some(p1) = src_plane1 {
+        if p1.len() < px {
+            return false;
+        }
+    }
+    for i in 0..px {
+        let s = i * bpp;
+        let a_byte = src_plane1.map(|p1| p1[i]);
+        let Some(rgba) = decode_xr10_texel_to_f32(format, &src_plane0[s..s + bpp], a_byte) else {
+            return false;
+        };
+        let d = i * RGBA16F_BPP as usize;
+        st16(&mut dst_rgba16f[d..d + 2], f32_to_f16(rgba[COMPONENT_R]));
+        st16(&mut dst_rgba16f[d + 2..d + 4], f32_to_f16(rgba[COMPONENT_G]));
+        st16(&mut dst_rgba16f[d + 4..d + 6], f32_to_f16(rgba[COMPONENT_B]));
+        st16(&mut dst_rgba16f[d + 6..d + 8], f32_to_f16(rgba[COMPONENT_A]));
+    }
+    true
+}
+
+/// Decode one row (`pixels` texels) of an XR10 Plane 0 (+ optional Plane 1
+/// alpha) source into `RGBA8` (`[0, 1]` clamped), for callers without half-float
+/// sampled upload support.
+pub fn decode_xr10_row_to_rgba8(
+    format: u16,
+    pixels: u32,
+    src_plane0: &[u8],
+    src_plane1: Option<&[u8]>,
+    dst_rgba8: &mut [u8],
+) -> bool {
+    if !is_xr10(format) {
+        return false;
+    }
+    if pixels == 0 {
+        return true;
+    }
+    let Some(bpp) = bytes_per_pixel(format).map(|b| b as usize) else {
+        return false;
+    };
+    let px = pixels as usize;
+    let Some(p0_len) = px.checked_mul(bpp) else {
+        return false;
+    };
+    let Some(dst_len) = px.checked_mul(RGBA8_BPP as usize) else {
+        return false;
+    };
+    if src_plane0.len() < p0_len || dst_rgba8.len() < dst_len {
+        return false;
+    }
+    if let Some(p1) = src_plane1 {
+        if p1.len() < px {
+            return false;
+        }
+    }
+    for i in 0..px {
+        let s = i * bpp;
+        let a_byte = src_plane1.map(|p1| p1[i]);
+        let Some(rgba) = decode_xr10_texel_to_f32(format, &src_plane0[s..s + bpp], a_byte) else {
+            return false;
+        };
+        let d = i * RGBA8_BPP as usize;
+        dst_rgba8[d + COMPONENT_R] = f32_to_unorm8(rgba[COMPONENT_R]);
+        dst_rgba8[d + COMPONENT_G] = f32_to_unorm8(rgba[COMPONENT_G]);
+        dst_rgba8[d + COMPONENT_B] = f32_to_unorm8(rgba[COMPONENT_B]);
+        dst_rgba8[d + COMPONENT_A] = f32_to_unorm8(rgba[COMPONENT_A]);
+    }
+    true
 }
 
 /// The clear colour as one unorm8 RGBA texel.
@@ -2348,6 +2712,18 @@ pub fn texel_to_rgba8(format: u16, src: &[u8]) -> Option<[u8; 4]> {
             let order = TenBitOrder::of_format(format)?;
             rgba = order.word_to_rgba8(u32::from_le_bytes([src[0], src[1], src[2], src[3]]));
         }
+        MTL_FORMAT_RGB10A8_2P_XR10
+        | MTL_FORMAT_RGB10A8_2P_XR10_SRGB
+        | MTL_FORMAT_BGRA10_XR
+        | MTL_FORMAT_BGRA10_XR_SRGB
+        | MTL_FORMAT_BGR10_XR
+        | MTL_FORMAT_BGR10_XR_SRGB => {
+            let decoded = decode_xr10_texel_to_f32(format, src, None)?;
+            rgba[COMPONENT_R] = f32_to_unorm8(decoded[COMPONENT_R]);
+            rgba[COMPONENT_G] = f32_to_unorm8(decoded[COMPONENT_G]);
+            rgba[COMPONENT_B] = f32_to_unorm8(decoded[COMPONENT_B]);
+            rgba[COMPONENT_A] = f32_to_unorm8(decoded[COMPONENT_A]);
+        }
         _ => return None,
     }
     Some(rgba)
@@ -2424,6 +2800,20 @@ pub fn rgba8_to_texel(format: u16, rgba: [u8; 4], dst: &mut [u8]) -> bool {
             };
             dst[..4].copy_from_slice(&order.rgba8_to_word(rgba).to_le_bytes());
         }
+        MTL_FORMAT_RGB10A8_2P_XR10
+        | MTL_FORMAT_RGB10A8_2P_XR10_SRGB
+        | MTL_FORMAT_BGRA10_XR
+        | MTL_FORMAT_BGRA10_XR_SRGB
+        | MTL_FORMAT_BGR10_XR
+        | MTL_FORMAT_BGR10_XR_SRGB => {
+            let rgba_f = [
+                f32::from(rgba[COMPONENT_R]) / 255.0,
+                f32::from(rgba[COMPONENT_G]) / 255.0,
+                f32::from(rgba[COMPONENT_B]) / 255.0,
+                f32::from(rgba[COMPONENT_A]) / 255.0,
+            ];
+            return encode_xr10_texel_from_f32(format, rgba_f, dst).is_some();
+        }
         _ => return false,
     }
     true
@@ -2480,6 +2870,12 @@ pub fn narrows_to_unorm8(format: u16) -> bool {
             | MTL_FORMAT_RGBA32_FLOAT
             | MTL_FORMAT_RGB10A2_UNORM
             | MTL_FORMAT_BGR10A2_UNORM
+            | MTL_FORMAT_RGB10A8_2P_XR10
+            | MTL_FORMAT_RGB10A8_2P_XR10_SRGB
+            | MTL_FORMAT_BGRA10_XR
+            | MTL_FORMAT_BGRA10_XR_SRGB
+            | MTL_FORMAT_BGR10_XR
+            | MTL_FORMAT_BGR10_XR_SRGB
     )
 }
 
@@ -4217,6 +4613,66 @@ mod tests {
                 &mut back
             ));
             assert_eq!(&back[..], *p);
+        }
+    }
+
+    #[test]
+    fn xr10_codec_preserves_sdr_bytes_extended_range_and_two_plane_alpha() {
+        assert_eq!(float_to_xr10_code(0.0, false), 384);
+        assert_eq!(float_to_xr10_code(1.0, false), 894);
+        assert!((xr10_code_to_float(384, false) - 0.0).abs() < 1e-6);
+        assert!((xr10_code_to_float(894, false) - 1.0).abs() < 1e-6);
+
+        // Every 8-bit SDR value maps to `384 + 2 * b` with zero rounding loss.
+        for b in 0u8..=255 {
+            let rgba = [b, 255 - b, b.wrapping_mul(3), 180];
+            let mut p0 = [0u8; 4];
+            assert!(rgba8_to_texel(MTL_FORMAT_RGB10A8_2P_XR10, rgba, &mut p0));
+            let got = texel_to_rgba8(MTL_FORMAT_RGB10A8_2P_XR10, &p0).unwrap();
+            assert_eq!(&got[..3], &rgba[..3], "byte {b}");
+            assert_eq!(got[3], 255);
+        }
+
+        // Extended-range negative + HDR (> 1.0) values + separate Plane 1 alpha.
+        let pixels = [
+            [-0.5f32, 0.0, 1.2, 0.25],
+            [1.15, -0.25, 0.5, 0.75],
+            [0.0, 0.0, 0.0, 0.0],
+        ];
+        let mut src_f16 = Vec::with_capacity(pixels.len() * 8);
+        for px in pixels {
+            for c in px {
+                src_f16.extend_from_slice(&f32_to_f16(c).to_le_bytes());
+            }
+        }
+        let mut plane0 = vec![0u8; pixels.len() * 4];
+        let mut plane1 = vec![0u8; pixels.len()];
+        assert!(encode_xr10_row_from_rgba16f(
+            MTL_FORMAT_RGB10A8_2P_XR10,
+            pixels.len() as u32,
+            &src_f16,
+            &mut plane0,
+            Some(&mut plane1),
+        ));
+        assert_eq!(plane1, vec![64, 191, 0]);
+        let mut dst_f16 = vec![0u8; pixels.len() * 8];
+        assert!(decode_xr10_row_to_rgba16f(
+            MTL_FORMAT_RGB10A8_2P_XR10,
+            pixels.len() as u32,
+            &plane0,
+            Some(&plane1),
+            &mut dst_f16,
+        ));
+        for (i, want) in pixels.iter().enumerate() {
+            let base = i * 8;
+            for c in 0..4 {
+                let got = f16_to_f32(ld16(&dst_f16[base + c * 2..base + c * 2 + 2]));
+                assert!(
+                    (got - want[c]).abs() < 0.005,
+                    "pixel {i} chan {c}: got {got}, want {}",
+                    want[c]
+                );
+            }
         }
     }
 }

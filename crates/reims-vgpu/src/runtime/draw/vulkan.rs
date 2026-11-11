@@ -225,12 +225,14 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                     // run exactly as it does for a Store that never skipped its
                     // readback. `read_resident_chain` fail-logs a lost resident.
                     note_type11_store_route("gva_store_sync");
-                    if let Some(expected_layout) = req
-                        .colors
-                        .first()
-                        .and_then(|c0| pixel_format::store_texel_order(c0.format))
-                        .filter(|layout| !layout.is_four_byte_color())
-                    {
+                    if let Some(expected_layout) = req.colors.first().and_then(|c0| {
+                        if pixel_format::is_xr10(c0.format) {
+                            Some(TexelLayout::Rgba16Float)
+                        } else {
+                            pixel_format::store_texel_order(c0.format)
+                                .filter(|layout| !layout.is_four_byte_color())
+                        }
+                    }) {
                         if let Ok(rb) =
                             crate::backend::vulkan::engine::read_target_native(&identity)
                         {
@@ -595,7 +597,37 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                 // above. `None` only when that walk could not name the span,
                 // which is the pre-existing behaviour for a target this device
                 // cannot resolve at all.
-                let native_written = if let Some((native_bytes, _layout)) = draw_native
+                let alpha_plane = super::resolve_alpha_plane_for_target(
+                    state,
+                    host,
+                    req.task_id,
+                    c0.texture_ref,
+                    c0.target_gva,
+                    c0.width,
+                    c0.height,
+                    c0.format,
+                );
+                let allowed_pages = sync_store_pages.as_ref().map(|p| p.membership());
+                let native_written = if pixel_format::is_xr10(c0.format) {
+                    if let Some((native_bytes, TexelLayout::Rgba16Float)) = draw_native.as_ref() {
+                        super::write_gva_xr10_from_rgba16f_within(
+                            state,
+                            host,
+                            req.task_id,
+                            c0.target_gva,
+                            c0.width,
+                            c0.height,
+                            c0.row_stride,
+                            c0.format,
+                            alpha_plane,
+                            native_bytes,
+                            allowed_pages,
+                        )
+                        .is_ok()
+                    } else {
+                        false
+                    }
+                } else if let Some((native_bytes, _layout)) = draw_native
                     .as_ref()
                     .filter(|(_, layout)| pixel_format::store_texel_order(c0.format) == Some(*layout))
                 {
@@ -609,7 +641,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                         c0.row_stride,
                         c0.format,
                         native_bytes,
-                        sync_store_pages.as_ref().map(|p| p.membership()),
+                        allowed_pages,
                     )
                     .is_ok()
                 } else {
@@ -628,7 +660,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                     }
                     true
                 } else {
-                    let ok = write_gva_rgba8_within(
+                    let mut ok = write_gva_rgba8_within(
                         state,
                         host,
                         req.task_id,
@@ -638,26 +670,55 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                         c0.row_stride,
                         c0.format,
                         &rgba,
-                        sync_store_pages.as_ref().map(|p| p.membership()),
+                        allowed_pages,
                     )
                     .is_ok();
                     if ok {
-                        let producer_object_type =
-                            objects::lookup_list_entry(state, host, req.task_id, c0.texture_ref)
-                                .map(|entry| entry.object_type)
-                                .unwrap_or(0);
-                        host_cache_store_gva_layer(
-                            state,
-                            host,
-                            req.task_id,
-                            c0.texture_ref,
-                            producer_object_type,
-                            c0.target_gva,
-                            c0.width,
-                            c0.height,
-                            &rgba,
-                            true,
-                        );
+                        if let Some((alpha_gva, alpha_bpr)) = alpha_plane {
+                            ok = super::write_gva_xr10_alpha_from_rgba8_within(
+                                state,
+                                host,
+                                req.task_id,
+                                alpha_gva,
+                                c0.width,
+                                c0.height,
+                                alpha_bpr,
+                                &rgba,
+                                allowed_pages,
+                            )
+                            .is_ok();
+                        }
+                    }
+                    if ok {
+                        if pixel_format::is_xr10(c0.format) {
+                            if c0.target_gva != 0 {
+                                crate::runtime::surface_cache::evict_gva(state, c0.target_gva);
+                            }
+                            if c0.texture_ref != 0 {
+                                crate::runtime::surface_cache::evict_texture(
+                                    state,
+                                    req.task_id,
+                                    c0.texture_ref,
+                                );
+                            }
+                        } else {
+                            let producer_object_type =
+                                objects::lookup_list_entry(state, host, req.task_id, c0.texture_ref)
+                                    .map(|entry| entry.object_type)
+                                    .unwrap_or(0);
+                            host_cache_store_gva_layer(
+                                state,
+                                host,
+                                req.task_id,
+                                c0.texture_ref,
+                                producer_object_type,
+                                c0.target_gva,
+                                c0.width,
+                                c0.height,
+                                &rgba,
+                                true,
+                            );
+                        }
                     }
                     ok
                 };
@@ -750,7 +811,22 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                 let _span = StoreCostSpan::new("clear_seed_gva_us");
                 crate::runtime::drain::note_store_route("clear_seed_gva");
                 crate::runtime::drain::note_store_route_n("clear_seed_gva_kb", seed_kb);
-                super::write_gva_solid_native_within(
+                let allowed_pages = if i == 0 {
+                    sync_store_pages.as_ref().map(|p| p.membership())
+                } else {
+                    None
+                };
+                let alpha_plane = super::resolve_alpha_plane_for_target(
+                    state,
+                    host,
+                    req.task_id,
+                    c.texture_ref,
+                    c.target_gva,
+                    c.width,
+                    c.height,
+                    c.format,
+                );
+                let mut p0_ok = super::write_gva_solid_native_within(
                     state,
                     host,
                     req.task_id,
@@ -760,13 +836,26 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                     c.row_stride,
                     c.format,
                     &c.clear_color,
-                    if i == 0 {
-                        sync_store_pages.as_ref().map(|p| p.membership())
-                    } else {
-                        None
-                    },
+                    allowed_pages,
                 )
-                .is_ok()
+                .is_ok();
+                if p0_ok {
+                    if let Some((alpha_gva, alpha_bpr)) = alpha_plane {
+                        p0_ok = super::write_gva_solid_alpha_plane_within(
+                            state,
+                            host,
+                            req.task_id,
+                            alpha_gva,
+                            c.width,
+                            c.height,
+                            alpha_bpr,
+                            c.clear_color[3],
+                            allowed_pages,
+                        )
+                        .is_ok();
+                    }
+                }
+                p0_ok
             } else if c.mapping_id != 0 {
                 let _span = StoreCostSpan::new("clear_seed_t11_us");
                 crate::runtime::drain::note_store_route("clear_seed_t11");
@@ -5270,6 +5359,7 @@ pub(super) fn try_type5_sample_zero_copy<M: HostMemory + HostOps>(
 /// dressed as a decline.
 fn native_scratch_to_upload(
     scratch: &[u8],
+    alpha_plane: Option<(&[u8], u64)>,
     w: u32,
     h: u32,
     planes: u32,
@@ -5279,6 +5369,47 @@ fn native_scratch_to_upload(
 ) -> Option<(Vec<u8>, TexelLayout)> {
     let native = native_uploads_for(sample_fmt);
     let bpr = bpr as usize;
+    if pixel_format::is_xr10(sample_fmt) {
+        let (out_layout, out_bpp) = if native.float16 {
+            (TexelLayout::Rgba16Float, pixel_format::RGBA16F_BPP as usize)
+        } else {
+            (TexelLayout::Rgba8, RGBA8_BPP as usize)
+        };
+        let out_row = (w as usize).checked_mul(out_bpp)?;
+        let rows = (h as usize).checked_mul(planes as usize)?;
+        let mut out = vec![0u8; out_row.checked_mul(rows)?];
+        let trow = tight as usize;
+        if !native.float16 {
+            crate::runtime::draw::note_sampled_narrowing(
+                "linear_memo_narrowed",
+                0,
+                sample_fmt,
+                w,
+                h,
+            );
+        }
+        for row_index in 0..rows {
+            let src = row_index.checked_mul(bpr)?;
+            let src_p0 = scratch.get(src..src + trow)?;
+            let src_p1 = match alpha_plane {
+                Some((p1_bytes, abpr)) => {
+                    let asrc = row_index.checked_mul(abpr as usize)?;
+                    Some(p1_bytes.get(asrc..asrc + w as usize)?)
+                }
+                None => None,
+            };
+            let dst = &mut out[row_index * out_row..(row_index + 1) * out_row];
+            let ok = if native.float16 {
+                pixel_format::decode_xr10_row_to_rgba16f(sample_fmt, w, src_p0, src_p1, dst)
+            } else {
+                pixel_format::decode_xr10_row_to_rgba8(sample_fmt, w, src_p0, src_p1, dst)
+            };
+            if !ok {
+                return None;
+            }
+        }
+        return Some((out, out_layout));
+    }
     if let Some(fmt) = linear_native_upload_format(sample_fmt, native)
         .filter(|fmt| tight == (w as u64).saturating_mul(fmt.bytes_per_texel() as u64))
     {
@@ -5434,10 +5565,38 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
     // and served by the general loader below, which uses the tighter rule. That
     // is a slower path, not lost work.
     let span = bpr.checked_mul(h as u64)?.checked_mul(u64::from(planes))?;
-    let native_len = host_alloc_len(span)?;
+    let p0_len = host_alloc_len(span)?;
     if tex.allocation_size != 0 && layout.offset.saturating_add(span) > tex.allocation_size {
         return None;
     }
+    let alpha_plane = if pixel_format::is_two_plane_xr10(sample_fmt) {
+        if let Some((alpha_gva, alpha_layout)) = tex.alpha_plane_gva(state.page_shift) {
+            if alpha_gva == 0
+                || alpha_layout.width != w
+                || alpha_layout.height != h
+                || alpha_layout.planes() != planes
+                || alpha_layout.row_stride < u64::from(w)
+            {
+                return None;
+            }
+            let alpha_span = alpha_layout
+                .row_stride
+                .checked_mul(h as u64)?
+                .checked_mul(u64::from(planes))?;
+            if tex.allocation_size != 0
+                && alpha_layout.offset.saturating_add(alpha_span) > tex.allocation_size
+            {
+                return None;
+            }
+            Some((alpha_gva, alpha_layout.row_stride, alpha_span))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let total_span = span.checked_add(alpha_plane.map_or(0, |(_, _, s)| s))?;
+    let native_len = host_alloc_len(total_span)?;
     // Same coherence rule as the general loader: land any resident-authoritative
     // writeback *aliasing the sampled span* before reading it — and only then.
     //
@@ -5462,19 +5621,44 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
         span,
         crate::runtime::render_writeback::SettleSite::LinearMemoRead,
     );
+    if let Some((alpha_gva, _, alpha_span)) = alpha_plane {
+        crate::runtime::writeback_debt::settle_for_texture(
+            state,
+            host,
+            task_id,
+            texture_ref,
+            alpha_gva,
+            alpha_span,
+            crate::runtime::render_writeback::SettleSite::LinearMemoRead,
+        );
+    }
     let mut scratch = std::mem::take(&mut state.guest_linear_scratch);
     scratch.resize(native_len, 0);
-    let read = gva_mem::read_task_gva_by_id(
+    let read_p0 = gva_mem::read_task_gva_by_id(
         host,
         &state.tasks,
         task_id,
         gva,
-        &mut scratch,
+        &mut scratch[..p0_len],
         state.page_shift,
     );
-    if read.is_err() {
+    if read_p0.is_err() {
         state.guest_linear_scratch = scratch;
         return None;
+    }
+    if let Some((alpha_gva, _, _)) = alpha_plane {
+        let read_p1 = gva_mem::read_task_gva_by_id(
+            host,
+            &state.tasks,
+            task_id,
+            alpha_gva,
+            &mut scratch[p0_len..native_len],
+            state.page_shift,
+        );
+        if read_p1.is_err() {
+            state.guest_linear_scratch = scratch;
+            return None;
+        }
     }
     let key = (task_id, gva, w, h, planes, sample_fmt);
     // Three-way, because "the memo did not answer" has two causes that want
@@ -5537,9 +5721,17 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
         ));
     }
     // First sight or native bytes changed: convert fresh, new generation.
-    let Some((rgba, fmt)) =
-        native_scratch_to_upload(&scratch, w, h, planes, bpr, sample_fmt, tight)
-    else {
+    let alpha_slice = alpha_plane.map(|(_, abpr, _)| (&scratch[p0_len..native_len], abpr));
+    let Some((rgba, fmt)) = native_scratch_to_upload(
+        &scratch[..p0_len],
+        alpha_slice,
+        w,
+        h,
+        planes,
+        bpr,
+        sample_fmt,
+        tight,
+    ) else {
         state.guest_linear_scratch = scratch;
         return None;
     };
@@ -9913,7 +10105,17 @@ pub fn apply_gva_clear<M: HostMemory + HostOps>(
         c0.texture_ref,
         c0.target_gva,
     );
-    super::write_gva_solid_native_within(
+    let alpha_plane = super::resolve_alpha_plane_for_target(
+        state,
+        host,
+        task_id,
+        c0.texture_ref,
+        c0.target_gva,
+        c0.width,
+        c0.height,
+        c0.format,
+    );
+    let mut ok = super::write_gva_solid_native_within(
         state,
         host,
         task_id,
@@ -9925,7 +10127,24 @@ pub fn apply_gva_clear<M: HostMemory + HostOps>(
         clear_color,
         None,
     )
-    .is_ok()
+    .is_ok();
+    if ok {
+        if let Some((alpha_gva, alpha_bpr)) = alpha_plane {
+            ok = super::write_gva_solid_alpha_plane_within(
+                state,
+                host,
+                task_id,
+                alpha_gva,
+                c0.width,
+                c0.height,
+                alpha_bpr,
+                clear_color[3],
+                None,
+            )
+            .is_ok();
+        }
+    }
+    ok
 }
 
 pub(crate) fn retain_heap_target(
@@ -11176,6 +11395,7 @@ fn gva_store_defer_eligible(req: &DrawEncodeRequest) -> bool {
         || c0.texture_ref == 0
         || req.gva_alloc_gen == 0
         || c0.buffer_backed
+        || pixel_format::is_xr10(c0.format)
     {
         return false;
     }

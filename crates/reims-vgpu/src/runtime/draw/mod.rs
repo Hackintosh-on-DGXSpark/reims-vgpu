@@ -5004,6 +5004,77 @@ pub(crate) fn write_gva_rgba8<M: HostMemory + HostOps>(
 /// closed on its own terms, and refusing on an empty capture would drop live
 /// Stores whenever the capture failed for an unrelated reason. If that counter
 /// stays at zero it can be tightened with evidence.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "matches resolved colour target fields without widening ColorRtRequest"
+)]
+pub(crate) fn resolve_alpha_plane_for_target<M: HostMemory>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    texture_ref: u32,
+    target_gva: u64,
+    width: u32,
+    height: u32,
+    format: u16,
+) -> Option<(u64, u32)> {
+    if !pixel_format::is_two_plane_xr10(format)
+        || texture_ref == 0
+        || target_gva == 0
+        || width == 0
+        || height == 0
+    {
+        return None;
+    }
+    let mut cur = texture_ref;
+    for _ in 0..MAX_TEXTURE_VIEW_CHAIN {
+        let entry = objects::lookup_list_entry(state, host, task_id, cur)?;
+        if entry.object_type != OBJECT_TYPE_TEXTURE_VIEW {
+            break;
+        }
+        let (_, desc) =
+            objects::resolve_descriptor(state, host, task_id, cur, &[OBJECT_TYPE_TEXTURE_VIEW])
+                .ok()?;
+        let view = crate::runtime::decode::resource::decode_texture_view_descriptor(&desc).ok()?;
+        if view.carries_range() && (view.level_base != 0 || view.slice_base != 0) {
+            return None;
+        }
+        if view.base_texture_ref == 0 || view.base_texture_ref == cur {
+            return None;
+        }
+        cur = view.base_texture_ref;
+    }
+    let (_, desc_bytes) = objects::resolve_descriptor(
+        state,
+        host,
+        task_id,
+        cur,
+        &[OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_VARIANT],
+    )
+    .ok()?;
+    let tex = decode_texture_descriptor(&desc_bytes).ok()?;
+    let (p0_gva, _) = tex.level_gva(0, state.page_shift)?;
+    if p0_gva != target_gva {
+        return None;
+    }
+    let (alpha_gva, alpha) = tex.alpha_plane_gva(state.page_shift)?;
+    if alpha_gva == 0
+        || alpha.width != width
+        || alpha.height != height
+        || alpha.row_stride < u64::from(width)
+        || alpha.row_stride > u64::from(u32::MAX)
+    {
+        return None;
+    }
+    if tex.allocation_size != 0 {
+        let end = alpha.offset.saturating_add(alpha.slice_read_span(width)?);
+        if end > tex.allocation_size {
+            return None;
+        }
+    }
+    Some((alpha_gva, alpha.row_stride as u32))
+}
+
 pub(crate) fn sync_store_target_pages<M: HostMemory>(
     state: &DeviceState,
     host: &M,
@@ -5030,12 +5101,30 @@ pub(crate) fn sync_store_target_pages<M: HostMemory>(
         crate::runtime::drain::note_store_route("sync_store_unbounded");
         return None;
     }
+    let mut set: std::collections::HashSet<u64> = ordered.iter().copied().collect();
+    if let Some((alpha_gva, alpha_bpr)) = resolve_alpha_plane_for_target(
+        state,
+        host,
+        task_id,
+        c.texture_ref,
+        c.target_gva,
+        c.width,
+        c.height,
+        c.format,
+    ) {
+        if let Some(alpha_span) = (alpha_bpr as u64).checked_mul(c.height as u64) {
+            set.extend(crate::runtime::gva_mem::task_gva_page_gpas(
+                host,
+                &state.tasks,
+                task_id,
+                alpha_gva,
+                alpha_span,
+                state.page_shift,
+            ));
+        }
+    }
     crate::runtime::drain::note_store_route("sync_store_bound");
-    Some(StoreTargetPages {
-        set: ordered.iter().copied().collect(),
-        ordered,
-        span,
-    })
+    Some(StoreTargetPages { set, ordered, span })
 }
 
 /// The guest pages a synchronous GVA render Store may write, from one walk
@@ -5210,6 +5299,148 @@ pub(crate) fn write_gva_native_within<M: HostMemory + HostOps>(
     Ok(())
 }
 
+#[cfg(feature = "backend-vulkan")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors the target GVA, optional Plane 1 alpha GVA, and row geometry"
+)]
+pub(crate) fn write_gva_xr10_from_rgba16f_within<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    gva: u64,
+    width: u32,
+    height: u32,
+    bpr: u32,
+    format: u16,
+    alpha_plane: Option<(u64, u32)>,
+    rgba16f: &[u8],
+    allowed: crate::runtime::gva_view::WindowPages<'_>,
+) -> Result<(), crate::runtime::host::MemError> {
+    use crate::runtime::host::MemError;
+    if gva == 0 || width == 0 || height == 0 || bpr == 0 || !pixel_format::is_xr10(format) {
+        return Err(MemError::BadArgs);
+    }
+    let Some(tight) = pixel_format::tight_row_bytes(width, format) else {
+        return Err(MemError::BadArgs);
+    };
+    if bpr < tight {
+        return Err(MemError::BadArgs);
+    }
+    if let Some((agva, abpr)) = alpha_plane {
+        if agva == 0 || abpr < width {
+            return Err(MemError::BadArgs);
+        }
+    }
+    let src_row_bytes = (width as usize)
+        .checked_mul(pixel_format::RGBA16F_BPP as usize)
+        .ok_or(MemError::BadArgs)?;
+    let need = src_row_bytes
+        .checked_mul(height as usize)
+        .ok_or(MemError::BadArgs)?;
+    if rgba16f.len() < need {
+        return Err(MemError::BadArgs);
+    }
+    let mut row_p0 = vec![0u8; tight as usize];
+    let mut row_p1 = alpha_plane.map(|_| vec![0u8; width as usize]);
+    for y in 0..height as usize {
+        let src = &rgba16f[y * src_row_bytes..(y + 1) * src_row_bytes];
+        if !pixel_format::encode_xr10_row_from_rgba16f(
+            format,
+            width,
+            src,
+            &mut row_p0,
+            row_p1.as_deref_mut(),
+        ) {
+            return Err(MemError::BadArgs);
+        }
+        let p0_row_gva = gva.saturating_add((y as u64).saturating_mul(bpr as u64));
+        crate::runtime::gva_view::write_span_within(
+            state, host, task_id, p0_row_gva, &row_p0, allowed,
+        )?;
+        if let (Some((agva, abpr)), Some(p1)) = (alpha_plane, row_p1.as_deref()) {
+            let p1_row_gva = agva.saturating_add((y as u64).saturating_mul(abpr as u64));
+            crate::runtime::gva_view::write_span_within(
+                state, host, task_id, p1_row_gva, p1, allowed,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "backend-vulkan")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors Plane 1 alpha GVA and row geometry"
+)]
+pub(crate) fn write_gva_xr10_alpha_from_rgba8_within<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    alpha_gva: u64,
+    width: u32,
+    height: u32,
+    alpha_bpr: u32,
+    rgba: &[u8],
+    allowed: crate::runtime::gva_view::WindowPages<'_>,
+) -> Result<(), crate::runtime::host::MemError> {
+    use crate::runtime::host::MemError;
+    if alpha_gva == 0 || width == 0 || height == 0 || alpha_bpr < width {
+        return Err(MemError::BadArgs);
+    }
+    let src_row_bytes = (width as usize)
+        .checked_mul(RGBA8_BPP as usize)
+        .ok_or(MemError::BadArgs)?;
+    let need = src_row_bytes
+        .checked_mul(height as usize)
+        .ok_or(MemError::BadArgs)?;
+    if rgba.len() < need {
+        return Err(MemError::BadArgs);
+    }
+    let mut row_p1 = vec![0u8; width as usize];
+    for y in 0..height as usize {
+        let src = &rgba[y * src_row_bytes..(y + 1) * src_row_bytes];
+        for (x, dst) in row_p1.iter_mut().enumerate() {
+            *dst = src[x * 4 + 3];
+        }
+        let p1_row_gva = alpha_gva.saturating_add((y as u64).saturating_mul(alpha_bpr as u64));
+        crate::runtime::gva_view::write_span_within(
+            state, host, task_id, p1_row_gva, &row_p1, allowed,
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "backend-vulkan")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors Plane 1 alpha GVA and row geometry"
+)]
+pub(crate) fn write_gva_solid_alpha_plane_within<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    alpha_gva: u64,
+    width: u32,
+    height: u32,
+    alpha_bpr: u32,
+    clear_alpha: f64,
+    allowed: crate::runtime::gva_view::WindowPages<'_>,
+) -> Result<(), crate::runtime::host::MemError> {
+    use crate::runtime::host::MemError;
+    if alpha_gva == 0 || width == 0 || height == 0 || alpha_bpr < width {
+        return Err(MemError::BadArgs);
+    }
+    let row_p1 = vec![pixel_format::f64_to_unorm8(clear_alpha); width as usize];
+    for y in 0..height as usize {
+        let p1_row_gva = alpha_gva.saturating_add((y as u64).saturating_mul(alpha_bpr as u64));
+        crate::runtime::gva_view::write_span_within(
+            state, host, task_id, p1_row_gva, &row_p1, allowed,
+        )?;
+    }
+    Ok(())
+}
+
 /// Land a solid colour into a GVA render target.
 ///
 /// One tight RGBA8 row is built and handed to the same writer every full-image
@@ -5226,9 +5457,7 @@ pub(crate) fn write_gva_native_within<M: HostMemory + HostOps>(
     clippy::too_many_arguments,
     reason = "the same target GVA and native row geometry every GVA writer takes"
 )]
-// The CLEAR seed at the head of a draw chain is the only caller, and it is the
-// Vulkan rail's; the Metal rail seeds through its own encoder.
-#[cfg_attr(not(feature = "backend-vulkan"), allow(dead_code))]
+#[allow(dead_code)]
 pub(crate) fn write_gva_solid8<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -5881,8 +6110,9 @@ pub(crate) fn seed_color_load_native<M: HostMemory + HostOps>(
     height: u32,
     target_format: u16,
 ) -> Option<(Vec<u8>, TexelLayout)> {
-    let want_native = pixel_format::store_texel_order(target_format)
-        .is_some_and(|layout| !layout.is_four_byte_color());
+    let want_native = pixel_format::is_xr10(target_format)
+        || pixel_format::store_texel_order(target_format)
+            .is_some_and(|layout| !layout.is_four_byte_color());
     if want_native {
         let native = NativeUploads {
             bgra8: false,

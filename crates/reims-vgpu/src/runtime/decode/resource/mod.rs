@@ -428,6 +428,8 @@ pub struct TextureDescriptor {
     pub pixel_format: u16,
     /// Per-mip layouts (index 0 = L0). Empty if geometry incomplete.
     pub levels: Vec<TextureLevelLayout>,
+    /// Optional Plane 1 (alpha) layout decoded from [`OBJECT_TYPE_TWIN_LAYOUT_TEXTURE`].
+    pub alpha_plane: Option<TextureLevelLayout>,
 }
 
 impl TextureDescriptor {
@@ -505,6 +507,23 @@ impl TextureDescriptor {
             return None;
         }
         // Offset must leave room for at least one row within the allocation.
+        if self.allocation_size != 0
+            && (layout.offset >= self.allocation_size
+                || self.allocation_size - layout.offset < layout.row_stride)
+        {
+            return None;
+        }
+        Some((base.checked_add(layout.offset)?, layout))
+    }
+
+    /// Guest VA and layout of Plane 1 (8-bit alpha) on a two-plane type-12
+    /// texture, when the descriptor carried one.
+    pub fn alpha_plane_gva(&self, page_shift: u32) -> Option<(u64, &TextureLevelLayout)> {
+        let base = self.allocation_base_gva(page_shift)?;
+        let layout = self.alpha_plane.as_ref()?;
+        if layout.width == 0 || layout.height == 0 || layout.row_stride == 0 {
+            return None;
+        }
         if self.allocation_size != 0
             && (layout.offset >= self.allocation_size
                 || self.allocation_size - layout.offset < layout.row_stride)
@@ -1764,13 +1783,18 @@ pub struct ListObjectEntry {
     pub twin_layout: bool,
 }
 
-/// Give a type-12 descriptor type 2's shape: drop the second copy of its
-/// level-0 layout. The format is read where type 2's is.
+const TWIN_ALPHA_PLANE_MAGIC: [u8; 8] = *b"TWINPLN1";
+
+/// Give a type-12 descriptor type 2's shape while preserving its Plane 1
+/// level-0 layout in a self-identifying trailer for [`decode_texture_descriptor`].
 pub fn reshape_twin_layout_descriptor(bytes: &mut Vec<u8>) -> bool {
     if bytes.len() < TEXTURE_DESC_PIXEL_FORMAT + 2 + TWIN_LAYOUT_COPY.len() {
         return false;
     }
+    let plane1 = bytes[TWIN_LAYOUT_COPY].to_vec();
     bytes.drain(TWIN_LAYOUT_COPY);
+    bytes.extend_from_slice(&TWIN_ALPHA_PLANE_MAGIC);
+    bytes.extend_from_slice(&plane1);
     true
 }
 
@@ -1853,6 +1877,20 @@ pub fn decode_memoryless_texture_descriptor(
 }
 
 pub fn decode_texture_descriptor(bytes: &[u8]) -> Result<TextureDescriptor, DecodeStatus> {
+    let trailer_len = TWIN_ALPHA_PLANE_MAGIC.len() + TWIN_LAYOUT_COPY.len();
+    let (bytes, twin_plane1) = if bytes.len() >= TEXTURE_DESC_GEOMETRY_LEN + trailer_len {
+        let split = bytes.len() - trailer_len;
+        if bytes[split..split + TWIN_ALPHA_PLANE_MAGIC.len()] == TWIN_ALPHA_PLANE_MAGIC {
+            (
+                &bytes[..split],
+                Some(&bytes[split + TWIN_ALPHA_PLANE_MAGIC.len()..]),
+            )
+        } else {
+            (bytes, None)
+        }
+    } else {
+        (bytes, None)
+    };
     if bytes.len() < TEXTURE_DESC_GEOMETRY_LEN {
         return Err(DecodeStatus::ErrShort("res_texture_desc_short"));
     }
@@ -2001,6 +2039,35 @@ pub fn decode_texture_descriptor(bytes: &[u8]) -> Result<TextureDescriptor, Deco
              (multi-mip body too short for its shifted format trailer)",
             bytes.len()
         ));
+    }
+    if let Some(p1) = twin_plane1 {
+        let off_rel = TEXTURE_DESC_DATA_OFFSET - TEXTURE_DESC_MIPMAP_LEVEL_COUNT;
+        let used_rel = TEXTURE_DESC_USED_SIZE - TEXTURE_DESC_MIPMAP_LEVEL_COUNT;
+        let bpr_rel = TEXTURE_DESC_ROW_STRIDE - TEXTURE_DESC_MIPMAP_LEVEL_COUNT;
+        let w_rel = TEXTURE_DESC_WIDTH - TEXTURE_DESC_MIPMAP_LEVEL_COUNT;
+        let h_rel = TEXTURE_DESC_HEIGHT - TEXTURE_DESC_MIPMAP_LEVEL_COUNT;
+        let d_rel = TEXTURE_DESC_DEPTH - TEXTURE_DESC_MIPMAP_LEVEL_COUNT;
+        let offset = u64::from(ld32(&p1[off_rel..]));
+        let used_size = u64::from(ld32(&p1[used_rel..]));
+        let row_stride = u64::from(ld32(&p1[bpr_rel..]));
+        let width = ld32(&p1[w_rel..]);
+        let height = ld32(&p1[h_rel..]);
+        let depth = ld32(&p1[d_rel..]).max(1);
+        let size = if used_size != 0 {
+            used_size
+        } else {
+            row_stride.saturating_mul(u64::from(height))
+        };
+        if width != 0 && height != 0 && row_stride != 0 {
+            out.alpha_plane = Some(TextureLevelLayout {
+                offset,
+                size,
+                row_stride,
+                width,
+                height,
+                depth,
+            });
+        }
     }
     Ok(out)
 }

@@ -6957,6 +6957,7 @@ fn a_gva_span_no_store_has_stamped_refuses_the_resident_sample_rung() {
             height,
             depth: 1,
         }],
+        alpha_plane: None,
     };
     let gva = tex
         .level_gva(0, state.page_shift)
@@ -7443,4 +7444,132 @@ fn a_dontcare_colour_attachment_is_still_served_its_prior_contents() {
         !type11_load_is_a_seed_candidate(&c0),
         "an explicit provenance seed still excludes the resident candidate"
     );
+}
+
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn type12_xr10_two_plane_store_and_sample_roundtrip() {
+    use crate::contract::endian::{st16, st32, st64};
+    use crate::contract::pass_action::MTL_STORE_ACTION_STORE;
+    use crate::contract::pixel_format::{
+        f16_to_f32, f32_to_f16, TexelLayout, MTL_FORMAT_RGB10A8_2P_XR10,
+    };
+    use crate::runtime::decode::resource::{
+        list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_TWIN_LAYOUT_TEXTURE,
+        TEXTURE_DESC_BYTES_PER_ELEMENT, TEXTURE_DESC_DATA_OFFSET, TEXTURE_DESC_DEPTH,
+        TEXTURE_DESC_HEIGHT, TEXTURE_DESC_MIPMAP_LEVEL_COUNT, TEXTURE_DESC_PIXEL_FORMAT,
+        TEXTURE_DESC_ROW_STRIDE, TEXTURE_DESC_USED_SIZE, TEXTURE_DESC_WIDTH,
+    };
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+    assert!(state.set_object_list(1, 0, 256));
+
+    // Place a 2x1 type-12 RGB10A8_2p_XR10 texture at base page 2 (0x8000):
+    // Plane 0 @ +0x0000 (stride 64), Plane 1 @ +0x4000 (page 3 = 0xc000, stride 64).
+    let mut desc = vec![0u8; 176];
+    st64(&mut desc[0..], 0x8000);
+    st32(&mut desc[8..], 2); // handle = page 2 -> base GVA 0x8000
+    st16(&mut desc[TEXTURE_DESC_MIPMAP_LEVEL_COUNT..], 1);
+    st32(&mut desc[TEXTURE_DESC_DATA_OFFSET..], 0);
+    desc[TEXTURE_DESC_BYTES_PER_ELEMENT] = 4;
+    st32(&mut desc[TEXTURE_DESC_USED_SIZE..], 64);
+    st32(&mut desc[TEXTURE_DESC_ROW_STRIDE..], 64);
+    st32(&mut desc[TEXTURE_DESC_WIDTH..], 2);
+    st32(&mut desc[TEXTURE_DESC_HEIGHT..], 1);
+    st32(&mut desc[TEXTURE_DESC_DEPTH..], 1);
+    // Plane 1 block at 0x48..0x84 (60 bytes mirroring 0x0c..0x48).
+    let p1 = 0x48usize;
+    st16(&mut desc[p1..], 1);
+    st32(&mut desc[p1 + (TEXTURE_DESC_DATA_OFFSET - TEXTURE_DESC_MIPMAP_LEVEL_COUNT)..], 0x4000);
+    desc[p1 + (TEXTURE_DESC_BYTES_PER_ELEMENT - TEXTURE_DESC_MIPMAP_LEVEL_COUNT)] = 1;
+    st32(&mut desc[p1 + (TEXTURE_DESC_USED_SIZE - TEXTURE_DESC_MIPMAP_LEVEL_COUNT)..], 64);
+    st32(&mut desc[p1 + (TEXTURE_DESC_ROW_STRIDE - TEXTURE_DESC_MIPMAP_LEVEL_COUNT)..], 64);
+    st32(&mut desc[p1 + (TEXTURE_DESC_WIDTH - TEXTURE_DESC_MIPMAP_LEVEL_COUNT)..], 2);
+    st32(&mut desc[p1 + (TEXTURE_DESC_HEIGHT - TEXTURE_DESC_MIPMAP_LEVEL_COUNT)..], 1);
+    st32(&mut desc[p1 + (TEXTURE_DESC_DEPTH - TEXTURE_DESC_MIPMAP_LEVEL_COUNT)..], 1);
+    st16(&mut desc[TEXTURE_DESC_PIXEL_FORMAT + 60..], MTL_FORMAT_RGB10A8_2P_XR10);
+
+    let desc_gva = 0x400u64;
+    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, &desc);
+    let entry_off = list_object_entry_offset(7, 256).unwrap();
+    let mut entry = [0u8; OBJECT_LIST_ENTRY_LEN];
+    st32(
+        &mut entry[0..],
+        u32::from(OBJECT_TYPE_TWIN_LAYOUT_TEXTURE) | ((desc.len() as u32) << 8),
+    );
+    entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
+    write_task_gva_arm64e(&mut host, &state.tasks[1], entry_off, &entry);
+
+    let alpha = resolve_alpha_plane_for_target(
+        &state,
+        &host,
+        1,
+        7,
+        0x8000,
+        2,
+        1,
+        MTL_FORMAT_RGB10A8_2P_XR10,
+    );
+    assert_eq!(alpha, Some((0xc000, 64)));
+
+    let c0 = ColorRtRequest {
+        texture_ref: 7,
+        target_gva: 0x8000,
+        row_stride: 64,
+        width: 2,
+        height: 1,
+        format: MTL_FORMAT_RGB10A8_2P_XR10,
+        store_action: MTL_STORE_ACTION_STORE,
+        ..Default::default()
+    };
+    let pages = sync_store_target_pages(&state, &host, 1, &c0).expect("store pages");
+    assert!(
+        pages.ordered_complete(0x8000, 1 << PAGE_SHIFT_ARM64E).is_some(),
+        "Plane 1 membership must not perturb Plane 0 ordered_complete"
+    );
+
+    // Pixel 0: extended-range [1.25, -0.25, 0.5, 0.5]; Pixel 1: transparent [0.0, 0.0, 0.0, 0.0].
+    let px0 = [1.25f32, -0.25, 0.5, 0.5];
+    let px1 = [0.0f32, 0.0, 0.0, 0.0];
+    let mut rgba16f = Vec::with_capacity(16);
+    for ch in px0.into_iter().chain(px1) {
+        rgba16f.extend_from_slice(&f32_to_f16(ch).to_le_bytes());
+    }
+    write_gva_xr10_from_rgba16f_within(
+        &mut state,
+        &mut host,
+        1,
+        0x8000,
+        2,
+        1,
+        64,
+        MTL_FORMAT_RGB10A8_2P_XR10,
+        alpha,
+        &rgba16f,
+        Some(pages.membership()),
+    )
+    .expect("two-plane XR10 store within armed Plane 0 + Plane 1 pages");
+
+    let (loaded, fmt) = load_linear_texture_host(
+        &mut state,
+        &mut host,
+        1,
+        7,
+        0,
+        None,
+        NativeUploads::ALL,
+        crate::runtime::render_writeback::SettleSite::LinearTextureSampled,
+    )
+    .expect("two-plane XR10 sampled load");
+    assert_eq!(fmt.layout(), TexelLayout::Rgba16Float);
+    let read_f32 = |off: usize| -> f32 {
+        f16_to_f32(u16::from_le_bytes([loaded[off], loaded[off + 1]]))
+    };
+    assert!((read_f32(0) - 1.25).abs() < 0.004);
+    assert!((read_f32(2) - (-0.25)).abs() < 0.004);
+    assert!((read_f32(4) - 0.5).abs() < 0.004);
+    assert!((read_f32(6) - (128.0 / 255.0)).abs() < 0.004);
+    assert!((read_f32(14) - 0.0).abs() < 1e-4, "Plane 1 zero alpha must survive");
 }
