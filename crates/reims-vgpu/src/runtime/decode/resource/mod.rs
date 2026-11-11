@@ -2956,7 +2956,7 @@ pub fn decode_render_pipeline_descriptor(
         }
         if color_abs < declared {
             out.color_attachments = parse_color_attachments(bytes, declared, color_abs)?;
-            if let Some(c0) = out.color_attachments.first().copied() {
+            if let Some(c0) = out.color_attachments.iter().find(|a| a.slot == 0).copied() {
                 out.color0 = c0;
             }
         }

@@ -3201,3 +3201,42 @@ fn a_declared_input_primitive_topology_does_not_refuse_the_pipeline() {
     assert!(RENDER_PIPELINE_TAGS_BENIGN.contains(&PIPELINE_TAG_INPUT_PRIMITIVE_TOPOLOGY));
     assert!(!RENDER_PIPELINE_TAGS_BENIGN.contains(&0x6d));
 }
+
+#[test]
+fn sparse_secondary_color_attachment_does_not_alias_color0() {
+    use crate::contract::endian::st32;
+
+    let mut b = vec![0u8; 64];
+    st32(&mut b[0..], TYPE7_OBJECT_RENDER_PIPELINE);
+    st32(&mut b[8..], 21);
+    b[16] = 1;
+    b[17] = PIPELINE_TAG_COLOR_ATTACH_OFFSET;
+    b[18] = 4;
+    let color_rel = 8u32;
+    st32(&mut b[19..], color_rel);
+    let section = 16 + color_rel as usize;
+    st32(&mut b[section..], 1);
+    st32(&mut b[section + 4..], 8);
+    let entry = section + 8;
+    b[entry] = 3;
+    b[entry + 1] = COLOR_ATTACHMENT_TAG_INDEX;
+    b[entry + 2] = 4;
+    st32(&mut b[entry + 3..], 1);
+    b[entry + 7] = COLOR_ATTACHMENT_TAG_PIXEL_FORMAT;
+    b[entry + 8] = 4;
+    st32(&mut b[entry + 9..], 0x69);
+    b[entry + 13] = COLOR_ATTACHMENT_TAG_BLEND_ENABLE;
+    b[entry + 14] = 4;
+    st32(&mut b[entry + 15..], 1);
+    let end = (entry + 19 + 3) & !3;
+    b.truncate(end);
+    let payload_len = (end - 16) as u32;
+    st32(&mut b[4..], end as u32);
+    st32(&mut b[12..], payload_len);
+
+    let pd = decode_render_pipeline_descriptor(&b).expect("sparse secondary pipeline decodes");
+    assert_eq!(pd.color_attachments.len(), 1);
+    assert_eq!(pd.color_attachments[0].slot, 1);
+    assert!(pd.color_attachments[0].blending_enabled);
+    assert_eq!(pd.color0, PipelineColorAttachment::default());
+}

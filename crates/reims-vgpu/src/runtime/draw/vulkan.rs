@@ -6629,6 +6629,35 @@ pub(super) fn secondary_target_identity<M: HostMemory + HostOps>(
     }
 }
 
+/// Zero color write masks and disable blending on attachments not declared by
+/// the fragment stage output interface.
+///
+/// In Metal, omitting `[[color(i)]]` from a fragment return type leaves
+/// attachment `i` untouched even when the pipeline color attachment carries the
+/// default `MTLColorWriteMaskAll`. Vulkan instead writes undefined values to
+/// every render-pass color attachment whose `colorWriteMask` is non-zero when
+/// the fragment shader declares no output at `Location = i` (Vulkan 15.2,
+/// Fragment Output Interface).
+fn mask_unwritten_render_targets(
+    render_targets: &[metal2vulkan::reflect::RenderTarget],
+    primary_mask: &mut crate::runtime::decode::resource::ColorWriteMask,
+    primary_blend: &mut Option<crate::backend::vulkan::engine::BlendStateResource>,
+    secondary_targets: &mut [crate::backend::vulkan::engine::SecondaryColorTarget],
+) {
+    let none = crate::runtime::decode::resource::ColorWriteMask::NONE;
+    if !render_targets.iter().any(|rt| rt.location == 0) {
+        *primary_mask = none;
+        *primary_blend = None;
+    }
+    for (idx, target) in secondary_targets.iter_mut().enumerate() {
+        let loc = (idx + 1) as u32;
+        if !render_targets.iter().any(|rt| rt.location == loc) {
+            target.color_write_mask = none;
+            target.blend = None;
+        }
+    }
+}
+
 pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -8955,20 +8984,17 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // alone, so gating the mask on blending would drop it exactly where the
         // guest is replacing rather than compositing.
         crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Assemble);
-        resources.color_write_mask = pd.color0.write_mask;
-        if f_shader.reflection.render_targets.is_empty() {
-            // The fragment stage writes no colour (a scratch storage write, or a
-            // pipeline with no fragment function), so no attachment may change.
-            let none = crate::runtime::decode::resource::ColorWriteMask::new(0)
-                .expect("an empty mask is in range");
-            resources.color_write_mask = none;
-            for target in &mut resources.secondary_targets {
-                target.color_write_mask = none;
-            }
-        }
-        if pd.color0.blending_enabled {
+        let primary_att = if pd.color_attachments.is_empty() {
+            Some(&pd.color0)
+        } else {
+            pd.color_attachments.iter().find(|a| a.slot == 0)
+        };
+        let empty_mask = crate::runtime::decode::resource::ColorWriteMask::new(0)
+            .expect("an empty mask is in range");
+        resources.color_write_mask = primary_att.map_or(empty_mask, |a| a.write_mask);
+        if let Some(att0) = primary_att.filter(|a| a.blending_enabled) {
             let constants = req.blend_color.unwrap_or([0.0; 4]);
-            match translate::blend::state(&pd.color0, constants) {
+            match translate::blend::state(att0, constants) {
                 Ok(b) => {
                     resources.blend = Some(b);
                 }
@@ -9528,6 +9554,12 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 )
             })?;
         }
+        mask_unwritten_render_targets(
+            &f_shader.reflection.render_targets,
+            &mut resources.color_write_mask,
+            &mut resources.blend,
+            &mut resources.secondary_targets,
+        );
         // The engine's own typed `DrawError` (a `vk_*` VkCall slug, a
         // `DrawReason` refusal, an interim `_untyped`) propagates unchanged so
         // the boundary below names the engine's specific check as the primary
@@ -13141,6 +13173,107 @@ mod vulkan_split_tests {
 
         req.colors[0].buffer_backed = true;
         assert!(!super::gva_store_defer_eligible(&req));
+    }
+
+    #[test]
+    fn mask_unwritten_render_targets_preserves_only_declared_locations() {
+        use crate::backend::vulkan::engine::{
+            BlendFactor, BlendOp, BlendStateResource, SecondaryColorTarget, TargetIdentity,
+        };
+        use crate::runtime::decode::resource::ColorWriteMask;
+        use metal2vulkan::reflect::RenderTarget;
+
+        let sample_blend = BlendStateResource {
+            src_color: BlendFactor::One,
+            dst_color: BlendFactor::OneMinusSrcAlpha,
+            color_op: BlendOp::Add,
+            src_alpha: BlendFactor::One,
+            dst_alpha: BlendFactor::OneMinusSrcAlpha,
+            alpha_op: BlendOp::Add,
+            constants: [0.0; 4],
+        };
+        let make_secs = || {
+            vec![
+                SecondaryColorTarget {
+                    identity: TargetIdentity::Texture {
+                        ref_: 11,
+                        width: 64,
+                        height: 64,
+                        generation: 1,
+                        stencil: false,
+                    },
+                    width: 64,
+                    height: 64,
+                    format: ash::vk::Format::R8G8B8A8_UNORM,
+                    clear: [0.0; 4],
+                    load: true,
+                    blend: Some(sample_blend),
+                    color_write_mask: ColorWriteMask::ALL,
+                },
+                SecondaryColorTarget {
+                    identity: TargetIdentity::Texture {
+                        ref_: 12,
+                        width: 64,
+                        height: 64,
+                        generation: 1,
+                        stencil: false,
+                    },
+                    width: 64,
+                    height: 64,
+                    format: ash::vk::Format::R8G8B8A8_UNORM,
+                    clear: [0.0; 4],
+                    load: true,
+                    blend: Some(sample_blend),
+                    color_write_mask: ColorWriteMask::ALL,
+                },
+            ]
+        };
+        let rt = |location| RenderTarget {
+            member_index: 0,
+            location,
+            type_name: None,
+        };
+
+        // Coverage-only shader (`[[color(1)]]`) in a 3-MRT RenderBox pass:
+        // slot 0 and slot 2 must be masked off; slot 1 keeps mask + blend.
+        let mut c0_mask = ColorWriteMask::ALL;
+        let mut c0_blend = Some(sample_blend);
+        let mut secs = make_secs();
+        super::mask_unwritten_render_targets(&[rt(1)], &mut c0_mask, &mut c0_blend, &mut secs);
+        assert_eq!(c0_mask, ColorWriteMask::NONE);
+        assert!(c0_blend.is_none());
+        assert_eq!(secs[0].color_write_mask, ColorWriteMask::ALL);
+        assert!(secs[0].blend.is_some());
+        assert_eq!(secs[1].color_write_mask, ColorWriteMask::NONE);
+        assert!(secs[1].blend.is_none());
+
+        // Color0-only shader (`[[color(0)]]`) in a 2-MRT Liquid Glass pass:
+        // slot 0 keeps mask + blend; slot 1 SDF/refraction map is untouched.
+        let mut c0_mask = ColorWriteMask::ALL;
+        let mut c0_blend = Some(sample_blend);
+        let mut secs = make_secs();
+        secs.truncate(1);
+        super::mask_unwritten_render_targets(&[rt(0)], &mut c0_mask, &mut c0_blend, &mut secs);
+        assert_eq!(c0_mask, ColorWriteMask::ALL);
+        assert!(c0_blend.is_some());
+        assert_eq!(secs[0].color_write_mask, ColorWriteMask::NONE);
+        assert!(secs[0].blend.is_none());
+
+        // Sublayer shader (`[[color(1)]], [[color(2)]]`) in a 3-MRT pass:
+        // slot 0 is masked off; slots 1 and 2 remain active.
+        let mut c0_mask = ColorWriteMask::ALL;
+        let mut c0_blend = Some(sample_blend);
+        let mut secs = make_secs();
+        super::mask_unwritten_render_targets(
+            &[rt(1), rt(2)],
+            &mut c0_mask,
+            &mut c0_blend,
+            &mut secs,
+        );
+        assert_eq!(c0_mask, ColorWriteMask::NONE);
+        assert!(c0_blend.is_none());
+        assert_eq!(secs[0].color_write_mask, ColorWriteMask::ALL);
+        assert_eq!(secs[1].color_write_mask, ColorWriteMask::ALL);
     }
 }
 
