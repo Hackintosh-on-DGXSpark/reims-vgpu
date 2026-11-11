@@ -6612,11 +6612,16 @@ pub(super) fn secondary_target_identity<M: HostMemory + HostOps>(
     {
         Some(heap_target_identity(task_id, target, c.width, c.height))
     } else if c.memoryless {
+        let generation = state
+            .task_resources
+            .get(task_id, c.texture_ref)
+            .map(|resource| resource.lifetime_ref().id())
+            .unwrap_or(0);
         Some(TargetIdentity::Texture {
             ref_: c.texture_ref,
             width: c.width,
             height: c.height,
-            generation: 0,
+            generation,
             stencil: false,
         })
     } else {
@@ -9822,7 +9827,20 @@ pub(crate) fn retain_heap_target(
 
 fn retain_pass_heap_targets(state: &DeviceState, req: &DrawEncodeRequest) {
     for c in &req.colors {
-        if c.mapping_id != 0 || c.target_gva != 0 || c.memoryless {
+        if c.mapping_id != 0 || c.target_gva != 0 {
+            continue;
+        }
+        if c.memoryless {
+            if let Some(resource) = state.task_resources.get(req.task_id, c.texture_ref) {
+                let identity = crate::backend::vulkan::engine::TargetIdentity::Texture {
+                    ref_: c.texture_ref,
+                    width: c.width,
+                    height: c.height,
+                    generation: resource.lifetime_ref().id(),
+                    stencil: false,
+                };
+                let _ = resource.resident_target_backing(&identity);
+            }
             continue;
         }
         if let Some(&target) = state.heap_texture_targets.get(&(req.task_id, c.texture_ref)) {

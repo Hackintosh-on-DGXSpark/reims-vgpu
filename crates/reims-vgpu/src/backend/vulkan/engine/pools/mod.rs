@@ -2094,8 +2094,13 @@ impl ResidentTargetSlot {
     /// the guest's IOSurface pages, so releasing a texture object cannot lose a
     /// frame. The window exists only because this device defers, and it closes
     /// where the deferral is recorded.
-    pub(crate) fn released_and_collectable(&self) -> bool {
-        self.resource_released && self.pin_count == 0 && !self.gpu_only_content
+    pub(crate) fn released_and_collectable(&self, identity: &TargetIdentity) -> bool {
+        let owes_guest_copy_out = self.gpu_only_content
+            && matches!(
+                identity,
+                TargetIdentity::Surface { .. } | TargetIdentity::Gva { .. }
+            );
+        self.resource_released && self.pin_count == 0 && !owes_guest_copy_out
     }
 
     /// Whether this slot's image may be re-used for a request of this geometry,

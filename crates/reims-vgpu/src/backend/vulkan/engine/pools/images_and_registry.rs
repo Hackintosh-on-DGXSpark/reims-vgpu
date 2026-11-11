@@ -2016,7 +2016,7 @@ impl ResourcePools {
         Some(
             self.registry
                 .get(identity)
-                .is_some_and(ResidentTargetSlot::released_and_collectable),
+                .is_some_and(|slot| slot.released_and_collectable(identity)),
         )
     }
 
@@ -2026,7 +2026,7 @@ impl ResourcePools {
             .filter(|identity| {
                 self.registry
                     .get(*identity)
-                    .is_some_and(ResidentTargetSlot::released_and_collectable)
+                    .is_some_and(|slot| slot.released_and_collectable(*identity))
             })
             .take(max)
             .cloned()
@@ -2949,6 +2949,41 @@ pub(super) mod pin_count_tests {
             vec![id],
             "once the frame is in the guest's pages the slot is collectable"
         );
+    }
+
+    #[test]
+    fn released_private_residents_do_not_wait_for_a_guest_copy_out_that_cannot_happen() {
+        for id in [
+            TargetIdentity::Heap {
+                task_id: 3,
+                ref_: 9,
+                width: 64,
+                height: 64,
+                generation: 7,
+                format: translate::pixel::RESIDENT_RGBA_FORMAT,
+            },
+            TargetIdentity::Texture {
+                ref_: 11,
+                width: 64,
+                height: 64,
+                generation: 8,
+                stencil: false,
+            },
+        ] {
+            let mut pools = ResourcePools::new();
+            pools.registry.insert(id.clone(), dummy_slot(true));
+            pools.registry_order.push_back(id.clone());
+
+            assert_eq!(pools.retain_resident_target(&id), Some(false));
+            pools.registry_mark_ready(&id);
+            assert!(pools.registry[&id].gpu_only_content);
+            assert_eq!(
+                pools.release_resident_ownership(&id),
+                Some(true),
+                "private residents have no guest pages to copy out to: {id:?}"
+            );
+            assert_eq!(pools.released_resident_keys(1), vec![id]);
+        }
     }
 
     fn surf(id: u32) -> TargetIdentity {
