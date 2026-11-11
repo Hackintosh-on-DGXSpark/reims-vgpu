@@ -2096,6 +2096,13 @@ pub fn clear_resident_target(
     let clears = [ash::vk::ClearValue { color: clear_val }];
     unsafe {
         let (cb, fence) = pools.begin_entry(ctx, counters)?;
+        pools.begin_slot_recording(
+            ctx,
+            cb,
+            gpu_span::Kind::Draw,
+            VkOp::GuestWriteResetCb,
+            VkOp::GuestWriteBeginCb,
+        )?;
         if prior_access != pools::ResidentAccess::Untouched {
             let (src_stage, src_access) = prior_access.source_scope();
             let barrier = [ash::vk::MemoryBarrier::default()
@@ -2162,6 +2169,42 @@ mod resident_content_backing_tests {
             classify_resident_content(false, false),
             ResidentContentBacking::NotReady
         );
+    }
+
+    #[test]
+    fn clear_resident_target_survives_ring_wrap_and_publishes_native_float16() {
+        let identity = TargetIdentity::Gva {
+            gva: 0xDEAD_BEEF_7000,
+            width: 4,
+            height: 4,
+            generation: 1,
+            format: ash::vk::Format::R16G16B16A16_SFLOAT,
+        };
+        for i in 0..40 {
+            match clear_resident_target(
+                identity.clone(),
+                [-0.5, 2.0, 0.25, 1.0 + i as f64 * 0.0],
+                crate::contract::pixel_format::MTL_FORMAT_RGBA16_FLOAT,
+            ) {
+                Ok(()) => {}
+                Err(DrawError::Init(_)) => return,
+                Err(other) => panic!("unexpected clear_resident_target failure at {i}: {other:?}"),
+            }
+        }
+        let rb = read_target_native(&identity).expect("cleared GVA resident must be readable");
+        assert_eq!(
+            rb.layout,
+            crate::contract::pixel_format::TexelLayout::Rgba16Float
+        );
+        assert_eq!(rb.pixels.len(), 4 * 4 * 8);
+        let expected = crate::contract::pixel_format::solid_native_texels(
+            4,
+            4,
+            crate::contract::pixel_format::TexelLayout::Rgba16Float,
+            &[-0.5, 2.0, 0.25, 1.0],
+        )
+        .unwrap();
+        assert_eq!(rb.pixels, expected);
     }
 }
 
