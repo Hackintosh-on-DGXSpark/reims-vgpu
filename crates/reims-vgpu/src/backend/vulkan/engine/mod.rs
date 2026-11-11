@@ -172,7 +172,10 @@ pub(crate) fn registry_subresource_range(
 /// geometry matches. Deriving usage here makes "same bucket implies same usage"
 /// true by construction, so a fourth creation site cannot get it wrong and
 /// nothing has to scan for one that did.
-pub(crate) fn registry_target_usage(format: ash::vk::Format) -> ash::vk::ImageUsageFlags {
+pub(crate) fn registry_target_usage(
+    format: ash::vk::Format,
+    attachment_feedback_loop_layout: bool,
+) -> ash::vk::ImageUsageFlags {
     if format_is_depth(format) {
         // A depth resident is only ever attachment N of an ad-hoc framebuffer.
         // No SAMPLED and no TRANSFER: nothing in this device reads a depth
@@ -181,11 +184,15 @@ pub(crate) fn registry_target_usage(format: ash::vk::Format) -> ash::vk::ImageUs
         // support the attachment alone.
         ash::vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
     } else {
-        ash::vk::ImageUsageFlags::COLOR_ATTACHMENT
+        let mut usage = ash::vk::ImageUsageFlags::COLOR_ATTACHMENT
             | ash::vk::ImageUsageFlags::INPUT_ATTACHMENT
             | ash::vk::ImageUsageFlags::TRANSFER_SRC
             | ash::vk::ImageUsageFlags::TRANSFER_DST
-            | ash::vk::ImageUsageFlags::SAMPLED
+            | ash::vk::ImageUsageFlags::SAMPLED;
+        if attachment_feedback_loop_layout {
+            usage |= ash::vk::ImageUsageFlags::ATTACHMENT_FEEDBACK_LOOP_EXT;
+        }
+        usage
     }
 }
 
@@ -3682,7 +3689,7 @@ pub fn probe_guest_backed_target(
             width,
             height,
             format,
-            registry_target_usage(format),
+            registry_target_usage(format, ctx.features.attachment_feedback_loop_layout),
         )
     };
 }

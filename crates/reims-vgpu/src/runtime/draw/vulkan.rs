@@ -10286,9 +10286,24 @@ fn merge_guest_writes_into_pages<M: HostMemory + HostOps>(
     }
     let readback = match crate::backend::vulkan::engine::read_target(identity) {
         Ok(rb) => rb,
-        Err(e) => {
+        Err(first_err) => {
+            if let Ok(native) = crate::backend::vulkan::engine::read_target_native(identity) {
+                if mapping_write::write_native_skipping(
+                    state,
+                    host,
+                    mapping_id,
+                    &native.pixels,
+                    width,
+                    height,
+                    native.layout,
+                    guest_owned,
+                ) {
+                    crate::runtime::drain::note_store_route("t11sample_resident_merged");
+                    return true;
+                }
+            }
             crate::observe::fail(format!(
-                "sampled_resident_merge_fail mid={mapping_id} {width}x{height} stage=readback err={e:?}"
+                "sampled_resident_merge_fail mid={mapping_id} {width}x{height} stage=readback err={first_err:?}"
             ));
             return false;
         }

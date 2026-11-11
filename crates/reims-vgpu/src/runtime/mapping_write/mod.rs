@@ -681,6 +681,97 @@ pub fn write_native_uncached<M: HostMemory + HostOps>(
     true
 }
 
+/// [`write_native_uncached`], leaving `skip` mapping-offset ranges untouched so
+/// partial CPU writes on a wide/non-4-byte surface merge cleanly with its GPU resident.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "native geometry, resident layout, and guest-owned skip ranges"
+)]
+pub fn write_native_skipping<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+    src: &[u8],
+    width: u32,
+    height: u32,
+    resident_layout: pixel_format::TexelLayout,
+    skip: SkipRanges<'_>,
+) -> bool {
+    if skip.is_empty() {
+        return write_native_uncached(state, host, mapping_id, src, width, height, resident_layout);
+    }
+    if !scanout_extent_ok(width, height) {
+        return false;
+    }
+    let (base_off, surface_bpr, span_end, bpp) = {
+        let Some(m) = state.mappings.get(&mapping_id) else {
+            return false;
+        };
+        if !m.mapped || m.page_entries.is_empty() {
+            return false;
+        }
+        let (mw, mh, format) = mapping_write_geometry(m, width, height);
+        if mw != width || mh != height {
+            return false;
+        }
+        if pixel_format::store_texel_order(format) != Some(resident_layout) {
+            return false;
+        }
+        let Some((base_off, bpr, span_end)) = type11_sample_window(m, mw, mh, format) else {
+            return false;
+        };
+        (base_off, bpr, span_end, resident_layout.bytes_per_texel())
+    };
+    let tight = (width as usize).saturating_mul(bpp as usize);
+    let need_src = tight.saturating_mul(height as usize);
+    if src.len() < need_src || (surface_bpr as usize) < tight {
+        return false;
+    }
+    crate::runtime::writeback_debt::supersede_for_mapping(
+        state,
+        mapping_id,
+        crate::runtime::render_writeback::SettleSite::MappingBgra8Write,
+    );
+    let Some(vouched) = vouch_for_write(state, host, mapping_id, "native_skip") else {
+        return false;
+    };
+    let bpr = surface_bpr as usize;
+    let frame_len = (height as usize)
+        .saturating_sub(1)
+        .saturating_mul(bpr)
+        .saturating_add(tight);
+    let mut frame = vec![0u8; frame_len];
+    let mut runs: Vec<(u64, u64)> = Vec::new();
+    for y in 0..height {
+        let src_off = (y as usize) * tight;
+        let dst_off = (y as usize) * bpr;
+        frame[dst_off..dst_off + tight].copy_from_slice(&src[src_off..src_off + tight]);
+        let row_lo = base_off.saturating_add((y as u64).saturating_mul(surface_bpr as u64));
+        for (lo, hi) in unskipped(row_lo, row_lo.saturating_add(tight as u64), skip) {
+            match runs.last_mut() {
+                Some(last) if last.1 == lo => last.1 = hi,
+                _ => runs.push((lo, hi)),
+            }
+        }
+    }
+    if !mapper::write_mapping_bytes_only(
+        state,
+        host,
+        mapping_id,
+        base_off,
+        &frame,
+        Some(&runs),
+        &vouched,
+    ) {
+        return false;
+    }
+    state.invalidate_storage_residency_window(mapping_id, base_off, span_end);
+    let _ = state.mark_mapping_written(mapping_id);
+    crate::runtime::surface_cache::forget(state, mapping_id);
+    crate::runtime::mapper::stamp_guest_write_gen(state, host, mapping_id);
+    true
+}
+
 /// A check that stopped a resident's frame from reaching the guest's pages
 /// without a host copy, so the flush owes the copying rail instead.
 ///

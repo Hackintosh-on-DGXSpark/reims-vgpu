@@ -2100,6 +2100,18 @@ pub fn texel_to_rgba8(format: u16, src: &[u8]) -> Option<[u8; 4]> {
             rgba[COMPONENT_B] = ((u32::from(ld16(&src[4..6])) * 255 + 32768) >> 16) as u8;
             rgba[COMPONENT_A] = ((u32::from(ld16(&src[6..8])) * 255 + 32768) >> 16) as u8;
         }
+        MTL_FORMAT_RGBA32_FLOAT => {
+            for c in 0..4 {
+                let f = f32::from_le_bytes([
+                    src[c * 4],
+                    src[c * 4 + 1],
+                    src[c * 4 + 2],
+                    src[c * 4 + 3],
+                ]);
+                let clamped = if f.is_nan() { 0.0 } else { f.clamp(0.0, 1.0) };
+                rgba[c] = (clamped * 255.0 + 0.5) as u8;
+            }
+        }
         MTL_FORMAT_RG16_FLOAT => {
             // Two float16 channels → R,G; B has no source (0), A opaque. Mirrors
             // the RGBA16Float LUT path (values clamp to [0,1] through the u8 LUT).
@@ -2150,6 +2162,12 @@ pub fn rgba8_to_texel(format: u16, rgba: [u8; 4], dst: &mut [u8]) -> bool {
             st16(&mut dst[2..4], u16::from(rgba[COMPONENT_G]) * 257);
             st16(&mut dst[4..6], u16::from(rgba[COMPONENT_B]) * 257);
             st16(&mut dst[6..8], u16::from(rgba[COMPONENT_A]) * 257);
+        }
+        MTL_FORMAT_RGBA32_FLOAT => {
+            for c in 0..4 {
+                let f = f32::from(rgba[c]) / 255.0;
+                dst[c * 4..c * 4 + 4].copy_from_slice(&f.to_le_bytes());
+            }
         }
         MTL_FORMAT_RG16_FLOAT => {
             // R,G → two float16 channels; B,A have no destination (RG16 is
@@ -2239,6 +2257,7 @@ pub fn narrows_to_unorm8(format: u16) -> bool {
         MTL_FORMAT_RGBA16_FLOAT
             | MTL_FORMAT_RG16_FLOAT
             | MTL_FORMAT_RGBA16_UNORM
+            | MTL_FORMAT_RGBA32_FLOAT
             | MTL_FORMAT_RGB10A2_UNORM
             | MTL_FORMAT_BGR10A2_UNORM
     )

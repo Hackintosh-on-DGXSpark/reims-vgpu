@@ -4320,10 +4320,13 @@ pub(crate) unsafe fn execute_draw_inner(
         area: (req.width, req.height),
     };
     let target_feedback = pass_key.color_feedback(0);
+    let target_fetched = pass_key.color_fetched(0);
     let target_pass_layout = pass_key.color_layout(0);
     let target_dst_stage = vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
         | if target_feedback {
             vk::PipelineStageFlags::VERTEX_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER
+        } else if target_fetched {
+            vk::PipelineStageFlags::FRAGMENT_SHADER
         } else {
             vk::PipelineStageFlags::empty()
         };
@@ -4331,6 +4334,11 @@ pub(crate) unsafe fn execute_draw_inner(
         | vk::AccessFlags::COLOR_ATTACHMENT_WRITE
         | if target_feedback {
             vk::AccessFlags::SHADER_READ
+        } else {
+            vk::AccessFlags::empty()
+        }
+        | if target_fetched {
+            vk::AccessFlags::INPUT_ATTACHMENT_READ
         } else {
             vk::AccessFlags::empty()
         };
@@ -4965,12 +4973,19 @@ pub(crate) unsafe fn execute_draw_inner(
         }
         let attachment_index = secondary_index + 1;
         let feedback = pass_key.color_feedback(attachment_index);
-        if feedback && req.continues_render_pass && pools.open_pass_echoes(&echo) {
+        let fetched = pass_key.color_fetched(attachment_index);
+        let desired_layout = pass_key.color_layout(attachment_index);
+        if (feedback || access.layout() == desired_layout)
+            && req.continues_render_pass
+            && pools.open_pass_echoes(&echo)
+        {
             continue;
         }
         let dst_stage = vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
             | if feedback {
                 vk::PipelineStageFlags::VERTEX_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER
+            } else if fetched {
+                vk::PipelineStageFlags::FRAGMENT_SHADER
             } else {
                 vk::PipelineStageFlags::empty()
             };
@@ -4978,6 +4993,11 @@ pub(crate) unsafe fn execute_draw_inner(
             | vk::AccessFlags::COLOR_ATTACHMENT_WRITE
             | if feedback {
                 vk::AccessFlags::SHADER_READ
+            } else {
+                vk::AccessFlags::empty()
+            }
+            | if fetched {
+                vk::AccessFlags::INPUT_ATTACHMENT_READ
             } else {
                 vk::AccessFlags::empty()
             };
@@ -5235,6 +5255,23 @@ pub(crate) unsafe fn execute_draw_inner(
             dst_stage,
             vk::DependencyFlags::BY_REGION
                 | super::feedback_transition_dependency(pass_key.color_layout(0)),
+            &barrier,
+            &[],
+            &[],
+        );
+    }
+    if pass_key.color_inputs != 0 {
+        // Order programmable-blending (`SubpassData` `OpImageRead`) reads after
+        // preceding colour-attachment writes in the same subpass, matching
+        // `fetch_dep` in `caches::get_or_create_render_pass`.
+        let barrier = [vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+            .dst_access_mask(vk::AccessFlags::INPUT_ATTACHMENT_READ)];
+        ctx.device.cmd_pipeline_barrier(
+            cb,
+            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+            vk::PipelineStageFlags::FRAGMENT_SHADER,
+            vk::DependencyFlags::BY_REGION,
             &barrier,
             &[],
             &[],

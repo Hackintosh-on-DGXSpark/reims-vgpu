@@ -2633,7 +2633,10 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
     }
     if serve.is_some() || have_bytes {
         // Engine resident serves this window; no cache/guest read.
-    } else if let Some(cached) = crate::runtime::surface_cache::get_linear_texture(state, &window) {
+    } else if let Some(cached) = {
+        crate::runtime::writeback_debt::pay_for_texture(state, host, task_id, texture_ref);
+        crate::runtime::surface_cache::get_linear_texture(state, &window)
+    } {
         bytes.copy_from_slice(cached);
         crate::observe::off(format!(
             "compute_stage_tex linear_cache task={task_id} ref={texture_ref} gva={gva:#x} fmt={:#x} dims={w}x{h} row_stride={}",

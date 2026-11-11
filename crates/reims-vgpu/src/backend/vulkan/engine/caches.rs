@@ -2177,6 +2177,7 @@ impl ObjectCaches {
                 attribute_formats,
                 pipeline_layout: ask.pipeline_layout,
                 render_pass: ask.render_pass,
+                attachment_feedback_loop_layout: ctx.features.attachment_feedback_loop_layout,
             },
             vert: std::sync::Arc::clone(ask.vert),
             frag: std::sync::Arc::clone(ask.frag),
@@ -2738,6 +2739,7 @@ pub(crate) struct GraphicsRecipe {
     pub attribute_formats: Vec<vk::Format>,
     pub pipeline_layout: vk::PipelineLayout,
     pub render_pass: vk::RenderPass,
+    pub attachment_feedback_loop_layout: bool,
 }
 
 /// Build one graphics pipeline from `recipe`.
@@ -2943,7 +2945,9 @@ pub(crate) unsafe fn create_graphics_pipeline(
         .layout(recipe.pipeline_layout)
         .render_pass(recipe.render_pass)
         .subpass(0);
-    if key.feedback_colors != 0 {
+    if key.feedback_colors != 0
+        || (key.pass.pass_key().color_inputs != 0 && recipe.attachment_feedback_loop_layout)
+    {
         gpci = gpci.flags(vk::PipelineCreateFlags::COLOR_ATTACHMENT_FEEDBACK_LOOP_EXT);
     }
     if key.pass.has_depth() {
