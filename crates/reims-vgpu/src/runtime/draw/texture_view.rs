@@ -421,7 +421,7 @@ pub(crate) fn resolve_texture_view_reasoned<M: HostMemory + HostOps>(
 /// the chain exceeds the max depth without a non-view base, a base ref is zero,
 /// or swizzle selectors are malformed. See [`resolve_texture_view_reasoned`] for
 /// the specific reason on the fail path.
-pub(super) fn resolve_texture_view<M: HostMemory + HostOps>(
+pub(crate) fn resolve_texture_view<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &M,
     task_id: u32,

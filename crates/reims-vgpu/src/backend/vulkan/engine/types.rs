@@ -1744,6 +1744,15 @@ pub enum TargetIdentity {
         /// claimed `bgra = false`.
         format: vk::Format,
     },
+    /// Type-8 heap-placed texture namespace (opcode 0x15 / 0x38).
+    Heap {
+        task_id: u32,
+        ref_: u32,
+        width: u32,
+        height: u32,
+        generation: u64,
+        format: vk::Format,
+    },
     /// Anonymous / no protocol identity (oracle / one-shot draws).
     Anonymous { slot: u64 },
 }
@@ -1854,9 +1863,10 @@ impl TargetKeyDivergence {
 impl TargetIdentity {
     pub fn width(&self) -> u32 {
         match self {
-            Self::Surface { width, .. } | Self::Texture { width, .. } | Self::Gva { width, .. } => {
-                *width
-            }
+            Self::Surface { width, .. }
+            | Self::Texture { width, .. }
+            | Self::Gva { width, .. }
+            | Self::Heap { width, .. } => *width,
             Self::Anonymous { .. } => 0,
         }
     }
@@ -1865,7 +1875,8 @@ impl TargetIdentity {
         match self {
             Self::Surface { height, .. }
             | Self::Texture { height, .. }
-            | Self::Gva { height, .. } => *height,
+            | Self::Gva { height, .. }
+            | Self::Heap { height, .. } => *height,
             Self::Anonymous { .. } => 0,
         }
     }
@@ -1874,7 +1885,8 @@ impl TargetIdentity {
         match self {
             Self::Surface { generation, .. }
             | Self::Texture { generation, .. }
-            | Self::Gva { generation, .. } => *generation,
+            | Self::Gva { generation, .. }
+            | Self::Heap { generation, .. } => *generation,
             Self::Anonymous { .. } => 0,
         }
     }
@@ -1896,6 +1908,9 @@ impl TargetIdentity {
             Self::Texture { ref_, .. } => (1, u64::from(*ref_)),
             Self::Gva { gva, .. } => (2, *gva),
             Self::Anonymous { slot } => (3, *slot),
+            Self::Heap { task_id, ref_, .. } => {
+                (4, (u64::from(*task_id) << 32) | u64::from(*ref_))
+            }
         }
     }
 
@@ -1930,7 +1945,8 @@ impl TargetIdentity {
         match &mut next {
             Self::Surface { generation: g, .. }
             | Self::Texture { generation: g, .. }
-            | Self::Gva { generation: g, .. } => *g = generation,
+            | Self::Gva { generation: g, .. }
+            | Self::Heap { generation: g, .. } => *g = generation,
             Self::Anonymous { .. } => {}
         }
         next
@@ -1994,6 +2010,10 @@ impl TargetIdentity {
             (Self::Gva { gva: a, .. }, Self::Gva { gva: b, .. }) => a == b,
             (Self::Texture { ref_: a, .. }, Self::Texture { ref_: b, .. }) => a == b,
             (Self::Anonymous { slot: a }, Self::Anonymous { slot: b }) => a == b,
+            (
+                Self::Heap { task_id: ta, ref_: ra, .. },
+                Self::Heap { task_id: tb, ref_: rb, .. },
+            ) => ta == tb && ra == rb,
             _ => false,
         }
     }
@@ -2016,6 +2036,7 @@ impl TargetIdentity {
         match self {
             Self::Surface { format, .. } => *format,
             Self::Gva { format, .. } => *format,
+            Self::Heap { format, .. } => *format,
             Self::Texture { .. } | Self::Anonymous { .. } => translate::pixel::RESIDENT_RGBA_FORMAT,
         }
     }

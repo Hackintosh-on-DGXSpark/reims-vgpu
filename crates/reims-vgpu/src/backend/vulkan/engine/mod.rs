@@ -2021,6 +2021,118 @@ pub fn resident_content_ready(identity: &TargetIdentity) -> bool {
     resident_content_backing(identity) != ResidentContentBacking::NotReady
 }
 
+/// Materialize a clear-only pass on a resident target so subsequent `LOAD` or
+/// `SampledSource::Target` binds read the declared clear colour rather than an
+/// absent/unready resident.
+pub fn clear_resident_target(
+    identity: TargetIdentity,
+    clear_color: [f64; 4],
+    mtl_format: u16,
+) -> Result<(), DrawError> {
+    let _ = mtl_format;
+    let width = identity.width();
+    let height = identity.height();
+    if width == 0 || height == 0 {
+        return Ok(());
+    }
+    let mut guard = lock_engine();
+    let EngineState {
+        ref mut owner,
+        ref mut caches,
+        ref mut pools,
+        ref counters,
+        ..
+    } = *guard;
+    let ctx = owner.ensure(counters)?;
+    unsafe { pools.ensure_init(ctx, counters)? };
+    let format = identity.resident_format();
+    let pass_key = caches::PassKey::single(false, format);
+    let render_pass = unsafe { caches.get_or_create_pass(ctx, pass_key, counters, pools)? };
+    let (framebuffer, prior_access) = unsafe {
+        let (slot, _) = pools.registry_ensure(
+            ctx,
+            identity.clone(),
+            width,
+            height,
+            1,
+            render_pass,
+            pass_key.framebuffer_compatibility(),
+            identity.generation(),
+            format,
+            None,
+            counters,
+        )?;
+        (slot.framebuffer, slot.access)
+    };
+    let clear_val = match format {
+        ash::vk::Format::R8_UINT
+        | ash::vk::Format::R8G8_UINT
+        | ash::vk::Format::R16G16_UINT
+        | ash::vk::Format::R32_UINT
+        | ash::vk::Format::R8G8B8A8_UINT
+        | ash::vk::Format::R16G16B16A16_UINT
+        | ash::vk::Format::R32G32B32A32_UINT => ash::vk::ClearColorValue {
+            uint32: clear_color.map(|c| c.max(0.0) as u32),
+        },
+        ash::vk::Format::R8_SINT
+        | ash::vk::Format::R16_SINT
+        | ash::vk::Format::R32_SINT
+        | ash::vk::Format::R8G8B8A8_SINT
+        | ash::vk::Format::R16G16B16A16_SINT
+        | ash::vk::Format::R32G32B32A32_SINT => ash::vk::ClearColorValue {
+            int32: clear_color.map(|c| c as i32),
+        },
+        _ => ash::vk::ClearColorValue {
+            float32: clear_color.map(|c| c as f32),
+        },
+    };
+    let clears = [ash::vk::ClearValue { color: clear_val }];
+    unsafe {
+        let (cb, fence) = pools.begin_entry(ctx, counters)?;
+        if prior_access != pools::ResidentAccess::Untouched {
+            let (src_stage, src_access) = prior_access.source_scope();
+            let barrier = [ash::vk::MemoryBarrier::default()
+                .src_access_mask(src_access)
+                .dst_access_mask(ash::vk::AccessFlags::COLOR_ATTACHMENT_WRITE)];
+            ctx.device.cmd_pipeline_barrier(
+                cb,
+                src_stage,
+                ash::vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                ash::vk::DependencyFlags::empty(),
+                &barrier,
+                &[],
+                &[],
+            );
+        }
+        let rp_begin = ash::vk::RenderPassBeginInfo::default()
+            .render_pass(render_pass)
+            .framebuffer(framebuffer)
+            .render_area(ash::vk::Rect2D {
+                offset: ash::vk::Offset2D { x: 0, y: 0 },
+                extent: ash::vk::Extent2D { width, height },
+            })
+            .clear_values(&clears);
+        ctx.device.cmd_begin_render_pass(
+            cb,
+            &rp_begin,
+            ash::vk::SubpassContents::INLINE,
+        );
+        ctx.device.cmd_end_render_pass(cb);
+        pools.gpu_span_seal_current(ctx, cb);
+        ctx.device
+            .end_command_buffer(cb)
+            .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::GuestWriteEndCb, e)))?;
+        let cbs = [cb];
+        ctx.submit_guest_work(&cbs, fence)
+            .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::GuestWriteSubmit, e)))?;
+        let sealed = pools.seal_entry(Vec::new(), Vec::new());
+        pools.finish_entry_async(&ctx.device, sealed);
+        pools.registry_mark_ready_at(&identity, caches::color0_pass_exit_layout());
+    }
+    Ok(())
+}
+
+
 #[cfg(test)]
 mod resident_content_backing_tests {
     use super::*;

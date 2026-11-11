@@ -2332,7 +2332,8 @@ impl ResourcePools {
         self.registry_order
             .iter()
             .filter(|k| {
-                self.registry
+                !matches!(k, TargetIdentity::Heap { .. })
+                    && self.registry
                     .get(*k)
                     .is_some_and(|slot| slot.pin_count == 0 && !slot.gpu_only_content)
             })

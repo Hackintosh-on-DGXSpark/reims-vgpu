@@ -97,6 +97,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                 req.chain_from_resident = true;
             } else {
                 req.colors[0].load_action = MTL_LOAD_ACTION_DONT_CARE;
+                req.chain_from_resident = false;
             }
         }
     }
@@ -448,6 +449,9 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                 engine_refusal = Some(crate::observe::Decline::slug(&e));
                 linux_m2v_draw_failure(&e, req).fail_once(req.pipeline_ref as u64);
             }
+        }
+        if engine_refusal.is_none() {
+            retain_pass_heap_targets(state, req);
         }
     }
 
@@ -913,6 +917,11 @@ pub(super) enum SampledSourceRequest {
         crate::backend::vulkan::engine::TargetIdentity,
         ash::vk::Format,
     ),
+    TargetWithComponents(
+        crate::backend::vulkan::engine::TargetIdentity,
+        ash::vk::Format,
+        pixel_format::SwizzlePlan,
+    ),
     /// Zero-copy guest gather: the engine copies the texel bytes from
     /// imported guest RAM inside the draw CB — no CPU read, no memo, no
     /// hash. Carries the native texel layout the image is created with.
@@ -1279,29 +1288,31 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
 
     // A heap texture is sampled from the resident a pass rendered it into; one
     // nothing has rendered yet has no content anywhere this device can reach.
-    if let Some(heap) = resource
+    let heap_resource = resource.clone().or_else(|| {
+        objects::resolve_resource(state, host, task_id, texture_ref).ok()
+    });
+    if let Some((heap, generation)) = heap_resource
         .as_deref()
-        .map(|resource| (resource.entry.object_type, resource.descriptor.clone()))
-        .or_else(|| {
-            objects::resolve_resource(state, host, task_id, texture_ref)
-                .ok()
-                .map(|resource| (resource.entry.object_type, resource.descriptor.clone()))
-        })
-        .filter(|(object_type, _)| *object_type == OBJECT_TYPE_TEXTURE_VIEW)
-        .and_then(|(_, desc)| heap_texture_of(&desc))
+        .filter(|res| res.entry.object_type == OBJECT_TYPE_TEXTURE_VIEW)
+        .and_then(|res| heap_texture_of(&res.descriptor).map(|h| (h, res.lifetime_ref().id())))
     {
-        let identity = heap_target_identity(texture_ref, heap.width, heap.height);
+        let target = crate::model::HeapTargetRef {
+            base_ref: texture_ref,
+            generation,
+            base_format: heap.format,
+        };
+        let identity = heap_target_identity(task_id, target, heap.width, heap.height);
         if !crate::backend::vulkan::engine::resident_content_ready(&identity) {
             crate::runtime::drain::note_store_route("heap_sample_unrendered");
             return None;
         }
-        let format = translate::pixel::translate(heap.format).ok()?.vk;
+        let pf = translate::pixel::translate(heap.format).ok()?;
         crate::runtime::drain::note_store_route("heap_sample_resident");
         return Some((
             heap.width,
             heap.height,
             0,
-            SampledSourceRequest::Target(identity, format),
+            SampledSourceRequest::TargetWithComponents(identity, pf.vk, pf.components),
         ));
     }
 
@@ -1356,18 +1367,51 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
             }
             let heap = objects::resolve_resource(state, host, task_id, base)
                 .ok()
-                .and_then(|resource| heap_texture_of(&resource.descriptor));
-            if let Some(heap) = heap {
-                if view.level != 0 || view.pixel_format.is_some_and(|f| f != heap.format) {
+                .and_then(|res| {
+                    heap_texture_of(&res.descriptor).map(|h| (h, res.lifetime_ref().id()))
+                });
+            if let Some((heap, generation)) = heap {
+                let view_fmt = view.pixel_format.unwrap_or(heap.format);
+                let compatible = (view.level == 0)
+                    .then(|| {
+                        translate::pixel::translate(heap.format)
+                            .ok()
+                            .zip(translate::pixel::translate(view_fmt).ok())
+                    })
+                    .flatten()
+                    .filter(|(base_pf, view_pf)| {
+                        translate::pixel::stored_bytes_agree(base_pf.vk, view_pf.vk)
+                    });
+                let Some((_, view_pf)) = compatible else {
                     crate::runtime::drain::note_store_route("heaptex_view_refused");
                     crate::observe::fail(format!(
                         "heaptex_view_refused ref={texture_ref} base={base} level={} view_fmt={:?} base_fmt={:#x}",
                         view.level, view.pixel_format, heap.format
                     ));
                     return None;
+                };
+                let target = crate::model::HeapTargetRef {
+                    base_ref: base,
+                    generation,
+                    base_format: heap.format,
+                };
+                let identity = heap_target_identity(task_id, target, heap.width, heap.height);
+                if !crate::backend::vulkan::engine::resident_content_ready(&identity) {
+                    crate::runtime::drain::note_store_route("heap_sample_unrendered");
+                    return None;
                 }
                 crate::runtime::drain::note_store_route("heaptex_view");
-                return resolve_sampled_source(state, host, task_id, base, None, may_bind_resident);
+                crate::runtime::drain::note_store_route("heap_sample_resident");
+                return Some((
+                    heap.width,
+                    heap.height,
+                    0,
+                    SampledSourceRequest::TargetWithComponents(
+                        identity,
+                        view_pf.vk,
+                        view_pf.components,
+                    ),
+                ));
             }
         }
     }
@@ -6562,11 +6606,11 @@ pub(super) fn secondary_target_identity<M: HostMemory + HostOps>(
             c.width,
             c.height,
         ))
-    } else if let Some(&base) = (c.mapping_id == 0 && !c.memoryless)
+    } else if let Some(&target) = (c.mapping_id == 0 && !c.memoryless)
         .then(|| state.heap_texture_targets.get(&(task_id, c.texture_ref)))
         .flatten()
     {
-        Some(heap_target_identity(base, c.width, c.height))
+        Some(heap_target_identity(task_id, target, c.width, c.height))
     } else if c.memoryless {
         Some(TargetIdentity::Texture {
             ref_: c.texture_ref,
@@ -7802,13 +7846,22 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 // handed the guest's own bytes over untouched.
                 let mut sampled_components = pixel_format::swizzle_identity();
                 let mut source_planes = 1;
-                let source_is_target = matches!(&loaded, SampledSourceRequest::Target(_, _));
+                let source_is_target = matches!(
+                    &loaded,
+                    SampledSourceRequest::Target(_, _)
+                        | SampledSourceRequest::TargetWithComponents(_, _, _)
+                );
                 let source = match loaded {
                     SampledSourceRequest::Bytes(rgba, identity, byte_format, origin) => {
                         bytes_identity = identity;
                         sampled_vk_format = translate::pixel::vk_sampled_bytes(byte_format);
                         byte_origin = origin;
                         crate::backend::vulkan::engine::SampledSource::Bytes(rgba)
+                    }
+                    SampledSourceRequest::TargetWithComponents(identity, format, components) => {
+                        sampled_vk_format = format;
+                        sampled_components = components;
+                        crate::backend::vulkan::engine::SampledSource::Target(identity)
                     }
                     SampledSourceRequest::Target(identity, format) => {
                         sampled_vk_format = format;
@@ -9728,23 +9781,47 @@ fn land_storage_writeback<M: HostMemory + HostOps>(
 
 /// Generation of every heap texture's resident. Memoryless attachments take 0
 /// at the same reference namespace, and the two must never share a resident.
-pub(crate) const HEAP_TARGET_GENERATION: u64 = 1;
-
-/// The engine resident a heap-placed texture lives in, named by the heap
-/// texture's own reference. It persists across passes, unlike a memoryless
-/// attachment's, because a heap texture is a real texture the guest renders
-/// into once and samples later.
+/// The engine resident a heap-placed texture lives in, keyed by the task, the
+/// base heap texture's reference, its serialized resource lifetime generation,
+/// and its declared allocation format.
 pub(crate) fn heap_target_identity(
-    texture_ref: u32,
+    task_id: u32,
+    target: crate::model::HeapTargetRef,
     width: u32,
     height: u32,
 ) -> crate::backend::vulkan::engine::TargetIdentity {
-    crate::backend::vulkan::engine::TargetIdentity::Texture {
-        ref_: texture_ref,
+    crate::backend::vulkan::engine::TargetIdentity::Heap {
+        task_id,
+        ref_: target.base_ref,
         width,
         height,
-        generation: HEAP_TARGET_GENERATION,
-        stencil: false,
+        generation: target.generation,
+        format: gva_resident_format(target.base_format),
+    }
+}
+
+/// Acquire or refresh a serialized `TaskResource`'s lease over its heap
+/// resident so deleting or replacing the heap texture retires the image.
+pub(crate) fn retain_heap_target(
+    state: &DeviceState,
+    task_id: u32,
+    base_ref: u32,
+    identity: &crate::backend::vulkan::engine::TargetIdentity,
+) {
+    if let Some(resource) = state.task_resources.get(task_id, base_ref) {
+        let _ = resource.resident_target_backing(identity);
+    }
+}
+
+fn retain_pass_heap_targets(state: &DeviceState, req: &DrawEncodeRequest) {
+    for c in &req.colors {
+        if c.mapping_id != 0 || c.target_gva != 0 || c.memoryless {
+            continue;
+        }
+        if let Some(&target) = state.heap_texture_targets.get(&(req.task_id, c.texture_ref)) {
+            let identity = heap_target_identity(req.task_id, target, c.width, c.height);
+            retain_heap_target(state, req.task_id, target.base_ref, &identity);
+        }
     }
 }
 
@@ -9757,8 +9834,8 @@ fn heap_primary_identity(
     if c0.mapping_id != 0 || c0.target_gva != 0 || c0.memoryless {
         return None;
     }
-    let base = *state.heap_texture_targets.get(&(req.task_id, c0.texture_ref))?;
-    Some(heap_target_identity(base, c0.width, c0.height))
+    let target = *state.heap_texture_targets.get(&(req.task_id, c0.texture_ref))?;
+    Some(heap_target_identity(req.task_id, target, c0.width, c0.height))
 }
 
 pub(crate) fn render_chain_identity(

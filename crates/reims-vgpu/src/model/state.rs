@@ -2386,6 +2386,14 @@ impl NamedMappings {
 }
 
 /// Full device model state (backend-independent).
+/// Resolved base heap-texture identity metadata for an attachment slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeapTargetRef {
+    pub base_ref: u32,
+    pub generation: u64,
+    pub base_format: u16,
+}
+
 #[derive(Debug)]
 pub struct DeviceState {
     pub id: DeviceId,
@@ -2659,7 +2667,7 @@ pub struct DeviceState {
     /// `(task, attachment ref)` of every heap-placed texture a pass has
     /// rendered into, naming the heap texture's own ref. Such a texture has no
     /// guest storage this device can reach; it lives in an engine resident.
-    pub heap_texture_targets: std::collections::HashMap<(u32, u32), u32>,
+    pub heap_texture_targets: std::collections::HashMap<(u32, u32), HeapTargetRef>,
     /// Reusable native BGRA read buffer for the type-11 memo re-read.
     pub type11_memo_scratch: Vec<u8>,
     /// Last guest-visible generation produced by a compute storage-image

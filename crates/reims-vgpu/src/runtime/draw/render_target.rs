@@ -1069,10 +1069,19 @@ fn resolve_render_target<M: HostMemory + HostOps>(
     // resident that later passes load from and sample. 26 and 27 place their
     // Liquid Glass shapes and shadows in heaps.
     if entry.object_type == OBJECT_TYPE_TEXTURE_VIEW {
-        if let Some(heap) = objects::read_descriptor(state, host, task_id, &entry)
-            .as_deref()
-            .and_then(super::heap_texture_of)
-        {
+        let resolved_res = objects::resolve_resource(state, host, task_id, resolved_ref).ok();
+        let heap_info = resolved_res
+            .as_ref()
+            .and_then(|res| {
+                super::heap_texture_of(&res.descriptor).map(|h| (h, res.lifetime_ref().id()))
+            })
+            .or_else(|| {
+                objects::read_descriptor(state, host, task_id, &entry)
+                    .as_deref()
+                    .and_then(super::heap_texture_of)
+                    .map(|h| (h, 1))
+            });
+        if let Some((heap, generation)) = heap_info {
             if level != 0 || heap.texture_type != 2 {
                 return Err(C::HeapShape {
                     level,
@@ -1099,9 +1108,14 @@ fn resolve_render_target<M: HostMemory + HostOps>(
                 }
                 .at(resolved_ref),
             )?;
-            state
-                .heap_texture_targets
-                .insert((task_id, texture_ref), resolved_ref);
+            state.heap_texture_targets.insert(
+                (task_id, texture_ref),
+                crate::model::HeapTargetRef {
+                    base_ref: resolved_ref,
+                    generation,
+                    base_format: heap.format,
+                },
+            );
             return Ok(ResolvedRenderTarget {
                 mapping_id: 0,
                 target_gva: 0,

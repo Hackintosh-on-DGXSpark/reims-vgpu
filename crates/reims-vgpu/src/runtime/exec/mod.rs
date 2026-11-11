@@ -4470,6 +4470,23 @@ fn apply_clear<M: HostMemory + HostOps>(
         )
         .is_ok();
     }
+    #[cfg(feature = "backend-vulkan")]
+    if c0.mapping_id == 0 && !c0.memoryless {
+        if let Some(&heap_target) = state.heap_texture_targets.get(&(task_id, target.texture_ref)) {
+            let identity = draw::heap_target_identity(task_id, heap_target, w, h);
+            if crate::backend::vulkan::engine::clear_resident_target(
+                identity.clone(),
+                att.clear_color,
+                c0.format,
+            )
+            .is_ok()
+            {
+                draw::retain_heap_target(state, task_id, heap_target.base_ref, &identity);
+                return true;
+            }
+            return false;
+        }
+    }
     if c0.mapping_id == 0 {
         return false;
     }

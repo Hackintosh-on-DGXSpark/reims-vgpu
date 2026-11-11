@@ -2736,10 +2736,43 @@ fn copy_heap_texture_to_buffer<M: HostMemory + HostOps>(
     if entry.object_type != OBJECT_TYPE_TEXTURE_VIEW {
         return None;
     }
-    let descriptor = objects::read_descriptor(state, host, task_id, &entry)?;
-    let heap = draw::heap_texture_of(&descriptor)?;
+    let resolved = objects::resolve_resource(state, host, task_id, cmd.source).ok();
+    let direct = resolved
+        .as_ref()
+        .and_then(|res| {
+            draw::heap_texture_of(&res.descriptor).map(|h| (cmd.source, res.lifetime_ref().id(), h))
+        })
+        .or_else(|| {
+            objects::read_descriptor(state, host, task_id, &entry)
+                .as_deref()
+                .and_then(draw::heap_texture_of)
+                .map(|h| (cmd.source, 1, h))
+        });
+    let (base_ref, generation, heap) = match direct {
+        Some(found) => found,
+        None => {
+            let view = draw::resolve_texture_view(state, host, task_id, cmd.source)?;
+            if view.level != 0 {
+                return None;
+            }
+            let base = view.base_texture_ref;
+            let base_res = objects::resolve_resource(state, host, task_id, base).ok()?;
+            let mut heap = draw::heap_texture_of(&base_res.descriptor)?;
+            if let Some(vf) = view.pixel_format {
+                if pixel_format::bytes_per_pixel(vf) == pixel_format::bytes_per_pixel(heap.format) {
+                    heap.format = vf;
+                }
+            }
+            (base, base_res.lifetime_ref().id(), heap)
+        }
+    };
+    let target = crate::model::HeapTargetRef {
+        base_ref,
+        generation,
+        base_format: heap.format,
+    };
     Some(copy_heap_resident_to_buffer(
-        state, host, task_id, cmd, heap,
+        state, host, task_id, cmd, target, heap,
     ))
 }
 
@@ -2759,6 +2792,7 @@ fn copy_heap_resident_to_buffer<M: HostMemory + HostOps>(
     host: &mut M,
     task_id: u32,
     cmd: &Command,
+    target: crate::model::HeapTargetRef,
     heap: draw::HeapTexture,
 ) -> BlitStatus {
     use crate::backend::vulkan::engine;
@@ -2823,7 +2857,7 @@ fn copy_heap_resident_to_buffer<M: HostMemory + HostOps>(
     {
         return br(BlitStatus::Bounds, "t2b_heap_dst_span_oob");
     }
-    let identity = draw::heap_target_identity(cmd.source, heap.width, heap.height);
+    let identity = draw::heap_target_identity(task_id, target, heap.width, heap.height);
     if !engine::resident_content_ready(&identity) {
         return br(BlitStatus::MissingResource, "t2b_heap_unrendered");
     }
