@@ -6781,7 +6781,7 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
                 _ => true,
             },
             crate::contract::pass_action::LoadAction::DontCare => {
-                crate::backend::vulkan::engine::resident_content_ready(&identity)
+                !c.memoryless && crate::backend::vulkan::engine::resident_content_ready(&identity)
             }
         };
         if matches!(
@@ -12953,6 +12953,86 @@ mod vulkan_split_tests {
         assert!(!condemned_sample_takes_resident(DeviceAllocation, false));
         assert!(!condemned_sample_takes_resident(GuestAllocation, true));
         assert!(!condemned_sample_takes_resident(NotReady, true));
+    }
+
+    #[test]
+    fn a_memoryless_secondary_dont_care_clears_instead_of_loading_prior_pass_scratch() {
+        use crate::backend::vulkan::engine::TargetIdentity;
+        use crate::contract::pass_action::{MTL_LOAD_ACTION_DONT_CARE, MTL_LOAD_ACTION_LOAD};
+        use crate::runtime::decode::resource::{PipelineColorAttachment, RenderPipelineDescriptor};
+
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        state.define_task(1, 0x1_0000, 2);
+
+        let pipeline = RenderPipelineDescriptor {
+            color_attachments: vec![
+                PipelineColorAttachment { slot: 0, ..PipelineColorAttachment::default() },
+                PipelineColorAttachment { slot: 1, ..PipelineColorAttachment::default() },
+            ],
+            ..RenderPipelineDescriptor::default()
+        };
+        let primary = TargetIdentity::Surface {
+            id: 0x42,
+            width: 32,
+            height: 32,
+            generation: 1,
+            format: crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT,
+        };
+        let make_colors = |load_action: u16| {
+            vec![
+                ColorRtRequest {
+                    slot: 0,
+                    width: 32,
+                    height: 32,
+                    format: crate::contract::pixel_format::MTL_FORMAT_RGBA16_FLOAT,
+                    ..ColorRtRequest::default()
+                },
+                ColorRtRequest {
+                    slot: 1,
+                    texture_ref: 77,
+                    width: 32,
+                    height: 32,
+                    format: crate::contract::pixel_format::MTL_FORMAT_RGBA16_FLOAT,
+                    load_action,
+                    memoryless: true,
+                    ..ColorRtRequest::default()
+                },
+            ]
+        };
+
+        let secs = super::build_secondary_targets(
+            &mut state,
+            &mut host,
+            1,
+            &make_colors(MTL_LOAD_ACTION_DONT_CARE),
+            &pipeline,
+            &primary,
+            32,
+            32,
+            [0.0; 4],
+        )
+        .expect("memoryless secondary builds");
+        assert!(
+            !secs[0].load,
+            "a new encoder opening a memoryless secondary with DontCare must clear"
+        );
+        let secs_load = super::build_secondary_targets(
+            &mut state,
+            &mut host,
+            1,
+            &make_colors(MTL_LOAD_ACTION_LOAD),
+            &pipeline,
+            &primary,
+            32,
+            32,
+            [0.0; 4],
+        )
+        .expect("memoryless secondary continuation builds");
+        assert!(
+            !secs_load[0].load,
+            "an unrendered memoryless secondary cannot load undefined bytes"
+        );
     }
 }
 

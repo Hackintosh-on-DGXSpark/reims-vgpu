@@ -1858,6 +1858,22 @@ impl ResourcePools {
         self.set_sole_copy(identity, !guest_backed);
     }
 
+    /// Record the GPU access left on a transient (`MTLStorageModeMemoryless`)
+    /// secondary colour attachment at encoder end without retaining rendered
+    /// contents across encoders or pinning the slot as sole-copy.
+    pub(crate) fn registry_discard_transient_color(
+        &mut self,
+        identity: &TargetIdentity,
+        access: ResidentAccess,
+    ) {
+        if let Some(slot) = self.registry.get_mut(identity) {
+            slot.content_ready = false;
+            slot.content_epoch = None;
+            slot.access = access;
+        }
+        self.set_sole_copy(identity, false);
+    }
+
     /// Mark a depth resident as holding rendered contents, after a pass that
     /// stored them.
     ///

@@ -4321,7 +4321,7 @@ pub(crate) unsafe fn execute_draw_inner(
     };
     let target_feedback = pass_key.color_feedback(0);
     let target_fetched = pass_key.color_fetched(0);
-    let target_pass_layout = pass_key.color_layout(0);
+    let target_pass_layout = pass_key.color_final_layout(0);
     let target_dst_stage = vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
         | if target_feedback {
             vk::PipelineStageFlags::VERTEX_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER
@@ -4573,11 +4573,14 @@ pub(crate) unsafe fn execute_draw_inner(
         );
     } else if load_uses_gpu_content
         && !(target_feedback && req.continues_render_pass && pools.open_pass_echoes(&echo))
-        && !pass_exit_needs_no_barrier(target_prior_access(
-            target_snapshotted,
-            target_access,
-            target_guest_backed,
-        ))
+        && !pass_exit_needs_no_barrier(
+            target_prior_access(
+                target_snapshotted,
+                target_access,
+                target_guest_backed,
+            ),
+            target_pass_layout,
+        )
     {
         unsafe { outside_pass.before_record(PassObstacle::TargetLayout, pools, &ctx.device, cb) };
         // A prior direct sample may have left this target shader-readable, or a
@@ -4974,55 +4977,76 @@ pub(crate) unsafe fn execute_draw_inner(
         let attachment_index = secondary_index + 1;
         let feedback = pass_key.color_feedback(attachment_index);
         let fetched = pass_key.color_fetched(attachment_index);
-        let desired_layout = pass_key.color_layout(attachment_index);
-        if (feedback || access.layout() == desired_layout)
+        let sec_load = pass_key.secondary[secondary_index].load;
+        let initial_layout = pass_key.color_final_layout(attachment_index);
+        if (feedback || access.layout() == initial_layout)
             && req.continues_render_pass
             && pools.open_pass_echoes(&echo)
         {
             continue;
         }
-        let dst_stage = vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
-            | if feedback {
-                vk::PipelineStageFlags::VERTEX_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER
-            } else if fetched {
-                vk::PipelineStageFlags::FRAGMENT_SHADER
-            } else {
-                vk::PipelineStageFlags::empty()
-            };
-        let dst_access = vk::AccessFlags::COLOR_ATTACHMENT_READ
-            | vk::AccessFlags::COLOR_ATTACHMENT_WRITE
-            | if feedback {
-                vk::AccessFlags::SHADER_READ
-            } else {
-                vk::AccessFlags::empty()
+        if sec_load {
+            if pass_exit_needs_no_barrier(*access, initial_layout) {
+                continue;
             }
-            | if fetched {
-                vk::AccessFlags::INPUT_ATTACHMENT_READ
-            } else {
-                vk::AccessFlags::empty()
-            };
-        unsafe { outside_pass.before_record(PassObstacle::MrtLayout, pools, &ctx.device, cb) };
-        let (src_stage, src_access) = access.source_scope();
-        let barrier = [vk::ImageMemoryBarrier::default()
-            .src_access_mask(src_access)
-            .dst_access_mask(dst_access)
-            .old_layout(access.layout())
-            .new_layout(pass_key.color_layout(attachment_index))
-            .image(*image)
-            .subresource_range(super::color_subresource_range())];
-        ctx.device.cmd_pipeline_barrier(
-            cb,
-            src_stage,
-            dst_stage,
-            if feedback {
-                vk::DependencyFlags::FEEDBACK_LOOP_EXT
-            } else {
-                vk::DependencyFlags::empty()
-            },
-            &[],
-            &[],
-            &barrier,
-        );
+            let dst_stage = vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+                | if feedback {
+                    vk::PipelineStageFlags::VERTEX_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER
+                } else if fetched {
+                    vk::PipelineStageFlags::FRAGMENT_SHADER
+                } else {
+                    vk::PipelineStageFlags::empty()
+                };
+            let dst_access = vk::AccessFlags::COLOR_ATTACHMENT_READ
+                | vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+                | if feedback {
+                    vk::AccessFlags::SHADER_READ
+                } else {
+                    vk::AccessFlags::empty()
+                }
+                | if fetched {
+                    vk::AccessFlags::INPUT_ATTACHMENT_READ
+                } else {
+                    vk::AccessFlags::empty()
+                };
+            unsafe { outside_pass.before_record(PassObstacle::MrtLayout, pools, &ctx.device, cb) };
+            let (src_stage, src_access) = access.source_scope();
+            let barrier = [vk::ImageMemoryBarrier::default()
+                .src_access_mask(src_access)
+                .dst_access_mask(dst_access)
+                .old_layout(access.layout())
+                .new_layout(initial_layout)
+                .image(*image)
+                .subresource_range(super::color_subresource_range())];
+            ctx.device.cmd_pipeline_barrier(
+                cb,
+                src_stage,
+                dst_stage,
+                if feedback {
+                    vk::DependencyFlags::FEEDBACK_LOOP_EXT
+                } else {
+                    super::feedback_transition_dependency(access.layout())
+                },
+                &[],
+                &[],
+                &barrier,
+            );
+        } else {
+            unsafe { outside_pass.before_record(PassObstacle::ClearWait, pools, &ctx.device, cb) };
+            let (src_stage, src_access) = access.source_scope();
+            let barrier = [vk::MemoryBarrier::default()
+                .src_access_mask(src_access)
+                .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)];
+            ctx.device.cmd_pipeline_barrier(
+                cb,
+                src_stage,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::DependencyFlags::empty(),
+                &barrier,
+                &[],
+                &[],
+            );
+        }
     }
 
     let clear = clear_values(req);
@@ -5254,7 +5278,7 @@ pub(crate) unsafe fn execute_draw_inner(
             src_stage,
             dst_stage,
             vk::DependencyFlags::BY_REGION
-                | super::feedback_transition_dependency(pass_key.color_layout(0)),
+                | super::feedback_transition_dependency(super::caches::color_feedback_layout()),
             &barrier,
             &[],
             &[],
@@ -5799,22 +5823,16 @@ pub(crate) unsafe fn execute_draw_inner(
     if is_mrt {
         for (secondary_index, (identity, _image, _old)) in mrt_secondaries.iter().enumerate() {
             let attachment_index = secondary_index + 1;
-            if pass_key.color_feedback(attachment_index) {
-                pools.registry_mark_ready_with_access(
-                    identity,
-                    super::pools::ResidentAccess::ColorFeedback(
-                        pass_key.color_final_layout(attachment_index),
-                    ),
-                );
+            let final_layout = pass_key.color_final_layout(attachment_index);
+            let access = if pass_key.color_feedback(attachment_index) {
+                super::pools::ResidentAccess::ColorFeedback(final_layout)
             } else {
-                // The pass's own `finalLayout` for this slot, asked of the key
-                // rather than respelled. The feedback arm beside it already
-                // derives; this one carried a hand-written
-                // `COLOR_ATTACHMENT_OPTIMAL`, which is the second spelling
-                // `color0_pass_exit_layout` exists to remove — a registry record
-                // naming a layout the pass did not leave the image in is a later
-                // barrier's wrong `oldLayout`.
-                pools.registry_mark_ready_at(identity, pass_key.color_final_layout(attachment_index));
+                super::pools::ResidentAccess::ColorWrite(final_layout)
+            };
+            if !req.render_pass_continues && matches!(identity, TargetIdentity::Texture { .. }) {
+                pools.registry_discard_transient_color(identity, access);
+            } else {
+                pools.registry_mark_ready_with_access(identity, access);
             }
         }
     }
@@ -6356,8 +6374,12 @@ fn target_source_scope(
 /// removes the `vkCmdPipelineBarrier` that was left recording nothing. The
 /// counter follows honestly — a draw that records no barrier is not charged an
 /// obstacle, so `passmerge_reachable` can be non-zero for the first time.
-fn pass_exit_needs_no_barrier(prior: super::pools::ResidentAccess) -> bool {
-    prior == super::pools::ResidentAccess::ColorWrite(super::caches::color0_pass_exit_layout())
+fn pass_exit_needs_no_barrier(
+    prior: super::pools::ResidentAccess,
+    initial_layout: vk::ImageLayout,
+) -> bool {
+    initial_layout == super::caches::color0_pass_exit_layout()
+        && prior == super::pools::ResidentAccess::ColorWrite(initial_layout)
 }
 
 /// Record the barrier that makes a registry-resident image readable as a
@@ -7662,18 +7684,25 @@ mod tests {
     /// transition, which is undefined behaviour and not an error.
     #[test]
     fn only_a_target_left_where_the_next_pass_wants_it_may_skip_its_barrier() {
+        let exit = super::super::caches::color0_pass_exit_layout();
         for tracked in every_access() {
-            let skippable = tracked
-                == ResidentAccess::ColorWrite(super::super::caches::color0_pass_exit_layout());
+            let skippable = tracked == ResidentAccess::ColorWrite(exit);
             assert_eq!(
-                pass_exit_needs_no_barrier(tracked),
+                pass_exit_needs_no_barrier(tracked, exit),
                 skippable,
                 "{tracked:?}"
+            );
+            assert!(
+                !pass_exit_needs_no_barrier(
+                    tracked,
+                    vk::ImageLayout::ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT,
+                ),
+                "a pass entering feedback layout needs an explicit transition from {tracked:?}"
             );
             // A snapshot is this draw's own transfer read and always needs the
             // transition back, whatever the registry was tracking.
             assert!(
-                !pass_exit_needs_no_barrier(target_prior_access(true, tracked, false)),
+                !pass_exit_needs_no_barrier(target_prior_access(true, tracked, false), exit),
                 "a snapshotted {tracked:?} target still has to come back from TRANSFER_SRC"
             );
         }

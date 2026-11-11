@@ -3893,3 +3893,163 @@ fn resident_content_state_separates_an_absent_slot_from_an_unstamped_one() {
         "a draw since the stamp clears it — the slot is still there"
     );
 }
+
+/// Multi-draw MRT + `color_inputs` (`dest_1` subpass fetch) across a pass-key
+/// transition (`color_inputs: 0 -> 0b10`) followed by an in-pass continuation
+/// (`color_inputs: 0b10 -> 0b10`) on a `448x192` `R16G16B16A16_SFLOAT`
+/// transient `TargetIdentity::Texture` secondary (the exact Notification Banner
+/// and Liquid Glass `WindowServer` / `RenderBox` shape).
+///
+/// Verifies three contracts on real GPU compression (NVIDIA DCC / tile memory):
+/// 1. Transitioning from an un-fetched MRT draw into a `color_fetched` MRT draw
+///    keeps `initialLayout == COLOR_ATTACHMENT_OPTIMAL` instead of emitting an
+///    outside-pass `GENERAL` barrier that disagrees with `VkRenderPass`.
+/// 2. Consecutive `color_fetched` MRT draws keep the `VkRenderPass` open
+///    (`render_pass_continuations` increments) and order `OpImageRead` via the
+///    intra-subpass `BY_REGION` barrier.
+/// 3. Ending the encoder (`render_pass_continues = false`) discards transient
+///    `TargetIdentity::Texture` content (`!resident_content_ready`) so the next
+///    encoder cannot inherit stale scratch pixels.
+#[test]
+fn mrt_color_input_secondary_preserves_dcc_continues_pass_and_discards_transient() {
+    const MRT_INIT_FRAG: &[u32] = &[
+        0x07230203, 0x00010300, 0x00070000, 0x0000000f, 0x00000000, 0x00020011, 0x00000001,
+        0x0003000e, 0x00000000, 0x00000001, 0x0007000f, 0x00000004, 0x00000001, 0x6e69616d,
+        0x00000000, 0x00000002, 0x00000003, 0x00030010, 0x00000001, 0x00000007, 0x00040047,
+        0x00000002, 0x0000001e, 0x00000000, 0x00040047, 0x00000003, 0x0000001e, 0x00000001,
+        0x00020013, 0x00000004, 0x00030021, 0x00000005, 0x00000004, 0x00030016, 0x00000006,
+        0x00000020, 0x00040017, 0x00000007, 0x00000006, 0x00000004, 0x00040020, 0x00000008,
+        0x00000003, 0x00000007, 0x0004003b, 0x00000008, 0x00000002, 0x00000003, 0x0004003b,
+        0x00000008, 0x00000003, 0x00000003, 0x0004002b, 0x00000006, 0x00000009, 0x3e800000,
+        0x0004002b, 0x00000006, 0x0000000a, 0x3f000000, 0x0004002b, 0x00000006, 0x0000000b,
+        0x3f400000, 0x0004002b, 0x00000006, 0x0000000c, 0x3f800000, 0x0007002c, 0x00000007,
+        0x0000000d, 0x00000009, 0x0000000a, 0x0000000b, 0x0000000c, 0x00050036, 0x00000004,
+        0x00000001, 0x00000000, 0x00000005, 0x000200f8, 0x0000000e, 0x0003003e, 0x00000002,
+        0x0000000d, 0x0003003e, 0x00000003, 0x0000000d, 0x000100fd, 0x00010038,
+    ];
+    const MRT_ACCUM_FRAG: &[u32] = &[
+        0x07230203, 0x00010300, 0x00070000, 0x00000017, 0x00000000, 0x00020011, 0x00000001,
+        0x00020011, 0x00000028, 0x0003000e, 0x00000000, 0x00000001, 0x0007000f, 0x00000004,
+        0x00000001, 0x6e69616d, 0x00000000, 0x00000002, 0x00000003, 0x00030010, 0x00000001,
+        0x00000007, 0x00040047, 0x00000004, 0x00000022, 0x00000000, 0x00040047, 0x00000004,
+        0x00000021, 0x000000c1, 0x00040047, 0x00000004, 0x0000002b, 0x00000001, 0x00040047,
+        0x00000002, 0x0000001e, 0x00000000, 0x00040047, 0x00000003, 0x0000001e, 0x00000001,
+        0x00020013, 0x00000005, 0x00030021, 0x00000006, 0x00000005, 0x00030016, 0x00000007,
+        0x00000020, 0x00040015, 0x00000008, 0x00000020, 0x00000001, 0x00040017, 0x00000009,
+        0x00000007, 0x00000004, 0x00040017, 0x0000000a, 0x00000008, 0x00000002, 0x00090019,
+        0x0000000b, 0x00000007, 0x00000006, 0x00000000, 0x00000000, 0x00000000, 0x00000002,
+        0x00000000, 0x00040020, 0x0000000c, 0x00000000, 0x0000000b, 0x00040020, 0x0000000d,
+        0x00000003, 0x00000009, 0x0004003b, 0x0000000c, 0x00000004, 0x00000000, 0x0004003b,
+        0x0000000d, 0x00000002, 0x00000003, 0x0004003b, 0x0000000d, 0x00000003, 0x00000003,
+        0x0004002b, 0x00000008, 0x0000000e, 0x00000000, 0x0005002c, 0x0000000a, 0x0000000f,
+        0x0000000e, 0x0000000e, 0x0004002b, 0x00000007, 0x00000010, 0x3e800000, 0x0004002b,
+        0x00000007, 0x00000011, 0x00000000, 0x0007002c, 0x00000009, 0x00000012, 0x00000010,
+        0x00000011, 0x00000011, 0x00000011, 0x00050036, 0x00000005, 0x00000001, 0x00000000,
+        0x00000006, 0x000200f8, 0x00000013, 0x0004003d, 0x0000000b, 0x00000014, 0x00000004,
+        0x00050062, 0x00000009, 0x00000015, 0x00000014, 0x0000000f, 0x00050081, 0x00000009,
+        0x00000016, 0x00000015, 0x00000012, 0x0003003e, 0x00000002, 0x00000016, 0x0003003e,
+        0x00000003, 0x00000016, 0x000100fd, 0x00010038,
+    ];
+
+    let _g = engine_test_session();
+    let (v, _) = triangle_spirv();
+    let (w, h) = (448u32, 192u32);
+    let primary = TargetIdentity::Surface {
+        id: 0x9B01,
+        width: w,
+        height: h,
+        generation: 1,
+        format: SURFACE_TEST_FORMAT,
+    };
+    let secondary = TargetIdentity::Texture {
+        ref_: 246,
+        width: w,
+        height: h,
+        generation: 7,
+        stencil: false,
+    };
+
+    // Draw 0: color_inputs == 0, clears & writes (0.25, 0.50, 0.75, 1.0) into s0 & s1.
+    let mut draw0 = engine_req(&v, MRT_INIT_FRAG, w, h);
+    draw0.target_identity = Some(primary.clone());
+    draw0.skip_readback = true;
+    draw0.render_pass_continues = true;
+    draw0.secondary_targets.push(SecondaryColorTarget {
+        identity: secondary.clone(),
+        width: w,
+        height: h,
+        format: ash::vk::Format::R16G16B16A16_SFLOAT,
+        clear: [0.0, 0.0, 0.0, 0.0],
+        load: false,
+        blend: None,
+        color_write_mask: Default::default(),
+    });
+    match engine::execute_draw_request_blocking(&draw0) {
+        Ok(_) => {}
+        Err(e) if skip_if_no_gpu(&e.to_string()) => {
+            eprintln!("SKIP mrt_color_input_secondary: {e}");
+            return;
+        }
+        Err(e) => panic!("draw0 failed: {e}"),
+    }
+    assert!(
+        engine::resident_content_ready(&secondary),
+        "intra-encoder secondary must stay content_ready while render_pass_continues is true"
+    );
+
+    // Draw 1: color_inputs == 0b10 (slot 1), loads s1 -> writes (0.50, 0.50, 0.75, 1.0).
+    let mut draw1 = engine_req(&v, MRT_ACCUM_FRAG, w, h);
+    draw1.target_identity = Some(primary.clone());
+    draw1.load_from_target = true;
+    draw1.color_inputs = 0b10;
+    draw1.continues_render_pass = true;
+    draw1.render_pass_continues = true;
+    draw1.skip_readback = true;
+    draw1.secondary_targets.push(SecondaryColorTarget {
+        identity: secondary.clone(),
+        width: w,
+        height: h,
+        format: ash::vk::Format::R16G16B16A16_SFLOAT,
+        clear: [0.0, 0.0, 0.0, 0.0],
+        load: true,
+        blend: None,
+        color_write_mask: Default::default(),
+    });
+    engine::execute_draw_request_blocking(&draw1).expect("draw1 failed");
+
+    // Draw 2: same pass compatibility (color_inputs == 0b10), reads (0.50, 0.50, 0.75, 1.0),
+    // outputs (0.75, 0.50, 0.75, 1.0) without corrupting DCC compression, and discards
+    // transient Texture content_ready at encoder end.
+    let mut draw2 = engine_req(&v, MRT_ACCUM_FRAG, w, h);
+    draw2.target_identity = Some(primary.clone());
+    draw2.load_from_target = true;
+    draw2.color_inputs = 0b10;
+    draw2.continues_render_pass = true;
+    draw2.render_pass_continues = false;
+    draw2.skip_readback = false;
+    draw2.secondary_targets.push(SecondaryColorTarget {
+        identity: secondary.clone(),
+        width: w,
+        height: h,
+        format: ash::vk::Format::R16G16B16A16_SFLOAT,
+        clear: [0.0, 0.0, 0.0, 0.0],
+        load: true,
+        blend: None,
+        color_write_mask: Default::default(),
+    });
+    let out = engine::execute_draw_request_blocking(&draw2).expect("draw2 failed");
+    assert!(
+        !engine::resident_content_ready(&secondary),
+        "transient Texture secondary must discard content_ready when encoder ends"
+    );
+
+    let px = semantic_rgba(&out);
+    assert_eq!(px.len(), (w * h * 4) as usize, "readback size");
+    for p in 0..(w * h) as usize {
+        let (r, g, b, a) = (px[p * 4], px[p * 4 + 1], px[p * 4 + 2], px[p * 4 + 3]);
+        assert!(
+            near(r, 191) && near(g, 128) && near(b, 191) && near(a, 255),
+            "pixel {p} RGBA=({r},{g},{b},{a}); expected ~(191,128,191,255)"
+        );
+    }
+}

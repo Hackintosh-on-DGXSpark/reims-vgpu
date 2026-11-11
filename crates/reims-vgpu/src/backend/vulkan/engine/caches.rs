@@ -1896,7 +1896,12 @@ impl ObjectCaches {
         if key.color_inputs != 0 {
             deps.push(fetch_dep);
         }
-        deps.push(color_feedback_self_dependency(key.color_layout(0)));
+        let feedback_layout = if key.feedback_colors != 0 {
+            color_feedback_layout()
+        } else {
+            key.color_layout(0)
+        };
+        deps.push(color_feedback_self_dependency(feedback_layout));
         let rp_info = vk::RenderPassCreateInfo::default()
             .attachments(&attachments)
             .subpasses(&subpass)
