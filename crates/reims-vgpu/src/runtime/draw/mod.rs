@@ -1800,7 +1800,9 @@ pub(crate) fn note_sampled_narrowing(
     }
     // A ten-bit unorm channel always fits; only its low two bits go.
     let lost = match fmt {
-        pixel_format::MTL_FORMAT_RGB10A2_UNORM | pixel_format::MTL_FORMAT_BGR10A2_UNORM => {
+        pixel_format::MTL_FORMAT_RGB10A2_UNORM
+        | pixel_format::MTL_FORMAT_BGR10A2_UNORM
+        | pixel_format::MTL_FORMAT_RGBA16_UNORM => {
             "256_levels"
         }
         _ => "clamp_to_unit_and_256_levels",

@@ -2001,6 +2001,7 @@ mod tests {
                 // could be created at that format; only this side still refused
                 // it, so a half-float secondary MRT slot was declined while a
                 // half-float primary was not.
+                p::MTL_FORMAT_RGBA16_UNORM,
                 p::MTL_FORMAT_RGBA16_FLOAT,
             ]
         );

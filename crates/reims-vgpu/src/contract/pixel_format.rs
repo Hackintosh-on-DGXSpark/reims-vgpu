@@ -477,7 +477,7 @@ impl TexelLayout {
             // because the scanout capture and the type-11 memo rung have only an
             // eight-bit destination, and it keeps the top eight of ten bits.
             // Lossy, so no floor may send a sampled bind to it.
-            Self::Rgb10a2Unorm | Self::Bgr10a2Unorm => true,
+            Self::Rgb10a2Unorm | Self::Bgr10a2Unorm | Self::Rgba16Unorm => true,
             // The two sixteen-bit normalized layouts join the floats here for
             // the same reason and a different quantity: `texel_to_rgba8` has no
             // arm for them because an arm would have to narrow ten bits of video
@@ -492,7 +492,6 @@ impl TexelLayout {
             | Self::Rg16Unorm
             | Self::Rg16Uint
             | Self::Rg32Float
-            | Self::Rgba16Unorm
             | Self::Rg11b10Float => false,
         }
     }
@@ -514,7 +513,11 @@ impl TexelLayout {
     /// two-channel Vulkan formats sample to identically.
     pub fn cpu_loader_arm_is_lossy(self) -> bool {
         match self {
-            Self::Rgba16Float | Self::Rg16Float | Self::Rgb10a2Unorm | Self::Bgr10a2Unorm => true,
+            Self::Rgba16Float
+            | Self::Rg16Float
+            | Self::Rgba16Unorm
+            | Self::Rgb10a2Unorm
+            | Self::Bgr10a2Unorm => true,
             Self::Rgba8
             | Self::Bgra8
             | Self::R8
@@ -525,7 +528,6 @@ impl TexelLayout {
             | Self::Rg16Unorm
             | Self::Rg16Uint
             | Self::Rg32Float
-            | Self::Rgba16Unorm
             | Self::Rg11b10Float => false,
         }
     }
@@ -1310,7 +1312,7 @@ pub fn render_target_bpp(format: u16) -> Option<u32> {
     Some(match format {
         MTL_FORMAT_RGBA8_UNORM | MTL_FORMAT_RGBA8_UNORM_SRGB => RGBA8_BPP,
         MTL_FORMAT_BGRA8_UNORM | MTL_FORMAT_BGRA8_UNORM_SRGB => BGRA8_BPP,
-        MTL_FORMAT_RGBA16_FLOAT => RGBA16F_BPP,
+        MTL_FORMAT_RGBA16_FLOAT | MTL_FORMAT_RGBA16_UNORM => RGBA16F_BPP,
         MTL_FORMAT_RG16_FLOAT => RG16F_BPP,
         MTL_FORMAT_RG16_UINT => RG16_BPP,
         MTL_FORMAT_R16_FLOAT => R16F_BPP,
@@ -1385,6 +1387,7 @@ pub fn store_texel_order(format: u16) -> Option<TexelLayout> {
         MTL_FORMAT_BGRA8_UNORM | MTL_FORMAT_BGRA8_UNORM_SRGB => TexelLayout::Bgra8,
         MTL_FORMAT_R8_UNORM => TexelLayout::R8,
         MTL_FORMAT_RGBA16_FLOAT => TexelLayout::Rgba16Float,
+        MTL_FORMAT_RGBA16_UNORM => TexelLayout::Rgba16Unorm,
         MTL_FORMAT_RG16_FLOAT => TexelLayout::Rg16Float,
         MTL_FORMAT_R16_FLOAT => TexelLayout::R16Float,
         MTL_FORMAT_RG16_UINT => TexelLayout::Rg16Uint,
@@ -1896,10 +1899,17 @@ pub fn expand_rgba8_to_texel(
         //
         // `Rg11b10Float` is here because `render_target_bpp` does not admit its
         // format: no guest has been observed declaring a render target in one.
+        TexelLayout::Rgba16Unorm => {
+            for i in 0..px {
+                let (s, d) = (i * RGBA8_BPP as usize, i * RGBA16_BPP as usize);
+                for c in 0..4 {
+                    st16(&mut dst[d + c * 2..d + c * 2 + 2], u16::from(src_rgba[s + c]) * 257);
+                }
+            }
+        }
         TexelLayout::Rg8
         | TexelLayout::R16Unorm
         | TexelLayout::Rg16Unorm
-        | TexelLayout::Rgba16Unorm
         | TexelLayout::Rg11b10Float => return false,
     }
     true
@@ -2032,10 +2042,18 @@ pub fn narrow_texel_to_rgba8(
         // bits of each colour channel, two-bit alpha replicated out.
         TexelLayout::Rgb10a2Unorm => TenBitOrder::Rgb.narrow_row(&src[..src_len], dst_rgba),
         TexelLayout::Bgr10a2Unorm => TenBitOrder::Bgr.narrow_row(&src[..src_len], dst_rgba),
+        TexelLayout::Rgba16Unorm => {
+            for i in 0..px {
+                let (s, d) = (i * RGBA16_BPP as usize, i * RGBA8_BPP as usize);
+                for c in 0..4 {
+                    let v = u32::from(ld16(&src[s + c * 2..s + c * 2 + 2]));
+                    dst_rgba[d + c] = ((v * 255 + 32768) >> 16) as u8;
+                }
+            }
+        }
         TexelLayout::Rg8
         | TexelLayout::R16Unorm
         | TexelLayout::Rg16Unorm
-        | TexelLayout::Rgba16Unorm
         | TexelLayout::Rg11b10Float => return false,
     }
     true
@@ -2075,6 +2093,12 @@ pub fn texel_to_rgba8(format: u16, src: &[u8]) -> Option<[u8; 4]> {
             rgba[COMPONENT_G] = lut[ld16(&src[2..4]) as usize];
             rgba[COMPONENT_B] = lut[ld16(&src[4..6]) as usize];
             rgba[COMPONENT_A] = lut[ld16(&src[6..8]) as usize];
+        }
+        MTL_FORMAT_RGBA16_UNORM => {
+            rgba[COMPONENT_R] = ((u32::from(ld16(&src[0..2])) * 255 + 32768) >> 16) as u8;
+            rgba[COMPONENT_G] = ((u32::from(ld16(&src[2..4])) * 255 + 32768) >> 16) as u8;
+            rgba[COMPONENT_B] = ((u32::from(ld16(&src[4..6])) * 255 + 32768) >> 16) as u8;
+            rgba[COMPONENT_A] = ((u32::from(ld16(&src[6..8])) * 255 + 32768) >> 16) as u8;
         }
         MTL_FORMAT_RG16_FLOAT => {
             // Two float16 channels → R,G; B has no source (0), A opaque. Mirrors
@@ -2120,6 +2144,12 @@ pub fn rgba8_to_texel(format: u16, rgba: [u8; 4], dst: &mut [u8]) -> bool {
             st16(&mut dst[2..4], lut[rgba[COMPONENT_G] as usize]);
             st16(&mut dst[4..6], lut[rgba[COMPONENT_B] as usize]);
             st16(&mut dst[6..8], lut[rgba[COMPONENT_A] as usize]);
+        }
+        MTL_FORMAT_RGBA16_UNORM => {
+            st16(&mut dst[0..2], u16::from(rgba[COMPONENT_R]) * 257);
+            st16(&mut dst[2..4], u16::from(rgba[COMPONENT_G]) * 257);
+            st16(&mut dst[4..6], u16::from(rgba[COMPONENT_B]) * 257);
+            st16(&mut dst[6..8], u16::from(rgba[COMPONENT_A]) * 257);
         }
         MTL_FORMAT_RG16_FLOAT => {
             // R,G → two float16 channels; B,A have no destination (RG16 is
@@ -2208,6 +2238,7 @@ pub fn narrows_to_unorm8(format: u16) -> bool {
         format,
         MTL_FORMAT_RGBA16_FLOAT
             | MTL_FORMAT_RG16_FLOAT
+            | MTL_FORMAT_RGBA16_UNORM
             | MTL_FORMAT_RGB10A2_UNORM
             | MTL_FORMAT_BGR10A2_UNORM
     )
@@ -3414,7 +3445,6 @@ mod tests {
             TexelLayout::Rg8,
             TexelLayout::R16Unorm,
             TexelLayout::Rg16Unorm,
-            TexelLayout::Rgba16Unorm,
         ] {
             let mut dst = [0u8; 64];
             assert!(
@@ -3475,6 +3505,7 @@ mod tests {
                     TexelLayout::Bgra8 => SampledClass::Bgra8Unorm,
                     TexelLayout::R8 => SampledClass::R8Unorm,
                     TexelLayout::Rgba16Float => SampledClass::Rgba16Float,
+                    TexelLayout::Rgba16Unorm => SampledClass::Rgba16Unorm,
                     TexelLayout::Rg16Float => SampledClass::Rg16Float,
                     TexelLayout::R16Float => SampledClass::R16Float,
                     TexelLayout::Rg16Uint => SampledClass::Rg16Uint,
