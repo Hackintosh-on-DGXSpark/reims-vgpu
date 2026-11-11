@@ -4044,6 +4044,7 @@ fn render_pass_attachment_template(first: &draw::DrawEncodeRequest) -> draw::Dra
             target_seed_layout: None,
             multisample_source_ref: c.multisample_source_ref,
             memoryless: c.memoryless,
+            buffer_backed: c.buffer_backed,
         })
         .collect();
     draw::DrawEncodeRequest {

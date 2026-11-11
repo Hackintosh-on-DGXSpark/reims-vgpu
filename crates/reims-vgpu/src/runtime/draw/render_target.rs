@@ -361,6 +361,10 @@ pub(super) struct ResolvedRenderTarget {
     /// lives for the pass. Metal lets such an attachment neither load nor
     /// store, so nothing is seeded into it and nothing is written back.
     pub(super) memoryless: bool,
+    /// A type-8 buffer-backed texture over a shared MTLBuffer: guest CPU and
+    /// buffer readers access the underlying buffer without synchronizing
+    /// `texture_ref`, so a Store must land synchronously in guest memory.
+    pub(super) buffer_backed: bool,
 }
 
 /// Why a colour attachment's `texture_ref` could not be turned into somewhere
@@ -937,6 +941,7 @@ fn resolve_render_target<M: HostMemory + HostOps>(
             format: fmt,
             sample_count: 1,
             memoryless: false,
+            buffer_backed: false,
         });
     }
     // x86 Ventura/Tahoe type-4 surface/backing (present IOSurface). Object-list
@@ -1018,6 +1023,7 @@ fn resolve_render_target<M: HostMemory + HostOps>(
             format: fmt,
             sample_count: 1,
             memoryless: false,
+            buffer_backed: false,
         });
     }
     let entry = live.ok_or(C::NoListEntry.at(resolved_ref))?;
@@ -1063,6 +1069,7 @@ fn resolve_render_target<M: HostMemory + HostOps>(
             format: fmt,
             sample_count: tex.sample_count,
             memoryless: true,
+            buffer_backed: false,
         });
     }
     // Type-8 heap texture: no guest storage at all, so it renders into an engine
@@ -1125,6 +1132,7 @@ fn resolve_render_target<M: HostMemory + HostOps>(
                 format: fmt,
                 sample_count: heap.sample_count,
                 memoryless: false,
+                buffer_backed: false,
             });
         }
     }
@@ -1188,6 +1196,7 @@ fn resolve_render_target<M: HostMemory + HostOps>(
                 format: fmt,
                 sample_count: 1,
                 memoryless: false,
+                buffer_backed: true,
             });
         }
     }
@@ -1336,6 +1345,7 @@ fn resolve_render_target<M: HostMemory + HostOps>(
         format: fmt,
         sample_count: 1,
         memoryless: false,
+        buffer_backed: false,
     })
 }
 

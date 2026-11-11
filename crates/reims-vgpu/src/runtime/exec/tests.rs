@@ -2285,6 +2285,7 @@ fn render_pass_template_reuses_attachment_without_load_seed() {
             target_seed_layout: None,
             multisample_source_ref: 0,
             memoryless: false,
+            buffer_backed: false,
         }],
         ..Default::default()
     };

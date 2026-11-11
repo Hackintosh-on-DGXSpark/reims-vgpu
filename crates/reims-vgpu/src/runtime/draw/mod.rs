@@ -822,6 +822,9 @@ pub struct ColorRtRequest {
     /// zero, and the attachment is a host image keyed by `texture_ref` that is
     /// never seeded from or written back to the guest.
     pub memoryless: bool,
+    /// A type-8 buffer-backed texture whose Store writes directly to its
+    /// shared `MTLBuffer` pages rather than arming a texture-keyed GVA debt.
+    pub buffer_backed: bool,
 }
 
 /// One `setVisibilityResultMode:offset:`, as the encoder state it is.
@@ -4429,6 +4432,7 @@ pub fn writeback_chain_rgba<M: HostMemory + HostOps>(
         format: fmt,
         sample_count: _,
         memoryless: _,
+        buffer_backed: _,
     }) = lookup_render_target(state, host, task_id, *att)
     else {
         return lost("render_target_unresolved");
@@ -4555,6 +4559,7 @@ pub fn color_target_request<M: HostMemory + HostOps>(
         target_seed_layout: None,
         multisample_source_ref: 0,
         memoryless: rt.memoryless,
+        buffer_backed: rt.buffer_backed,
     };
     Some(DrawEncodeRequest {
         task_id,
@@ -4692,6 +4697,7 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
             format: mfmt,
             sample_count: target_sample_count,
             memoryless,
+            buffer_backed,
         } = target;
         #[cfg(feature = "backend-vulkan")]
         let attachment_sample_count = pipeline_sample_count.unwrap_or(target_sample_count);
@@ -4873,6 +4879,7 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
                     target_seed_layout: seed_layout,
                     multisample_source_ref,
                     memoryless,
+                    buffer_backed,
                 });
                 continue;
             }
@@ -4894,6 +4901,7 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
             target_seed_layout: None,
             multisample_source_ref,
             memoryless,
+            buffer_backed,
         });
     }
     if colors.is_empty() {

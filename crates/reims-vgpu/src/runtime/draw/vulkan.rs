@@ -6794,12 +6794,16 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
             // becomes a clear over live content.
             super::note_load_action_dont_care(pipeline.object_id, c.width, c.height);
         }
-        let clear = [
-            c.clear_color[0] as f32,
-            c.clear_color[1] as f32,
-            c.clear_color[2] as f32,
-            c.clear_color[3] as f32,
-        ];
+        let clear = if matches!(declared, crate::contract::pass_action::LoadAction::Clear) {
+            [
+                c.clear_color[0] as f32,
+                c.clear_color[1] as f32,
+                c.clear_color[2] as f32,
+                c.clear_color[3] as f32,
+            ]
+        } else {
+            [0.0; 4]
+        };
         // This slot's own blend, resolved exactly as the Metal arm resolves it:
         // find the pipeline's attachment entry for this Metal slot. No
         // `or_else(first())` fallback here — the Metal path has one for its
@@ -11061,6 +11065,7 @@ fn gva_store_defer_eligible(req: &DrawEncodeRequest) -> bool {
         || c0.row_stride == 0
         || c0.texture_ref == 0
         || req.gva_alloc_gen == 0
+        || c0.buffer_backed
     {
         return false;
     }
@@ -13033,6 +13038,109 @@ mod vulkan_split_tests {
             !secs_load[0].load,
             "an unrendered memoryless secondary cannot load undefined bytes"
         );
+    }
+
+    #[test]
+    fn secondary_non_clear_attachment_ignores_sentinel_clear_color() {
+        use crate::backend::vulkan::engine::TargetIdentity;
+        use crate::contract::pass_action::{
+            MTL_LOAD_ACTION_CLEAR, MTL_LOAD_ACTION_DONT_CARE, MTL_LOAD_ACTION_LOAD,
+        };
+        use crate::runtime::decode::resource::{
+            PipelineColorAttachment, RenderPipelineDescriptor,
+        };
+
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = FakeHost::default();
+        let pipeline = RenderPipelineDescriptor {
+            object_id: 21,
+            color_attachments: vec![
+                PipelineColorAttachment {
+                    slot: 0,
+                    pixel_format: u32::from(crate::contract::pixel_format::MTL_FORMAT_RGBA16_FLOAT),
+                    ..PipelineColorAttachment::default()
+                },
+                PipelineColorAttachment {
+                    slot: 1,
+                    pixel_format: u32::from(crate::contract::pixel_format::MTL_FORMAT_RG32_FLOAT),
+                    ..PipelineColorAttachment::default()
+                },
+            ],
+            ..RenderPipelineDescriptor::default()
+        };
+        let primary = TargetIdentity::Surface {
+            id: 0x43,
+            width: 32,
+            height: 32,
+            generation: 1,
+            format: crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT,
+        };
+        let make_colors = |load_action: u16| {
+            vec![
+                ColorRtRequest {
+                    slot: 0,
+                    width: 32,
+                    height: 32,
+                    format: crate::contract::pixel_format::MTL_FORMAT_RGBA16_FLOAT,
+                    ..ColorRtRequest::default()
+                },
+                ColorRtRequest {
+                    slot: 1,
+                    texture_ref: 78,
+                    width: 32,
+                    height: 32,
+                    format: crate::contract::pixel_format::MTL_FORMAT_RG32_FLOAT,
+                    load_action,
+                    clear_color: [1.0, 0.0, 0.0, 1.0],
+                    memoryless: true,
+                    ..ColorRtRequest::default()
+                },
+            ]
+        };
+
+        for action in [MTL_LOAD_ACTION_DONT_CARE, MTL_LOAD_ACTION_LOAD] {
+            let secs = super::build_secondary_targets(
+                &mut state,
+                &mut host,
+                1,
+                &make_colors(action),
+                &pipeline,
+                &primary,
+                32,
+                32,
+                [0.0; 4],
+            )
+            .expect("secondary builds");
+            assert_eq!(secs[0].clear, [0.0; 4]);
+        }
+
+        let secs_clear = super::build_secondary_targets(
+            &mut state,
+            &mut host,
+            1,
+            &make_colors(MTL_LOAD_ACTION_CLEAR),
+            &pipeline,
+            &primary,
+            32,
+            32,
+            [0.0; 4],
+        )
+        .expect("explicit clear secondary builds");
+        assert_eq!(secs_clear[0].clear, [1.0, 0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn buffer_backed_gva_store_is_not_defer_eligible() {
+        let mut req = one_page_gva_request();
+        req.gva_alloc_gen = 1;
+        req.colors[0].format = crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+        req.colors[0].width = 8;
+        req.colors[0].height = 8;
+        req.colors[0].row_stride = 32;
+        assert!(super::gva_store_defer_eligible(&req));
+
+        req.colors[0].buffer_backed = true;
+        assert!(!super::gva_store_defer_eligible(&req));
     }
 }
 
