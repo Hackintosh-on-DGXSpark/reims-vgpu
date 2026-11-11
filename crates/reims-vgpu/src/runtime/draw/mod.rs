@@ -1438,7 +1438,7 @@ pub(crate) fn load_render_mtlb_pair<M: HostMemory + HostOps>(
     host: &M,
     task_id: u32,
     pipeline_ref: u32,
-) -> Result<(Vec<u8>, Vec<u8>), DrawPreparationDecline> {
+) -> Result<(Vec<u8>, Option<Vec<u8>>), DrawPreparationDecline> {
     let pd = load_render_pipeline(state, host, task_id, pipeline_ref).ok_or(
         DrawPreparationDecline::PipelineMissing {
             task_id,
@@ -1451,17 +1451,23 @@ pub(crate) fn load_render_mtlb_pair<M: HostMemory + HostOps>(
             function_ref: pd.vertex_func_ref,
         },
     )?;
-    let f_mtlb = load_mtlb(
-        state,
-        host,
-        task_id,
-        pd.fragment_func_ref,
-        AirLoadRail::Draw,
-    )
-    .ok_or(DrawPreparationDecline::FragmentMtlbMissing {
-        task_id,
-        function_ref: pd.fragment_func_ref,
-    })?;
+    let f_mtlb = if pd.fragment_func_ref == 0 {
+        None
+    } else {
+        Some(
+            load_mtlb(
+                state,
+                host,
+                task_id,
+                pd.fragment_func_ref,
+                AirLoadRail::Draw,
+            )
+            .ok_or(DrawPreparationDecline::FragmentMtlbMissing {
+                task_id,
+                function_ref: pd.fragment_func_ref,
+            })?,
+        )
+    };
     Ok((v_mtlb, f_mtlb))
 }
 

@@ -45,6 +45,7 @@ pub(crate) struct ExecContinuation {
     task_id: u32,
     payload: Vec<u8>,
     streams: Vec<Vec<u8>>,
+    guest_reads: Vec<u32>,
     next_stream: usize,
     acc: StreamAccum,
     cursor: ChainCursor,
@@ -114,12 +115,14 @@ impl ExecContinuations {
 
 /// Keep `stop`'s packet at its channel head, to continue where it stopped.
 #[cfg(feature = "backend-vulkan")]
+#[allow(clippy::too_many_arguments)]
 pub(super) fn park(
     state: &mut crate::model::DeviceState,
     slot: ExecSlot,
     payload: &[u8],
     task_id: u32,
     streams: Vec<Vec<u8>>,
+    guest_reads: Vec<u32>,
     stop: super::StreamStop,
     out: &mut ExecResult,
 ) {
@@ -137,6 +140,7 @@ pub(super) fn park(
             task_id,
             payload: payload.to_vec(),
             streams,
+            guest_reads,
             next_stream: stream,
             acc,
             cursor: suspension.cursor,
@@ -205,6 +209,7 @@ pub(super) fn resume<M: crate::runtime::host::HostMemory + crate::runtime::host:
     let ExecContinuation {
         task_id,
         streams,
+        guest_reads,
         next_stream,
         acc,
         mut cursor,
@@ -226,7 +231,13 @@ pub(super) fn resume<M: crate::runtime::host::HostMemory + crate::runtime::host:
         &mut measured_ns,
     );
     if let Some(stop) = stopped {
-        park(state, slot, payload, task_id, streams, stop, &mut out);
+        park(state, slot, payload, task_id, streams, guest_reads, stop, &mut out);
+    } else {
+        for object_id in guest_reads {
+            crate::runtime::resource_validity::deliver_for_guest_read(
+                state, host, task_id, object_id,
+            );
+        }
     }
     super::note_exec_header(started, measured_ns);
     out.total_us = super::elapsed_us(started);

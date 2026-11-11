@@ -700,6 +700,7 @@ settle_sites! {
     /// `surface_quarantine::quarantine_collision` — both colliding mappings'
     /// pages, before anything is decided about them.
     Quarantine => "settle_quarantine",
+    GuestReadRequest => "settle_guest_read_request",
 }
 
 /// Block until every guest-page write this device has submitted has executed.

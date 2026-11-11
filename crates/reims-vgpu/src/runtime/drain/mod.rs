@@ -4202,6 +4202,14 @@ fn apply_map_family<H: HostMemory + HostOps>(
                     if outcome.missed {
                         miss = miss.saturating_add(1);
                     }
+                    if outcome.guest_read_requested {
+                        crate::runtime::resource_validity::deliver_for_guest_read(
+                            state,
+                            host,
+                            cmd.task_id,
+                            rec.object_id,
+                        );
+                    }
                 }
                 // One counter here, two on the exec side: `pageBacking`
                 // names mapping ids, so a record this device holds no

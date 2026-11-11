@@ -771,15 +771,28 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
     // pixels the guest has since overwritten has to go now — landing it later
     // would replace the guest's own bytes with a frame the guest has declared
     // stale.
-    consume_resource_table(state, task_id, &resource_descs);
+    let guest_reads = consume_resource_table(state, task_id, &resource_descs);
 
     let stopped = run_streams(state, host, task_id, &streams, 0, None, &mut out, &mut measured_ns);
     #[cfg(feature = "backend-vulkan")]
     if let Some(stop) = stopped {
-        continuation::park(state, slot, payload, task_id, streams, stop, &mut out);
+        continuation::park(state, slot, payload, task_id, streams, guest_reads, stop, &mut out);
+    } else {
+        for object_id in guest_reads {
+            crate::runtime::resource_validity::deliver_for_guest_read(
+                state, host, task_id, object_id,
+            );
+        }
     }
     #[cfg(not(feature = "backend-vulkan"))]
-    let _ = stopped;
+    {
+        let _ = stopped;
+        for object_id in guest_reads {
+            crate::runtime::resource_validity::deliver_for_guest_read(
+                state, host, task_id, object_id,
+            );
+        }
+    }
     note_exec_header(exec_started, measured_ns);
     out.total_us = elapsed_us(exec_started);
     out
@@ -912,8 +925,13 @@ fn note_exec_header(exec_started: std::time::Instant, measured_ns: u64) {
 ///
 /// The census that measured it is gone; a correlation with no counter-examples
 /// over 19 135 trials is a finding, not a thing to keep re-deriving per frame.
-fn consume_resource_table(state: &mut DeviceState, task_id: u32, descs: &[ExecResourceDesc]) {
+fn consume_resource_table(
+    state: &mut DeviceState,
+    task_id: u32,
+    descs: &[ExecResourceDesc],
+) -> Vec<u32> {
     use crate::runtime::resource_validity::{apply, ValiditySite};
+    let mut guest_reads = Vec::new();
     let mut no_surface = 0u32;
     let mut unknown = 0u32;
     for d in descs {
@@ -925,6 +943,9 @@ fn consume_resource_table(state: &mut DeviceState, task_id: u32, descs: &[ExecRe
                 .fail_once(0);
         }
         let outcome = apply(state, task_id, d.object_id, d.ops, ValiditySite::ExecTable);
+        if outcome.guest_read_requested {
+            guest_reads.push(d.object_id);
+        }
         if !outcome.missed {
             continue;
         }
@@ -938,6 +959,7 @@ fn consume_resource_table(state: &mut DeviceState, task_id: u32, descs: &[ExecRe
     // opcode in the device and a per-record line would bury the fail view.
     crate::runtime::drain::note_store_route_n("validity_no_surface", no_surface as u64);
     crate::runtime::drain::note_store_route_n("validity_unknown_object", unknown as u64);
+    guest_reads
 }
 
 /// The one part of an `EXEC_INDIRECT2` resource-table record this device cannot
@@ -1011,10 +1033,11 @@ fn preflight_render_translations<M: HostMemory + HostOps>(
         // A container whose AIR will not extract is the same "deterministic
         // missing plan input" as one that would not load: normal execution
         // reports it precisely, and there is no asynchronous work to await.
-        let (Ok(v_air), Ok(f_air)) = (
-            crate::runtime::mtlb::extract_air(&v_mtlb),
-            crate::runtime::mtlb::extract_air(&f_mtlb),
-        ) else {
+        let f_air = f_mtlb
+            .as_deref()
+            .map(crate::runtime::mtlb::extract_air)
+            .transpose();
+        let (Ok(v_air), Ok(f_air)) = (crate::runtime::mtlb::extract_air(&v_mtlb), f_air) else {
             continue;
         };
         let cache_started = std::time::Instant::now();
@@ -1025,12 +1048,14 @@ fn preflight_render_translations<M: HostMemory + HostOps>(
         ) {
             pending = true;
         }
-        if !crate::runtime::m2v_cache::ensure_cached_async(
-            f_air,
-            metal2vulkan::passes::Stage::Fragment,
-            pipeline_ref,
-        ) {
-            pending = true;
+        if let Some(f_air) = f_air {
+            if !crate::runtime::m2v_cache::ensure_cached_async(
+                f_air,
+                metal2vulkan::passes::Stage::Fragment,
+                pipeline_ref,
+            ) {
+                pending = true;
+            }
         }
         note_preflight_part(PreflightPart::Cache, cache_started.elapsed().as_nanos() as u64);
     }
@@ -4545,7 +4570,7 @@ pub(crate) fn test_run_and_park<M: HostMemory + HostOps>(
             acc,
             suspension,
         };
-        continuation::park(state, slot, payload, task_id, streams, stop, &mut out);
+        continuation::park(state, slot, payload, task_id, streams, Vec::new(), stop, &mut out);
     }
     out
 }

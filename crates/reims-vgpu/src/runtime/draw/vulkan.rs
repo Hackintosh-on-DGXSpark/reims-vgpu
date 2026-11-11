@@ -957,20 +957,48 @@ pub(super) enum AttachmentAliasSample<'a> {
     /// Records 2+ of a resident GVA chain: the prior record's content lives
     /// on the engine-resident target, not in a CPU seed. Bound as a resident
     /// sampled source (the engine snapshots on self-alias).
-    ResidentChain,
+    ResidentChain { slot: u32 },
+}
+
+fn sampled_base_level_gva<M: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    texture_ref: u32,
+) -> Option<u64> {
+    use crate::runtime::decode::resource::{
+        OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_VARIANT,
+    };
+    let (_entry, desc) = objects::resolve_descriptor(
+        state,
+        host,
+        task_id,
+        texture_ref,
+        &[OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_VARIANT],
+    )
+    .ok()?;
+    let tex = decode_texture_descriptor(&desc).ok()?;
+    tex.level_gva(0, state.page_shift).map(|(gva, _)| gva)
 }
 
 pub(super) fn fragment_attachment_alias_sample<'a>(
     req: &'a DrawEncodeRequest,
     texture_index: u32,
     texture_ref: u32,
+    sampled_gva: Option<u64>,
 ) -> Option<(u32, u32, AttachmentAliasSample<'a>)> {
-    let color = req.colors.iter().find(|color| {
-        color.slot == texture_index
-            && color.texture_ref == texture_ref
+    let names_it = |color: &&ColorRtRequest| {
+        color.texture_ref == texture_ref
             && color.mapping_id == 0
             && color.target_gva != 0
-    })?;
+            && sampled_gva.is_none_or(|gva| gva == color.target_gva)
+    };
+    let color = req
+        .colors
+        .iter()
+        .filter(names_it)
+        .find(|color| color.slot == texture_index)
+        .or_else(|| req.colors.iter().find(names_it))?;
     let need = (color.width as usize)
         .checked_mul(color.height as usize)?
         .checked_mul(RGBA8_BPP as usize)?;
@@ -996,7 +1024,7 @@ pub(super) fn fragment_attachment_alias_sample<'a>(
                 return Some((
                     color.width,
                     color.height,
-                    AttachmentAliasSample::ResidentChain,
+                    AttachmentAliasSample::ResidentChain { slot: color.slot },
                 ));
             }
             None
@@ -1877,10 +1905,22 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
         native_uploads_asking_host(),
         crate::runtime::render_writeback::SettleSite::LinearTextureSampled,
     )?;
-    let (_entry, desc) = sampled_texture_descriptor(state, host, task_id, texture_ref)?;
-    let tex = decode_texture_descriptor(&desc).ok()?;
-    let (w, h) = tex.extent()?;
-    let planes = tex.levels.first()?.planes();
+    let (w, h, planes) = match texture_view::resolve_texture_view(state, host, task_id, texture_ref)
+    {
+        Some(view) => {
+            let (_entry, desc) =
+                sampled_texture_descriptor(state, host, task_id, view.base_texture_ref)?;
+            let tex = decode_texture_descriptor(&desc).ok()?;
+            let (_gva, layout) = tex.level_gva(view.level, state.page_shift)?;
+            (layout.width, layout.height, layout.planes())
+        }
+        None => {
+            let (_entry, desc) = sampled_texture_descriptor(state, host, task_id, texture_ref)?;
+            let tex = decode_texture_descriptor(&desc).ok()?;
+            let (w, h) = tex.extent()?;
+            (w, h, tex.levels.first()?.planes())
+        }
+    };
     let need = (w as usize)
         .saturating_mul(h as usize)
         .saturating_mul(planes as usize)
@@ -6322,6 +6362,67 @@ fn note_type11_store_route(route: &'static str) {
     clippy::too_many_arguments,
     reason = "every argument is a distinct wire-derived input to the attachment set"
 )]
+pub(super) fn secondary_target_identity<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    c: &ColorRtRequest,
+    format: ash::vk::Format,
+) -> Option<crate::backend::vulkan::engine::TargetIdentity> {
+    use crate::backend::vulkan::engine::TargetIdentity;
+    if c.target_gva != 0 {
+        Some(TargetIdentity::Gva {
+            gva: c.target_gva,
+            width: c.width,
+            height: c.height,
+            generation: if c.texture_ref != 0 {
+                crate::runtime::writeback_debt::gva_resource_generation(
+                    state,
+                    host,
+                    crate::runtime::writeback_debt::GvaResourceKey {
+                        task_id,
+                        texture_ref: c.texture_ref,
+                    },
+                    c.target_gva,
+                    u64::from(c.row_stride).saturating_mul(u64::from(c.height)),
+                )
+            } else {
+                gva_span_alloc_generation(
+                    state,
+                    host,
+                    task_id,
+                    c.target_gva,
+                    c.row_stride,
+                    c.height,
+                )
+            },
+            format,
+        })
+    } else if c.mapping_id != 0 {
+        Some(crate::runtime::present_identity::surface_identity(
+            state,
+            c.mapping_id,
+            c.width,
+            c.height,
+        ))
+    } else if let Some(&base) = (c.mapping_id == 0 && !c.memoryless)
+        .then(|| state.heap_texture_targets.get(&(task_id, c.texture_ref)))
+        .flatten()
+    {
+        Some(heap_target_identity(base, c.width, c.height))
+    } else if c.memoryless {
+        Some(TargetIdentity::Texture {
+            ref_: c.texture_ref,
+            width: c.width,
+            height: c.height,
+            generation: 0,
+            stencil: false,
+        })
+    } else {
+        None
+    }
+}
+
 pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -6336,7 +6437,7 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
     Vec<crate::backend::vulkan::engine::SecondaryColorTarget>,
     crate::runtime::census::present_proxy::SecondaryMrtRefusal,
 > {
-    use crate::backend::vulkan::engine::{SecondaryColorTarget, TargetIdentity};
+    use crate::backend::vulkan::engine::SecondaryColorTarget;
     use crate::runtime::census::present_proxy::SecondaryMrtRefusal;
     if colors.len() <= 1 {
         return Ok(Vec::new());
@@ -6402,64 +6503,7 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
         // Without one this attachment is keyed on `(gva, width, height)` alone
         // and two guest allocations reusing that address at that geometry share
         // one GPU image — the wrong-content class `74748d2` closed for color0.
-        let identity = if c.target_gva != 0 {
-            TargetIdentity::Gva {
-                gva: c.target_gva,
-                width: c.width,
-                height: c.height,
-                generation: if c.texture_ref != 0 {
-                    crate::runtime::writeback_debt::gva_resource_generation(
-                        state,
-                        host,
-                        crate::runtime::writeback_debt::GvaResourceKey {
-                            task_id,
-                            texture_ref: c.texture_ref,
-                        },
-                        c.target_gva,
-                        u64::from(c.row_stride).saturating_mul(u64::from(c.height)),
-                    )
-                } else {
-                    gva_span_alloc_generation(
-                        state,
-                        host,
-                        task_id,
-                        c.target_gva,
-                        c.row_stride,
-                        c.height,
-                    )
-                },
-                // The format this attachment's image is actually created with,
-                // not a re-derivation of it. `registry_ensure_attachment` takes
-                // `format` — resolved just above by `color_attachment` — so
-                // answering the key from anything else lets the identity claim
-                // one format while the image holds another. It did: a
-                // `R16G16_SFLOAT` secondary is admitted by `color_attachment`
-                // and got an identity saying eight-bit RGBA.
-                format,
-            }
-        } else if c.mapping_id != 0 {
-            crate::runtime::present_identity::surface_identity(
-                state,
-                c.mapping_id,
-                c.width,
-                c.height,
-            )
-        } else if let Some(&base) = (c.mapping_id == 0 && !c.memoryless)
-            .then(|| state.heap_texture_targets.get(&(task_id, c.texture_ref)))
-            .flatten()
-        {
-            heap_target_identity(base, c.width, c.height)
-        } else if c.memoryless {
-            // No guest destination to follow, so the texture ref names it, as
-            // it names a depth attachment. Its content never outlives the pass.
-            TargetIdentity::Texture {
-                ref_: c.texture_ref,
-                width: c.width,
-                height: c.height,
-                generation: 0,
-                stencil: false,
-            }
-        } else {
+        let Some(identity) = secondary_target_identity(state, host, task_id, c, format) else {
             crate::runtime::census::present_proxy::note_secondary_mrt_drop(
                 crate::runtime::census::present_proxy::MrtDrop::NoIdentity,
                 c.width,
@@ -7470,8 +7514,14 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     let alias_span = crate::runtime::sampled_phase::Span::open(
                         crate::runtime::sampled_phase::Part::ResolveAlias,
                     );
+                    let sampled_gva = (frag_stage
+                        && req.colors.iter().any(|c| c.texture_ref == texture_ref))
+                    .then(|| sampled_base_level_gva(state, host, req.task_id, texture_ref))
+                    .flatten();
                     let attachment_alias = frag_stage
-                        .then(|| fragment_attachment_alias_sample(req, index, texture_ref))
+                        .then(|| {
+                            fragment_attachment_alias_sample(req, index, texture_ref, sampled_gva)
+                        })
                         .flatten();
                     if let Some((aw, ah, alias)) = attachment_alias {
                         match alias {
@@ -7495,8 +7545,29 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                                     crate::backend::vulkan::engine::SampledByteOrigin::AttachmentAlias,
                                 ),
                             ),
-                            AttachmentAliasSample::ResidentChain => {
-                                let identity = render_chain_identity(state, req).ok_or({
+                            AttachmentAliasSample::ResidentChain { slot } => {
+                                let color = req.colors.iter().find(|color| {
+                                    color.slot == slot && color.texture_ref == texture_ref
+                                });
+                                let attachment_format = color.and_then(|color| {
+                                    translate::pixel::color_attachment(color.format)
+                                        .ok()
+                                        .map(|resolved| resolved.0)
+                                });
+                                let identity = if slot == 0 {
+                                    render_chain_identity(state, req)
+                                } else {
+                                    color.zip(attachment_format).and_then(|(color, format)| {
+                                        secondary_target_identity(
+                                            state,
+                                            host,
+                                            req.task_id,
+                                            color,
+                                            format,
+                                        )
+                                    })
+                                }
+                                .ok_or({
                                     DrawError::DrawPreparation(
                                         DrawPreparationDecline::AttachmentAliasIdentityMissing {
                                             index,
@@ -7509,17 +7580,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                                     identity.height(),
                                     SampledSourceRequest::Target(
                                         identity.clone(),
-                                        req.colors
-                                            .iter()
-                                            .find(|color| {
-                                                color.slot == index
-                                                    && color.texture_ref == texture_ref
-                                            })
-                                            .and_then(|color| {
-                                                translate::pixel::color_attachment(color.format)
-                                                    .ok()
-                                                    .map(|resolved| resolved.0)
-                                            })
+                                        attachment_format
                                             .unwrap_or_else(|| identity.resident_format()),
                                     ),
                                 )

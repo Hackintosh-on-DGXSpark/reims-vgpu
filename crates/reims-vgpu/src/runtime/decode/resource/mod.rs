@@ -632,6 +632,9 @@ impl Default for ColorWriteMask {
 }
 
 impl ColorWriteMask {
+    pub const NONE: Self = Self { bits: 0 };
+    pub const ALL: Self = Self { bits: MTL_COLOR_WRITE_MASK_ALL };
+
     /// `None` for a value outside `MTLColorWriteMask`'s four bits — see
     /// [`ColorWriteMaskOutOfRange`], which is what the decoder reports for it.
     pub fn new(bits: u32) -> Option<Self> {

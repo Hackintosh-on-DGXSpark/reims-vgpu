@@ -1817,23 +1817,69 @@ fn attachment_alias_resident_chain_selection() {
         ..Default::default()
     });
     assert_eq!(
-        fragment_attachment_alias_sample(&req, 0, 42),
+        fragment_attachment_alias_sample(&req, 0, 42, None),
         None,
         "unarmed LOAD without seed must not alias"
     );
     req.chain_from_resident = true;
     assert_eq!(
-        fragment_attachment_alias_sample(&req, 0, 42),
-        Some((8, 8, AttachmentAliasSample::ResidentChain)),
+        fragment_attachment_alias_sample(&req, 0, 42, None),
+        Some((8, 8, AttachmentAliasSample::ResidentChain { slot: 0 })),
         "armed chain aliases from the resident target"
     );
     // CPU seed still wins when present (record after a non-resident hop).
     let seed = vec![0u8; 8 * 8 * 4];
     req.colors[0].target_seed_rgba = Some(seed);
     assert!(matches!(
-        fragment_attachment_alias_sample(&req, 0, 42),
+        fragment_attachment_alias_sample(&req, 0, 42, None),
         Some((8, 8, AttachmentAliasSample::Seed(_, _)))
     ));
+}
+
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn a_pass_reads_its_own_attachments_through_any_texture_index() {
+    let attachment = |slot, texture_ref, target_gva| ColorRtRequest {
+        slot,
+        texture_ref,
+        mapping_id: 0,
+        target_gva,
+        width: 128,
+        height: 128,
+        load_action: MTL_LOAD_ACTION_LOAD,
+        ..Default::default()
+    };
+    let mut req = DrawEncodeRequest::default();
+    req.colors.push(attachment(0, 19, 0x26_8000));
+    req.colors.push(attachment(1, 20, 0x28_8000));
+    req.chain_from_resident = true;
+
+    assert_eq!(
+        fragment_attachment_alias_sample(&req, 0, 20, None),
+        Some((128, 128, AttachmentAliasSample::ResidentChain { slot: 1 }))
+    );
+    assert_eq!(
+        fragment_attachment_alias_sample(&req, 1, 19, None),
+        Some((128, 128, AttachmentAliasSample::ResidentChain { slot: 0 }))
+    );
+    assert_eq!(fragment_attachment_alias_sample(&req, 2, 21, None), None);
+
+    let mut mip = DrawEncodeRequest::default();
+    mip.colors.push(ColorRtRequest {
+        slot: 0,
+        texture_ref: 19,
+        mapping_id: 0,
+        target_gva: 0x4290000,
+        width: 32,
+        height: 32,
+        load_action: MTL_LOAD_ACTION_CLEAR,
+        ..Default::default()
+    });
+    assert_eq!(
+        fragment_attachment_alias_sample(&mip, 0, 19, Some(0x428c000)),
+        None
+    );
+    assert!(fragment_attachment_alias_sample(&mip, 0, 19, Some(0x4290000)).is_some());
 }
 
 /// Vulkan-arm only: `AttachmentAliasSample` and its resolver are
@@ -1862,24 +1908,27 @@ fn gva_attachment_alias_samples_the_in_process_chain() {
     };
 
     let (width, height, sample) =
-        fragment_attachment_alias_sample(&req, 0, texture_ref).expect("GVA alias");
+        fragment_attachment_alias_sample(&req, 0, texture_ref, None).expect("GVA alias");
     assert_eq!((width, height), (2, 1));
     let AttachmentAliasSample::Seed(actual, _) = sample else {
         panic!("Load alias must use the chained seed");
     };
     assert_eq!(actual, seed);
-    assert!(fragment_attachment_alias_sample(&req, 1, texture_ref).is_none());
-    assert!(fragment_attachment_alias_sample(&req, 0, texture_ref + 1).is_none());
+    assert!(matches!(
+        fragment_attachment_alias_sample(&req, 1, texture_ref, None),
+        Some((2, 1, AttachmentAliasSample::Seed(..)))
+    ));
+    assert!(fragment_attachment_alias_sample(&req, 0, texture_ref + 1, None).is_none());
 
     req.colors[0].mapping_id = 9;
-    assert!(fragment_attachment_alias_sample(&req, 0, texture_ref).is_none());
+    assert!(fragment_attachment_alias_sample(&req, 0, texture_ref, None).is_none());
     req.colors[0].mapping_id = 0;
     req.colors[0].load_action = MTL_LOAD_ACTION_DONT_CARE;
-    assert!(fragment_attachment_alias_sample(&req, 0, texture_ref).is_none());
+    assert!(fragment_attachment_alias_sample(&req, 0, texture_ref, None).is_none());
     req.colors[0].load_action = MTL_LOAD_ACTION_CLEAR;
     req.colors[0].clear_color = [0.25, 0.5, 0.75, 1.0];
     assert_eq!(
-        fragment_attachment_alias_sample(&req, 0, texture_ref),
+        fragment_attachment_alias_sample(&req, 0, texture_ref, None),
         Some((2, 1, AttachmentAliasSample::Clear([0.25, 0.5, 0.75, 1.0])))
     );
 }
