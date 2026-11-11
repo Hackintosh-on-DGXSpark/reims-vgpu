@@ -5439,6 +5439,64 @@ fn an_unbuildable_secondary_refuses_the_draw_rather_than_dropping_to_single_rt()
         single.is_empty(),
         "one colour attachment produces no secondaries"
     );
+
+    // A secondary attachment larger than the pass's render area is legal in
+    // Metal and Vulkan (`attachment >= framebuffer`), retaining its own backing
+    // dimensions while smaller attachments (`32 < 64` above) stay refused.
+    let larger_slot1 = ColorRtRequest {
+        width: 128,
+        height: 128,
+        row_stride: 128 * 4,
+        ..good_slot1.clone()
+    };
+    let larger = build_secondary_targets(
+        &mut state,
+        &mut host,
+        1,
+        &[slot0.clone(), larger_slot1],
+        &pipeline,
+        &primary,
+        64,
+        64,
+        [0.0; 4],
+    )
+    .expect("larger secondary MRT attachment must build");
+    assert_eq!((larger[0].width, larger[0].height), (128, 128));
+
+    // An unrendered heap secondary declaring `MTLLoadActionLoad` coerces to
+    // `load = false` instead of reaching the engine with an unready `LOAD`.
+    state.heap_texture_targets.insert(
+        (1, 77),
+        crate::model::HeapTargetRef {
+            base_ref: 77,
+            generation: 3,
+            base_format: crate::contract::pixel_format::MTL_FORMAT_RGBA8_UNORM,
+        },
+    );
+    let unrendered_heap_slot1 = ColorRtRequest {
+        texture_ref: 77,
+        mapping_id: 0,
+        target_gva: 0,
+        format: crate::contract::pixel_format::MTL_FORMAT_RGBA8_UNORM,
+        load_action: crate::contract::pass_action::MTL_LOAD_ACTION_LOAD,
+        ..good_slot1.clone()
+    };
+    let heap_secs = build_secondary_targets(
+        &mut state,
+        &mut host,
+        1,
+        &[slot0.clone(), unrendered_heap_slot1],
+        &pipeline,
+        &primary,
+        64,
+        64,
+        [0.0; 4],
+    )
+    .expect("unrendered heap secondary must build");
+    assert!(
+        !heap_secs[0].load,
+        "unrendered heap secondary LOAD must coerce to false instead of tripping LoadSecondaryContentNotReady"
+    );
 }
 
 /// Two attachments over one destination are refused wherever the pair sits, not

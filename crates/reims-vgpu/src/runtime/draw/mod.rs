@@ -4698,7 +4698,16 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
         if base_w == 0 {
             base_w = mw;
             base_h = mh;
-        } else if mw != base_w || mh != base_h {
+        } else if {
+            #[cfg(feature = "backend-vulkan")]
+            {
+                mw < base_w || mh < base_h
+            }
+            #[cfg(not(feature = "backend-vulkan"))]
+            {
+                mw != base_w || mh != base_h
+            }
+        } {
             // An attachment whose geometry differs from the first one is
             // dropped, and the draw goes on with the rest. **This is a loss the
             // guest is not told about**: the shader still writes that
@@ -4737,14 +4746,19 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
             && !memoryless
             && state.heap_texture_targets.contains_key(&(task_id, target_ref));
         if heap {
-            // A heap texture's content lives in its engine resident. Colour0's
-            // LOAD is honoured from there by `encode_draw_chain`; a secondary
-            // has no way to load one, so it starts undefined.
+            // A heap texture's content lives in its engine resident. On Vulkan,
+            // both colour0 (`encode_draw_chain`) and secondary slots
+            // (`build_secondary_targets`) load from that resident when ready
+            // and start cleared when unrendered; on Metal a secondary has no
+            // resident rail and starts undefined.
             if let Some(cl) = clears.iter().find(|a| a.texture_ref == att.texture_ref) {
                 load_action = MTL_LOAD_ACTION_CLEAR;
                 clear_color = cl.clear_color;
             } else if load_action == MTL_LOAD_ACTION_LOAD && !colors.is_empty() {
-                load_action = MTL_LOAD_ACTION_DONT_CARE;
+                #[cfg(not(feature = "backend-vulkan"))]
+                {
+                    load_action = MTL_LOAD_ACTION_DONT_CARE;
+                }
             }
         } else if memoryless {
             // Nothing to seed from: a memoryless attachment starts cleared or

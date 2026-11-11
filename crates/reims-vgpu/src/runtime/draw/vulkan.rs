@@ -6638,7 +6638,7 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
     Vec<crate::backend::vulkan::engine::SecondaryColorTarget>,
     crate::runtime::census::present_proxy::SecondaryMrtRefusal,
 > {
-    use crate::backend::vulkan::engine::SecondaryColorTarget;
+    use crate::backend::vulkan::engine::{SecondaryColorTarget, TargetIdentity};
     use crate::runtime::census::present_proxy::SecondaryMrtRefusal;
     if colors.len() <= 1 {
         return Ok(Vec::new());
@@ -6658,8 +6658,10 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
                 reason: crate::runtime::census::present_proxy::MrtDrop::NonContiguousSlot,
             });
         }
-        // MRT requires every attachment to share the framebuffer geometry.
-        if c.width != fb_w || c.height != fb_h {
+        // MRT requires every attachment to cover at least the framebuffer's
+        // render area; larger attachments render into `(fb_w, fb_h)` while
+        // retaining their own dimensions in the resident registry.
+        if c.width < fb_w || c.height < fb_h {
             crate::runtime::census::present_proxy::note_secondary_mrt_drop(
                 crate::runtime::census::present_proxy::MrtDrop::GeometryMismatch,
                 c.width,
@@ -6767,7 +6769,12 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
         let declared = crate::contract::pass_action::LoadAction::from_declared(c.load_action);
         let load = match declared {
             crate::contract::pass_action::LoadAction::Clear => false,
-            crate::contract::pass_action::LoadAction::Load => true,
+            crate::contract::pass_action::LoadAction::Load => match &identity {
+                TargetIdentity::Heap { .. } | TargetIdentity::Texture { .. } => {
+                    crate::backend::vulkan::engine::resident_content_ready(&identity)
+                }
+                _ => true,
+            },
             crate::contract::pass_action::LoadAction::DontCare => {
                 crate::backend::vulkan::engine::resident_content_ready(&identity)
             }
