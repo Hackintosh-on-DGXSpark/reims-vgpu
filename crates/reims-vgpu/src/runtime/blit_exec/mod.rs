@@ -2827,6 +2827,35 @@ fn copy_heap_resident_to_buffer<M: HostMemory + HostOps>(
     if !engine::resident_content_ready(&identity) {
         return br(BlitStatus::MissingResource, "t2b_heap_unrendered");
     }
+    if let Some(expected_layout) = pixel_format::store_texel_order(heap.format) {
+        if let Ok(rb) = engine::read_target_native(&identity) {
+            if rb.layout == expected_layout {
+                let bpp = rb.layout.bytes_per_texel() as usize;
+                let src_row = heap.width as usize * bpp;
+                if rb.pixels.len() >= src_row * heap.height as usize {
+                    let allowed = dest_window(state, host, task_id, dst_base, span);
+                    for y in 0..copy_h {
+                        let at = (oy + y) as usize * src_row + ox as usize * bpp;
+                        let slice = &rb.pixels[at..at + row_bytes as usize];
+                        if gva_mem::write_task_gva_product_within(
+                            state,
+                            host,
+                            task_id,
+                            dst_base + y * dst_bpr,
+                            slice,
+                            allowed.as_ref(),
+                        )
+                        .is_err()
+                        {
+                            return br(BlitStatus::GuestIo, "t2b_heap_write_io");
+                        }
+                    }
+                    crate::runtime::drain::note_store_route("blit_t2b_heap");
+                    return BlitStatus::Ok;
+                }
+            }
+        }
+    }
     let Ok(readback) = engine::read_target(&identity) else {
         return br(BlitStatus::MissingResource, "t2b_heap_read_refused");
     };

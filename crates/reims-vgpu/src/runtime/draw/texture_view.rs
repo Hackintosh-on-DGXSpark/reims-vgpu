@@ -702,6 +702,10 @@ pub(crate) struct NativeUploads {
     /// only exact path, for `float16`'s reason: the CPU arm keeps eight of each
     /// channel's ten bits.
     pub ten_bit: bool,
+    /// Upload guest 16-bit normalized colour (`RGBA16Unorm`) natively.
+    pub unorm16: bool,
+    /// Upload guest integer and float32 layouts (`Rg16Uint`, `Rg32Float`, `R32Float`) natively.
+    pub integer_and_float32: bool,
 }
 
 impl NativeUploads {
@@ -711,6 +715,8 @@ impl NativeUploads {
         bgra8: false,
         float16: false,
         ten_bit: false,
+        unorm16: false,
+        integer_and_float32: false,
     };
 
     /// Native BGRA8 only — the answer this parameter carried when it was a
@@ -726,6 +732,8 @@ impl NativeUploads {
         bgra8: true,
         float16: false,
         ten_bit: false,
+        unorm16: false,
+        integer_and_float32: false,
     };
 
     /// Every native layout the loaders can produce.
@@ -739,6 +747,8 @@ impl NativeUploads {
         bgra8: true,
         float16: true,
         ten_bit: true,
+        unorm16: true,
+        integer_and_float32: true,
     };
 }
 
@@ -768,6 +778,11 @@ pub(crate) fn linear_native_upload_format(
         SampledClass::Bgra8Unorm if native.bgra8 => TexelLayout::Bgra8,
         SampledClass::Rgba16Float if native.float16 => TexelLayout::Rgba16Float,
         SampledClass::Rg16Float if native.float16 => TexelLayout::Rg16Float,
+        SampledClass::R16Float if native.float16 => TexelLayout::R16Float,
+        SampledClass::Rgba16Unorm if native.unorm16 => TexelLayout::Rgba16Unorm,
+        SampledClass::Rg16Uint if native.integer_and_float32 => TexelLayout::Rg16Uint,
+        SampledClass::Rg32Float if native.integer_and_float32 => TexelLayout::Rg32Float,
+        SampledClass::R32Float if native.integer_and_float32 => TexelLayout::R32Float,
         SampledClass::Rgb10a2Unorm if native.ten_bit => TexelLayout::Rgb10a2Unorm,
         SampledClass::Bgr10a2Unorm if native.ten_bit => TexelLayout::Bgr10a2Unorm,
         _ => return None,

@@ -1509,24 +1509,21 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
         }
     }
     if let Some(target) = &req.target_rgba8 {
-        // The seed is one tightly-packed RGBA8 slice of the target, and the
-        // length is checked rather than taken. `w as usize * h as usize` widens
-        // its operands, which reads as safe and is — but only just: two u32
-        // maxima multiply to a hair under u64::MAX, so the bytes-per-texel is a
-        // third factor that overflows. A refusal rather than a clamp, because
-        // this length is what the next line compares the buffer against and a
-        // wrapped one would let a short buffer match.
+        let seed_bpp = match req.target_seed_order {
+            SeedOrder::Rgba8 | SeedOrder::Bgra8 => crate::contract::pixel_format::RGBA8_BPP,
+            SeedOrder::Native(layout) => layout.bytes_per_texel(),
+        };
         let Some(expected) = crate::contract::extent::tight_image_bytes(
             req.width,
             req.height,
-            crate::contract::pixel_format::RGBA8_BPP as usize,
+            seed_bpp as usize,
         ) else {
             return Err(DrawError::DrawValidation(
                 DrawValidationDecline::UnrepresentableImageBytes {
                     width: req.width,
                     height: req.height,
                     layers: 1,
-                    bytes_per_texel: crate::contract::pixel_format::RGBA8_BPP,
+                    bytes_per_texel: seed_bpp,
                 },
             ));
         };
@@ -3381,13 +3378,43 @@ pub(crate) unsafe fn execute_draw_inner(
     // wide as RGBA8 and still needs its seed restated.
     phase.enter(super::draw_phase::Phase::StageSeed);
     let seed_wide = seed_bytes.and_then(|rgba8| {
+        if matches!(req.target_seed_order, SeedOrder::Native(_)) {
+            return None;
+        }
         let layout = crate::backend::vulkan::translate::pixel::texel_layout_of(color0_format)?;
         if layout.is_four_byte_color() {
             return None;
         }
         Some((rgba8, layout))
     });
-    let seed_slot = if let Some((rgba8, layout)) = seed_wide {
+    let seed_slot = if let (Some(native), SeedOrder::Native(seed_layout)) =
+        (seed_bytes, req.target_seed_order)
+    {
+        if crate::backend::vulkan::translate::pixel::texel_layout_of(color0_format)
+            != Some(seed_layout)
+        {
+            return Err(DrawError::DrawExecution(
+                DrawExecutionDecline::SeedFormatUnwritable {
+                    format: color0_format,
+                },
+            ));
+        }
+        let slot = {
+            let _s = stage_phase::Span::open(stage_phase::Part::Acquire);
+            pools.acquire_staging(
+                ctx,
+                native.len() as u64,
+                vk::BufferUsageFlags::TRANSFER_SRC,
+                counters,
+            )?
+        };
+        {
+            let _s = stage_phase::Span::moving(stage_phase::Part::Bytes, native.len() as u64);
+            pools.write_staging(ctx, &slot, native)?;
+        }
+        counters.note_seed_upload(native.len() as u64);
+        Some(slot)
+    } else if let Some((rgba8, layout)) = seed_wide {
         // The seed's own order first, because `expand_rgba8_to_texel` reads
         // semantic RGBA8 — the same normalization the four-byte arm folds into
         // its copy, done here as a step because a widening pass cannot also
@@ -5862,6 +5889,7 @@ pub(crate) unsafe fn execute_draw_inner(
             .render_post_wait_skips
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return Ok(DrawAnswer::Drawn(DrawOutput {
+            native_pixels: None,
             pixels: Vec::new(),
             storage_pixels: Vec::new(),
             target_guest_backed,
@@ -5942,6 +5970,7 @@ pub(crate) unsafe fn execute_draw_inner(
         phase.enter(super::draw_phase::Phase::Wait);
         pools.wait_entry_fence(ctx, counters, fence)?;
         return Ok(DrawAnswer::Drawn(DrawOutput {
+            native_pixels: None,
             pixels: Vec::new(),
             storage_pixels: read_storage(ctx)?,
             target_guest_backed,
@@ -5962,6 +5991,7 @@ pub(crate) unsafe fn execute_draw_inner(
             phase.enter(super::draw_phase::Phase::Wait);
             pools.wait_entry_fence(ctx, counters, fence)?;
             return Ok(DrawAnswer::Drawn(DrawOutput {
+                native_pixels: None,
                 pixels: Vec::new(),
                 storage_pixels: Vec::new(),
                 target_guest_backed,
@@ -5975,6 +6005,7 @@ pub(crate) unsafe fn execute_draw_inner(
             .render_post_wait_skips
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return Ok(DrawAnswer::Drawn(DrawOutput {
+            native_pixels: None,
             pixels: Vec::new(),
             storage_pixels: Vec::new(),
             target_guest_backed,
@@ -6015,6 +6046,7 @@ pub(crate) unsafe fn execute_draw_inner(
             format: color0_format,
         }),
     )?;
+    let native_pixels = (!layout.is_four_byte_color()).then(|| (out.clone(), layout));
     let (pixels, pixels_bgra) = super::narrow_readback_to_rgba8(
         out,
         layout,
@@ -6025,6 +6057,7 @@ pub(crate) unsafe fn execute_draw_inner(
 
     Ok(DrawAnswer::Drawn(DrawOutput {
         pixels,
+        native_pixels,
         storage_pixels: read_storage(ctx)?,
         target_guest_backed,
         guest_store_recorded,

@@ -6141,6 +6141,7 @@ fn a_synchronous_gva_store_is_bounded_to_the_pages_the_command_named() {
         store_action: MTL_STORE_ACTION_STORE,
         clear_color: [0.0; 4],
         target_seed_rgba: None,
+        target_seed_layout: None,
         multisample_source_ref: 0,
         memoryless: false,
     };
@@ -6349,6 +6350,7 @@ fn a_scissored_gva_store_is_bounded_on_both_its_rails() {
         store_action: MTL_STORE_ACTION_STORE,
         clear_color: [0.0; 4],
         target_seed_rgba: None,
+        target_seed_layout: None,
         multisample_source_ref: 0,
         memoryless: false,
     };

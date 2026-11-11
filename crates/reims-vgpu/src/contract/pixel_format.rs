@@ -227,6 +227,11 @@ pub enum SampledClass {
     Bgra8Unorm,
     Rgba16Float,
     Rg16Float,
+    R16Float,
+    Rgba16Unorm,
+    Rg16Uint,
+    Rg32Float,
+    R32Float,
     /// The packed ten-bit words. Their guest bytes are already the upload bytes
     /// of `A2B10G10R10_UNORM_PACK32` / `A2R10G10B10_UNORM_PACK32`, so a loader
     /// that carries the native layout hands them over unconverted.
@@ -1186,6 +1191,11 @@ pub fn sampled_class(format: u16) -> Option<SampledClass> {
         MTL_FORMAT_BGRA8_UNORM | MTL_FORMAT_BGRA8_UNORM_SRGB => SampledClass::Bgra8Unorm,
         MTL_FORMAT_RGBA16_FLOAT => SampledClass::Rgba16Float,
         MTL_FORMAT_RG16_FLOAT => SampledClass::Rg16Float,
+        MTL_FORMAT_R16_FLOAT => SampledClass::R16Float,
+        MTL_FORMAT_RGBA16_UNORM => SampledClass::Rgba16Unorm,
+        MTL_FORMAT_RG16_UINT => SampledClass::Rg16Uint,
+        MTL_FORMAT_RG32_FLOAT => SampledClass::Rg32Float,
+        MTL_FORMAT_R32_FLOAT => SampledClass::R32Float,
         MTL_FORMAT_RGB10A2_UNORM => SampledClass::Rgb10a2Unorm,
         MTL_FORMAT_BGR10A2_UNORM => SampledClass::Bgr10a2Unorm,
         _ => return None,
@@ -1373,7 +1383,13 @@ pub fn store_texel_order(format: u16) -> Option<TexelLayout> {
     Some(match format {
         MTL_FORMAT_RGBA8_UNORM | MTL_FORMAT_RGBA8_UNORM_SRGB => TexelLayout::Rgba8,
         MTL_FORMAT_BGRA8_UNORM | MTL_FORMAT_BGRA8_UNORM_SRGB => TexelLayout::Bgra8,
+        MTL_FORMAT_R8_UNORM => TexelLayout::R8,
         MTL_FORMAT_RGBA16_FLOAT => TexelLayout::Rgba16Float,
+        MTL_FORMAT_RG16_FLOAT => TexelLayout::Rg16Float,
+        MTL_FORMAT_R16_FLOAT => TexelLayout::R16Float,
+        MTL_FORMAT_RG16_UINT => TexelLayout::Rg16Uint,
+        MTL_FORMAT_RG32_FLOAT => TexelLayout::Rg32Float,
+        MTL_FORMAT_R32_FLOAT => TexelLayout::R32Float,
         MTL_FORMAT_RGB10A2_UNORM => TexelLayout::Rgb10a2Unorm,
         MTL_FORMAT_BGR10A2_UNORM => TexelLayout::Bgr10a2Unorm,
         _ => return None,
@@ -2626,7 +2642,10 @@ mod tests {
             sampled_class(MTL_FORMAT_A8_UNORM),
             Some(SampledClass::A8Unorm)
         );
-        assert_eq!(sampled_class(MTL_FORMAT_R16_FLOAT), None);
+        assert_eq!(
+            sampled_class(MTL_FORMAT_R16_FLOAT),
+            Some(SampledClass::R16Float)
+        );
         assert_eq!(
             storage_selector(MTL_FORMAT_R8_UNORM),
             Some(StorageImageSelector::R8Unorm)
@@ -3454,7 +3473,13 @@ mod tests {
                 Some(match order {
                     TexelLayout::Rgba8 => SampledClass::Rgba8Unorm,
                     TexelLayout::Bgra8 => SampledClass::Bgra8Unorm,
+                    TexelLayout::R8 => SampledClass::R8Unorm,
                     TexelLayout::Rgba16Float => SampledClass::Rgba16Float,
+                    TexelLayout::Rg16Float => SampledClass::Rg16Float,
+                    TexelLayout::R16Float => SampledClass::R16Float,
+                    TexelLayout::Rg16Uint => SampledClass::Rg16Uint,
+                    TexelLayout::Rg32Float => SampledClass::Rg32Float,
+                    TexelLayout::R32Float => SampledClass::R32Float,
                     TexelLayout::Rgb10a2Unorm => SampledClass::Rgb10a2Unorm,
                     TexelLayout::Bgr10a2Unorm => SampledClass::Bgr10a2Unorm,
                     other => {
@@ -3464,12 +3489,10 @@ mod tests {
                 "{fmt:#x} is read as one layout by the sampler and copied as another"
             );
         }
-        // A renderable format that is still not a byte-copy destination, so a
-        // further widening of the set above has to change this line to pass.
-        assert!(render_target_bpp(MTL_FORMAT_RG16_FLOAT).is_some());
-        assert!(
-            store_texel_order(MTL_FORMAT_RG16_FLOAT).is_none(),
-            "RG16_FLOAT renders but is not admitted to a copy"
+        assert_eq!(
+            store_texel_order(MTL_FORMAT_RG16_FLOAT),
+            Some(TexelLayout::Rg16Float),
+            "RG16_FLOAT render targets store native half-float texels"
         );
         // The widened one, named so that removing it from the rule is a test
         // failure rather than a silent narrowing back to eight bits.

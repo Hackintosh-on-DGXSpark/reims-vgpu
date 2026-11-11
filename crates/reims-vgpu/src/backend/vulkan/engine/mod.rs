@@ -2962,6 +2962,12 @@ pub struct TargetReadback {
     pub bgra: bool,
 }
 
+/// Unclamped native texels read back from a resident render target.
+pub struct NativeTargetReadback {
+    pub pixels: Vec<u8>,
+    pub layout: crate::contract::pixel_format::TexelLayout,
+}
+
 impl TargetReadback {
     /// The frame in semantic RGBA8, exchanging R and B only when it is not
     /// already in that order.
@@ -4756,7 +4762,18 @@ fn readback_snapshot(
     Ok((snap, layout))
 }
 
-fn read_target_inner(identity: &TargetIdentity) -> Result<TargetReadback, DrawError> {
+fn read_target_raw(
+    identity: &TargetIdentity,
+) -> Result<
+    (
+        Vec<u8>,
+        crate::contract::pixel_format::TexelLayout,
+        ash::vk::Format,
+        u64,
+        bool,
+    ),
+    DrawError,
+> {
     let mut guard = lock_engine();
     let EngineState {
         ref mut owner,
@@ -4767,9 +4784,6 @@ fn read_target_inner(identity: &TargetIdentity) -> Result<TargetReadback, DrawEr
     let ctx = owner.ensure(counters)?;
     unsafe { pools.ensure_init(ctx, counters)? };
     let (snap, layout) = readback_snapshot(pools, identity)?;
-    // Asked for at the resident's own width — the copy is a raw image→buffer
-    // move and reads the image format's texel — and narrowed below if that is
-    // not what the caller can read.
     let pixels = (snap.width as u64) * (snap.height as u64);
     let rb_size = pixels * u64::from(layout.bytes_per_texel());
     let read_access = pools::ResidentAccess::transfer_read(snap.guest_backing.is_some());
@@ -4789,17 +4803,25 @@ fn read_target_inner(identity: &TargetIdentity) -> Result<TargetReadback, DrawEr
         )?;
         pools.registry_note_access(identity, read_access);
         counters.note_target_read(rb_size);
-        // A wide resident is quantized here rather than refused; see
-        // `narrow_readback_to_rgba8` for why that direction is the safe one.
-        let (pixels, bgra) =
-            narrow_readback_to_rgba8(out, layout, snap.format, pixels, snap.bgra())?;
-        Ok(TargetReadback { pixels, bgra })
+        Ok((out, layout, snap.format, pixels, snap.bgra()))
     }
+}
+
+fn read_target_inner(identity: &TargetIdentity) -> Result<TargetReadback, DrawError> {
+    let (out, layout, format, pixels, snap_bgra) = read_target_raw(identity)?;
+    let (pixels, bgra) = narrow_readback_to_rgba8(out, layout, format, pixels, snap_bgra)?;
+    Ok(TargetReadback { pixels, bgra })
 }
 
 /// Full-frame readback of a resident target (present / Synchronize / Map / Store boundary).
 pub fn read_target(identity: &TargetIdentity) -> Result<TargetReadback, DrawError> {
     read_target_inner(identity)
+}
+
+/// Full-frame native-texel readback of a resident target, without narrowing to RGBA8.
+pub fn read_target_native(identity: &TargetIdentity) -> Result<NativeTargetReadback, DrawError> {
+    let (pixels, layout, _, _, _) = read_target_raw(identity)?;
+    Ok(NativeTargetReadback { pixels, layout })
 }
 
 /// Run bounded maintenance for dead resources and already-free pool entries.

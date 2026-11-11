@@ -2814,7 +2814,7 @@ fn the_gpu_whole_plane_arm_refuses_a_plane_the_rail_would_not_write() {
 #[test]
 fn the_gpu_whole_plane_arm_compares_stored_texels_and_not_transfer_functions() {
     use crate::contract::pixel_format::{
-        MTL_FORMAT_BGRA8_UNORM_SRGB, MTL_FORMAT_R32_FLOAT, MTL_FORMAT_RGBA8_UNORM_SRGB,
+        MTL_FORMAT_BGRA8_UNORM_SRGB, MTL_FORMAT_A8_UNORM, MTL_FORMAT_RGBA8_UNORM_SRGB,
     };
     use GpuPlaneRefusal::*;
 
@@ -2877,18 +2877,18 @@ fn the_gpu_whole_plane_arm_compares_stored_texels_and_not_transfer_functions() {
     // which this arm does not do. It must refuse rather than fold to `None ==
     // None` and read as agreement.
     let unlayed = GpuPlane {
-        pixel_format: MTL_FORMAT_R32_FLOAT,
+        pixel_format: MTL_FORMAT_A8_UNORM,
         ..dst
     };
     assert_eq!(
         gpu_whole_plane_destination(
             Some(unlayed),
             Some(GpuMappingWindow {
-                pixel_format: MTL_FORMAT_R32_FLOAT,
+                pixel_format: MTL_FORMAT_A8_UNORM,
                 ..window
             }),
             GpuResidentSource {
-                pixel_format: MTL_FORMAT_R32_FLOAT,
+                pixel_format: MTL_FORMAT_A8_UNORM,
                 ..src
             }
         ),

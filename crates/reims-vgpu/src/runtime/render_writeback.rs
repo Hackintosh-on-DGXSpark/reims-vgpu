@@ -945,6 +945,37 @@ pub fn store_render_frame<M: HostMemory + HostOps>(
         leased => {
             drop(leased);
             crate::runtime::drain::note_store_route("render_flush_copied");
+            let native_layout = state
+                .mappings
+                .get(&mapping_id)
+                .map(crate::runtime::mapping_write::mapping_store_format)
+                .and_then(crate::contract::pixel_format::store_texel_order)
+                .filter(|layout| !layout.is_four_byte_color());
+            if let Some(expected_layout) = native_layout {
+                if let Ok(rb) = crate::backend::vulkan::engine::read_target_native(identity) {
+                    if rb.layout == expected_layout {
+                        let len = rb.pixels.len();
+                        let ok = crate::runtime::mapping_write::write_native_uncached(
+                            state,
+                            host,
+                            mapping_id,
+                            &rb.pixels,
+                            width,
+                            height,
+                            rb.layout,
+                        );
+                        if ok {
+                            crate::runtime::drain::note_store_route("render_flush_copied_native");
+                            crate::runtime::drain::note_readback_phase(
+                                crate::runtime::drain::ReadbackPhase::Write,
+                                write_started.elapsed().as_micros() as u64,
+                            );
+                            finish(state, mapping_id, identity, len, started, false);
+                            return true;
+                        }
+                    }
+                }
+            }
             match crate::backend::vulkan::engine::read_target(identity) {
                 Ok(rb) => {
                     // Shared rather than owned outright: the write's tail
@@ -1289,6 +1320,37 @@ pub(crate) fn store_gva_frame<M: HostMemory + HostOps>(
     // pass and not the no-op this comment used to claim. Both spellings of that
     // declaration must reach the same answer; `ResidentReadSnapshot::bgra` is
     // where they do, and where they did not.
+    if let Some(expected_layout) = crate::contract::pixel_format::store_texel_order(c0.format)
+        .filter(|layout| !layout.is_four_byte_color())
+    {
+        let rb = crate::backend::vulkan::engine::read_target_native(identity)
+            .map_err(|inner| GvaWritebackDecline::CopiedReadRefused { inner })?;
+        if rb.layout == expected_layout {
+            let Some(tight) = crate::contract::pixel_format::tight_row_bytes(c0.width, c0.format)
+            else {
+                return Err(GvaWritebackDecline::FormatNeedsConversion { format: c0.format });
+            };
+            let extent = u64::from(c0.height.saturating_sub(1)) * u64::from(c0.row_stride)
+                + u64::from(tight);
+            crate::runtime::draw::write_gva_native_within(
+                state,
+                host,
+                task_id,
+                c0.target_gva,
+                c0.width,
+                c0.height,
+                c0.row_stride,
+                c0.format,
+                &rb.pixels,
+                Some(pages.membership()),
+            )
+            .map_err(|err| GvaWritebackDecline::CopiedWriteRefused { err })?;
+            forget_gva_host_copies(state, task_id, c0.target_gva, texture_ref);
+            crate::backend::vulkan::engine::note_resident_content_copied_out(identity);
+            crate::runtime::drain::note_store_route("gva_flush_copied_native");
+            return Ok(extent);
+        }
+    }
     let rgba = crate::backend::vulkan::engine::read_target(identity)
         .map_err(|inner| GvaWritebackDecline::CopiedReadRefused { inner })?
         .into_rgba8();

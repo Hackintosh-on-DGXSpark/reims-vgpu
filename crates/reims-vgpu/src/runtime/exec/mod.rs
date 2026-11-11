@@ -3649,6 +3649,7 @@ fn finish_stream_draws<M: HostMemory + HostOps>(
                         MultiDrawChainSource::Cpu => {
                             if let Some(c0) = req.colors.first_mut() {
                                 c0.target_seed_rgba = chain_rgba.take();
+                                c0.target_seed_layout = None;
                             }
                         }
                         MultiDrawChainSource::Missing => {
@@ -4040,6 +4041,7 @@ fn render_pass_attachment_template(first: &draw::DrawEncodeRequest) -> draw::Dra
             store_action: c.store_action,
             clear_color: c.clear_color,
             target_seed_rgba: None,
+            target_seed_layout: None,
             multisample_source_ref: c.multisample_source_ref,
             memoryless: c.memoryless,
         })

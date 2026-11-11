@@ -257,6 +257,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
     crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Prep);
     // metal2vulkan path: load MTLB → AIR → SPIR-V → internal Vulkan engine offscreen.
     let mut draw_rgba: Option<Vec<u8>> = None;
+    let mut draw_native: Option<(Vec<u8>, crate::contract::pixel_format::TexelLayout)> = None;
     // Physical order of `draw_rgba`. A type-11 composite Store renders into a
     // BGRA `Surface` resident, so its readback is already in guest scanout
     // order; the pooled and GVA targets stay RGBA. Carried instead of assumed —
@@ -274,8 +275,13 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
     if req.pipeline_ref != 0 && (req.vertex_count > 0 || req.indexed.is_some()) {
         req.chain_resident_established = false;
         match try_metal2vulkan_draw(state, host, req, writeback_guest) {
-            Ok(M2vDrawSpan::Pixels { bytes, bgra }) => {
+            Ok(M2vDrawSpan::Pixels {
+                bytes,
+                bgra,
+                native,
+            }) => {
                 draw_rgba = Some(bytes);
+                draw_native = native;
                 draw_bgra = bgra;
                 crate::observe::line(format!(
                     "linux_m2v_draw ok pipe={} {}x{} vtx={}",
@@ -313,6 +319,20 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                     // run exactly as it does for a Store that never skipped its
                     // readback. `read_resident_chain` fail-logs a lost resident.
                     note_type11_store_route("gva_store_sync");
+                    if let Some(expected_layout) = req
+                        .colors
+                        .first()
+                        .and_then(|c0| pixel_format::store_texel_order(c0.format))
+                        .filter(|layout| !layout.is_four_byte_color())
+                    {
+                        if let Ok(rb) =
+                            crate::backend::vulkan::engine::read_target_native(&identity)
+                        {
+                            if rb.layout == expected_layout {
+                                draw_native = Some((rb.pixels, rb.layout));
+                            }
+                        }
+                    }
                     draw_rgba = read_resident_chain(req, &identity);
                     crate::observe::line(format!(
                         "linux_m2v_draw ok resident_gva_store pipe={} {}x{} gva={:#x} rgba={}",
@@ -370,6 +390,22 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                         // readback the rail exists to avoid, which is the point —
                         // the fallback is a cost, never a lost frame.
                         note_type11_store_route("surface_resident_sync");
+                        if let Some(expected_layout) = req
+                            .colors
+                            .first()
+                            .and_then(|c0| state.mappings.get(&c0.mapping_id))
+                            .map(mapping_write::mapping_store_format)
+                            .and_then(pixel_format::store_texel_order)
+                            .filter(|layout| !layout.is_four_byte_color())
+                        {
+                            if let Ok(rb) =
+                                crate::backend::vulkan::engine::read_target_native(&identity)
+                            {
+                                if rb.layout == expected_layout {
+                                    draw_native = Some((rb.pixels, rb.layout));
+                                }
+                            }
+                        }
                         draw_rgba = read_resident_chain(req, &identity);
                         crate::observe::line(format!(
                             "linux_m2v_draw ok resident_surface_store_sync_fallback pipe={} {}x{} mid={} rgba={}",
@@ -507,28 +543,36 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                     // has to be written, because a record whose identity did not
                     // resolve rendered into a pooled RGBA target.
                     let mut bgra = rgba;
-                    {
-                        let _span = StoreCostSpan::new("t11_convert_us");
-                        reorder_rb_in_place(&mut bgra, draw_bgra, true);
-                    }
-                    note_type11_store_route("cpu_portability");
-                    // `write_bgra8`, not `write_rgba8_image_changed`: the frame is
-                    // already in guest scanout order, and that entry point would
-                    // have to exchange every row back to read it. Both share the
-                    // same tail — residency-window invalidation,
-                    // `mark_mapping_written`, and the `surface_cache` republish —
-                    // so this is a substitution and not a narrowing. Its
-                    // changed-span rung is not lost either: this call site has
-                    // always passed `None` for the seed.
-                    let ok = mapping_write::write_bgra8(
-                        state,
-                        host,
-                        c0.mapping_id,
-                        &bgra,
-                        c0.width.saturating_mul(RGBA8_BPP),
-                        c0.width,
-                        c0.height,
-                    );
+                    let native_ok = draw_native.as_ref().is_some_and(|(native_bytes, layout)| {
+                        mapping_write::write_native_uncached(
+                            state,
+                            host,
+                            c0.mapping_id,
+                            native_bytes,
+                            c0.width,
+                            c0.height,
+                            *layout,
+                        )
+                    });
+                    let ok = if native_ok {
+                        note_type11_store_route("cpu_portability");
+                        true
+                    } else {
+                        {
+                            let _span = StoreCostSpan::new("t11_convert_us");
+                            reorder_rb_in_place(&mut bgra, draw_bgra, true);
+                        }
+                        note_type11_store_route("cpu_portability");
+                        mapping_write::write_bgra8(
+                            state,
+                            host,
+                            c0.mapping_id,
+                            &bgra,
+                            c0.width.saturating_mul(RGBA8_BPP),
+                            c0.width,
+                            c0.height,
+                        )
+                    };
                     // The synchronous route publishes through
                     // `mark_mapping_written`, so the epoch it advanced to is
                     // simply the mapping's current one — read immediately, for
@@ -642,44 +686,72 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                 // above. `None` only when that walk could not name the span,
                 // which is the pre-existing behaviour for a target this device
                 // cannot resolve at all.
-                let gva_ok = write_gva_rgba8_within(
-                    state,
-                    host,
-                    req.task_id,
-                    c0.target_gva,
-                    c0.width,
-                    c0.height,
-                    c0.row_stride,
-                    c0.format,
-                    &rgba,
-                    sync_store_pages.as_ref().map(|p| p.membership()),
-                )
-                .is_ok();
-                // Discrete-GPU rail: type-2/3 encode into **texture_ref** + **GVA**
-                // host caches (not surface_id mid map — list ids collide with
-                // present mids;). Sample prefers GVA key then
-                // texture_ref with live descriptor geom.
-                if gva_ok {
-                    let producer_object_type =
-                        objects::lookup_list_entry(state, host, req.task_id, c0.texture_ref)
-                            .map(|entry| entry.object_type)
-                            .unwrap_or(0);
-                    host_cache_store_gva_layer(
+                let native_written = if let Some((native_bytes, _layout)) = draw_native
+                    .as_ref()
+                    .filter(|(_, layout)| pixel_format::store_texel_order(c0.format) == Some(*layout))
+                {
+                    write_gva_native_within(
                         state,
                         host,
                         req.task_id,
-                        c0.texture_ref,
-                        producer_object_type,
                         c0.target_gva,
                         c0.width,
                         c0.height,
+                        c0.row_stride,
+                        c0.format,
+                        native_bytes,
+                        sync_store_pages.as_ref().map(|p| p.membership()),
+                    )
+                    .is_ok()
+                } else {
+                    false
+                };
+                let gva_ok = if native_written {
+                    if c0.target_gva != 0 {
+                        crate::runtime::surface_cache::evict_gva(state, c0.target_gva);
+                    }
+                    if c0.texture_ref != 0 {
+                        crate::runtime::surface_cache::evict_texture(
+                            state,
+                            req.task_id,
+                            c0.texture_ref,
+                        );
+                    }
+                    true
+                } else {
+                    let ok = write_gva_rgba8_within(
+                        state,
+                        host,
+                        req.task_id,
+                        c0.target_gva,
+                        c0.width,
+                        c0.height,
+                        c0.row_stride,
+                        c0.format,
                         &rgba,
-                        // Inside `if gva_ok`: this arm only runs when
-                        // `write_gva_rgba8_within` landed the same bytes in the
-                        // guest's pages, so they are re-derivable from there.
-                        true,
-                    );
-                }
+                        sync_store_pages.as_ref().map(|p| p.membership()),
+                    )
+                    .is_ok();
+                    if ok {
+                        let producer_object_type =
+                            objects::lookup_list_entry(state, host, req.task_id, c0.texture_ref)
+                                .map(|entry| entry.object_type)
+                                .unwrap_or(0);
+                        host_cache_store_gva_layer(
+                            state,
+                            host,
+                            req.task_id,
+                            c0.texture_ref,
+                            producer_object_type,
+                            c0.target_gva,
+                            c0.width,
+                            c0.height,
+                            &rgba,
+                            true,
+                        );
+                    }
+                    ok
+                };
                 let (rgb_nz, max_rgb) = rgb_stats(&rgba);
                 // A Store that lands is expected control flow and belongs on
                 // the census channel, not the failure one — "non-OFF lines are
@@ -953,7 +1025,7 @@ pub(super) enum AttachmentAliasSample<'a> {
     /// bytes rather than a decoded value: an sRGB attachment holds encoded ones,
     /// and a bind that samples them linear hands the shader an undecoded value
     /// the next attachment write then encodes a second time.
-    Seed(&'a [u8], u16),
+    Seed(&'a [u8], SampledByteFormat),
     /// Records 2+ of a resident GVA chain: the prior record's content lives
     /// on the engine-resident target, not in a CPU seed. Bound as a resident
     /// sampled source (the engine snapshots on self-alias).
@@ -999,9 +1071,10 @@ pub(super) fn fragment_attachment_alias_sample<'a>(
         .filter(names_it)
         .find(|color| color.slot == texture_index)
         .or_else(|| req.colors.iter().find(names_it))?;
+    let seed_layout = color.target_seed_layout.unwrap_or(TexelLayout::Rgba8);
     let need = (color.width as usize)
         .checked_mul(color.height as usize)?
-        .checked_mul(RGBA8_BPP as usize)?;
+        .checked_mul(seed_layout.bytes_per_texel() as usize)?;
     match color.load_action {
         MTL_LOAD_ACTION_CLEAR => Some((
             color.width,
@@ -1017,7 +1090,10 @@ pub(super) fn fragment_attachment_alias_sample<'a>(
                 return Some((
                     color.width,
                     color.height,
-                    AttachmentAliasSample::Seed(seed, color.format),
+                    AttachmentAliasSample::Seed(
+                        seed,
+                        SampledByteFormat::from_source(seed_layout, color.format),
+                    ),
                 ));
             }
             if req.chain_from_resident {
@@ -1175,8 +1251,19 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
         // The opcode-9 descriptor's own pixel format. The loader converts to
         // RGBA8 order and decodes nothing, so the transfer function the guest
         // declared is still the one these bytes carry.
-        let source = bt.desc.pixel_format;
-        let (w, h, rgba) = load_buffer_texture_rgba(state, host, task_id, texture_ref, &bt)?;
+        let source = if bt.desc.pixel_format != 0 {
+            bt.desc.pixel_format
+        } else {
+            MTL_FORMAT_BGRA8_UNORM
+        };
+        let (w, h, rgba, byte_format) = load_buffer_texture_sampled(
+            state,
+            host,
+            task_id,
+            texture_ref,
+            &bt,
+            native_uploads_for(source),
+        )?;
         return Some((
             w,
             h,
@@ -1184,7 +1271,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
             SampledSourceRequest::Bytes(
                 std::sync::Arc::new(rgba),
                 None,
-                SampledByteFormat::from_source(TexelLayout::Rgba8, source),
+                byte_format,
                 crate::backend::vulkan::engine::SampledByteOrigin::BufferBackedTexture,
             ),
         ));
@@ -1247,7 +1334,14 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                 }
                 crate::runtime::drain::note_store_route("buftex_view");
                 bt.desc.pixel_format = format;
-                let (w, h, rgba) = load_buffer_texture_rgba(state, host, task_id, base, &bt)?;
+                let (w, h, rgba, byte_format) = load_buffer_texture_sampled(
+                    state,
+                    host,
+                    task_id,
+                    base,
+                    &bt,
+                    native_uploads_for(format),
+                )?;
                 return Some((
                     w,
                     h,
@@ -1255,7 +1349,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                     SampledSourceRequest::Bytes(
                         std::sync::Arc::new(rgba),
                         None,
-                        SampledByteFormat::from_source(TexelLayout::Rgba8, format),
+                        byte_format,
                         crate::backend::vulkan::engine::SampledByteOrigin::BufferBackedTexture,
                     ),
                 ));
@@ -1790,7 +1884,9 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                 // returns a content identity so the engine skips re-hash+upload;
                 // its census (T11Memo hit / T11Guest fill) is emitted internally.
                 let memo_source = crate::runtime::draw::mapping_declared_format(state, mid, None);
-                if let Some((rgba, identity)) = load_type11_rgba_memoized(state, host, mid) {
+                if let Some((rgba, identity, layout)) =
+                    load_type11_rgba_memoized(state, host, mid, native_uploads_for(memo_source))
+                {
                     note_type11_sample_rung("t11rung_guest_memo", guest_write);
                     return Some((
                         w,
@@ -1799,7 +1895,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                         SampledSourceRequest::Bytes(
                             rgba,
                             Some(identity),
-                            SampledByteFormat::from_source(TexelLayout::Rgba8, memo_source),
+                            SampledByteFormat::from_source(layout, memo_source),
                             crate::backend::vulkan::engine::SampledByteOrigin::SurfaceGuestFallback,
                         ),
                     ));
@@ -2529,6 +2625,50 @@ fn resolve_type11_load_seed<M: HostMemory + HostOps>(
         try_type11_target_guest_seed(state, host, mapping_id, w, h, target_format)
             .map(|seed| (Type11LoadSeed::Guest(seed), Type11SeedRung::GuestPages))
             .or_else(|| {
+                let target_layout = translate::pixel::texel_layout_of(target_format)
+                    .filter(|layout| !layout.is_four_byte_color())?;
+                if !mapper::ensure_resolved_for_scanout(state, host, mapping_id) {
+                    return None;
+                }
+                let (base_off, surface_bpr, span_end) = {
+                    let m = state.mappings.get(&mapping_id)?;
+                    let fmt = mapping_write::mapping_store_format(m);
+                    if pixel_format::store_texel_order(fmt) != Some(target_layout) {
+                        return None;
+                    }
+                    mapping_write::type11_sample_window(m, w, h, fmt)?
+                };
+                let bpp = target_layout.bytes_per_texel();
+                let tight = w.checked_mul(bpp)?;
+                let len = host_alloc_len((tight as u64).checked_mul(h as u64)?)?;
+                let mut native = vec![0u8; len];
+                if !mapping_write::read_rect_raw_at(
+                    state,
+                    host,
+                    mapping_id,
+                    mapping_write::SurfaceWindow {
+                        base_off,
+                        bpr: surface_bpr,
+                        span_end,
+                        bpp,
+                    },
+                    mapping_write::Rect {
+                        origin_x: 0,
+                        origin_y: 0,
+                        width: w,
+                        height: h,
+                    },
+                    &mut native,
+                    tight,
+                ) {
+                    return None;
+                }
+                Some((
+                    Type11LoadSeed::Host(std::sync::Arc::new(native), SeedOrder::Native(target_layout)),
+                    Type11SeedRung::GuestPages,
+                ))
+            })
+            .or_else(|| {
                 load_type11_mapping_rgba(state, host, mapping_id, None)
                     .map(|(_, _, r)| r)
                     .filter(|rgba| rgba.len() == (w as usize) * (h as usize) * 4)
@@ -2705,12 +2845,27 @@ pub(super) fn load_type5_view_rgba<M: HostMemory + HostOps>(
     // are named here rather than left to it.
     // The layout is the view's own; the transfer function travels with it,
     // because the default arm below converts to RGBA8 order and decodes nothing.
+    let native_uploads = native_uploads_for(view.pixel_format);
     let byte_format = SampledByteFormat::from_source(
         match view.pixel_format {
             pixel_format::MTL_FORMAT_RG8_UNORM => TexelLayout::Rg8,
             pixel_format::MTL_FORMAT_R16_UNORM => TexelLayout::R16Unorm,
             pixel_format::MTL_FORMAT_RG16_UNORM => TexelLayout::Rg16Unorm,
+            pixel_format::MTL_FORMAT_RGBA16_UNORM if native_uploads.unorm16 => {
+                TexelLayout::Rgba16Unorm
+            }
+            pixel_format::MTL_FORMAT_RGBA16_FLOAT if native_uploads.float16 => {
+                TexelLayout::Rgba16Float
+            }
+            pixel_format::MTL_FORMAT_RG16_FLOAT if native_uploads.float16 => {
+                TexelLayout::Rg16Float
+            }
+            pixel_format::MTL_FORMAT_R16_FLOAT if native_uploads.float16 => {
+                TexelLayout::R16Float
+            }
             pixel_format::MTL_FORMAT_RG16_UINT => TexelLayout::Rg16Uint,
+            pixel_format::MTL_FORMAT_RG32_FLOAT => TexelLayout::Rg32Float,
+            pixel_format::MTL_FORMAT_R32_FLOAT => TexelLayout::R32Float,
             pixel_format::MTL_FORMAT_RGB10A2_UNORM => TexelLayout::Rgb10a2Unorm,
             pixel_format::MTL_FORMAT_BGR10A2_UNORM => TexelLayout::Bgr10a2Unorm,
             pixel_format::MTL_FORMAT_RG11B10_FLOAT => TexelLayout::Rg11b10Float,
@@ -5131,33 +5286,31 @@ fn native_scratch_to_upload(
 /// change the answer for — so keying on it is the same rule stated once, not a
 /// fast path that could disagree with the slow one.
 fn native_uploads_for(sample_format: u16) -> NativeUploads {
-    if !pixel_format::narrows_to_unorm8(sample_format) {
+    if !pixel_format::narrows_to_unorm8(sample_format)
+        && !matches!(
+            sample_format,
+            pixel_format::MTL_FORMAT_R16_FLOAT
+                | pixel_format::MTL_FORMAT_RGBA16_UNORM
+                | pixel_format::MTL_FORMAT_RG16_UINT
+                | pixel_format::MTL_FORMAT_RG32_FLOAT
+                | pixel_format::MTL_FORMAT_R32_FLOAT
+        )
+    {
         return NativeUploads::BGRA8;
     }
     native_uploads_asking_host()
 }
 
-/// The same answer for a caller that does not yet know the guest format.
-///
-/// The last-resort sampled rung resolves the format inside the loader, so it
-/// cannot key the question the way the hot rung does — and it does not need to:
-/// `settle_linear_texture_sampled` read **0** across a four-rail sweep, because
-/// every rung above it serves. A lock on a path that does not run is not a cost.
 fn native_uploads_asking_host() -> NativeUploads {
     use crate::backend::vulkan::engine;
     NativeUploads {
-        // One flag for both half-float layouts, so the answer is the
-        // conjunction: a host that filters one and not the other keeps neither
-        // on the native rail. Nothing on record separates them — both carry
-        // `SAMPLED_IMAGE_FILTER_LINEAR` by mandate — and a per-layout flag
-        // would be two fields nobody could point at a host that needed them.
         float16: engine::supports_sampled_layout_linear_filter(TexelLayout::Rgba16Float)
-            && engine::supports_sampled_layout_linear_filter(TexelLayout::Rg16Float),
-        // The same conjunction for the two ten-bit orders. Vulkan requires the
-        // filter for `A2B10G10R10_UNORM_PACK32` and not for its sibling, so the
-        // answer is asked rather than assumed.
+            && engine::supports_sampled_layout_linear_filter(TexelLayout::Rg16Float)
+            && engine::supports_sampled_layout_linear_filter(TexelLayout::R16Float),
         ten_bit: engine::supports_sampled_layout_linear_filter(TexelLayout::Rgb10a2Unorm)
             && engine::supports_sampled_layout_linear_filter(TexelLayout::Bgr10a2Unorm),
+        unorm16: engine::supports_sampled_layout_linear_filter(TexelLayout::Rgba16Unorm),
+        integer_and_float32: true,
         ..NativeUploads::BGRA8
     }
 }
@@ -6171,7 +6324,11 @@ enum M2vDrawSpan {
     /// writeback — all want guest scanout order, and a BGRA resident hands them
     /// exactly that. Normalizing to RGBA here would restate a whole framebuffer
     /// per Store purely to have the Store restate it back.
-    Pixels { bytes: Vec<u8>, bgra: bool },
+    Pixels {
+        bytes: Vec<u8>,
+        bgra: bool,
+        native: Option<(Vec<u8>, crate::contract::pixel_format::TexelLayout)>,
+    },
     /// Intermediate record of a resident render-pass chain: content stays on
     /// the protocol-keyed engine target (no CPU pixels, no fence wait, no guest
     /// Store this record). The final record reads back and performs the
@@ -6743,8 +6900,25 @@ pub(super) fn honour_gva_load_elision<M: HostMemory + HostOps>(
                      an undefined attachment)"
                 ));
             }
+            let target_fmt = req.colors.first().map(|c0| c0.format).unwrap_or(0);
+            let native_reseed = seed_color_load_native(
+                state,
+                host,
+                req.task_id,
+                tex_ref,
+                gva,
+                cw,
+                ch,
+                target_fmt,
+            );
             if let Some(c0) = req.colors.first_mut() {
-                c0.target_seed_rgba = seed;
+                if let Some((bytes, layout)) = native_reseed {
+                    c0.target_seed_rgba = Some(bytes);
+                    c0.target_seed_layout = (layout != TexelLayout::Rgba8).then_some(layout);
+                } else {
+                    c0.target_seed_rgba = seed;
+                    c0.target_seed_layout = None;
+                }
             }
             None
         }
@@ -7535,13 +7709,13 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                                     crate::backend::vulkan::engine::SampledByteOrigin::AttachmentAlias,
                                 ),
                             ),
-                            AttachmentAliasSample::Seed(seed, stored) => (
+                            AttachmentAliasSample::Seed(seed, byte_format) => (
                                 aw,
                                 ah,
                                 SampledSourceRequest::Bytes(
                                     std::sync::Arc::new(seed.to_vec()),
                                     None,
-                                    SampledByteFormat::from_source(TexelLayout::Rgba8, stored),
+                                    byte_format,
                                     crate::backend::vulkan::engine::SampledByteOrigin::AttachmentAlias,
                                 ),
                             ),
@@ -8264,10 +8438,16 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     let mut seed_door = "none";
                     if let Some(seed) = c0.target_seed_rgba.as_ref() {
                         seed_door = "color_seed";
-                        if seed.len() == (w as usize) * (h as usize) * 4 {
-                            // seed_color_load selected this by RT provenance.
-                            // Black/transparent bytes are valid attachment data.
+                        let bpp = c0
+                            .target_seed_layout
+                            .map(|l| l.bytes_per_texel() as usize)
+                            .unwrap_or(4);
+                        if seed.len() == (w as usize) * (h as usize) * bpp {
                             target_rgba8 = Some(std::sync::Arc::new(seed.clone()));
+                            if let Some(layout) = c0.target_seed_layout {
+                                seed_order =
+                                    crate::backend::vulkan::engine::SeedOrder::Native(layout);
+                            }
                         }
                     } else if c0.mapping_id != 0 {
                         seed_door = "mapping";
@@ -8580,14 +8760,10 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 }
             }
         }
-        if gpu_only_content_allowed && store_is_store && writeback_guest {
+        if store_is_store && writeback_guest {
             if let Some(identity) = gva_chain_identity(req) {
-                // Only the eligibility call can still vary here: the enclosing
-                // `&&` already established `store_is_store && writeback_guest`.
-                // (The sibling rail above re-tests its pair for real, because
-                // its outer condition is an `||`.)
-                if gva_store_defer_eligible(req) {
-                    resources.target_identity = Some(identity.clone());
+                resources.target_identity = Some(identity.clone());
+                if gpu_only_content_allowed && gva_store_defer_eligible(req) {
                     resources.skip_readback = true;
                     gva_resident_store = Some(identity);
                 }
@@ -9383,6 +9559,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         Ok(M2vDrawSpan::Pixels {
             bytes: pixels,
             bgra: pixels_bgra,
+            native: out.native_pixels,
         })
     }
 }

@@ -768,6 +768,9 @@ pub enum DrawAnswer {
 #[derive(Debug, Default)]
 pub struct DrawOutput {
     pub pixels: Vec<u8>,
+    /// Unclamped attachment-native texels when the attachment is not 4-byte
+    /// RGBA8/BGRA8 colour (`!layout.is_four_byte_color()`).
+    pub native_pixels: Option<(Vec<u8>, crate::contract::pixel_format::TexelLayout)>,
     /// The texels of each scratch storage image with `read_back`, in request
     /// order, tight rows.
     pub storage_pixels: Vec<Vec<u8>>,
@@ -2034,6 +2037,8 @@ pub enum SeedOrder {
     Rgba8,
     /// Guest scanout order — B, G, R, A in memory.
     Bgra8,
+    /// Attachment-native texels, staged verbatim without 8-bit expansion.
+    Native(crate::contract::pixel_format::TexelLayout),
 }
 
 /// Where a sampled image's content comes from.

@@ -623,6 +623,64 @@ pub fn write_bgra8_uncached<M: HostMemory + HostOps>(
     )
 }
 
+/// Write tight native texels into a type-11 mapping whose declared format
+/// matches `resident_layout` (e.g. `RGBA16Float`, `BGR10A2Unorm`, `RGB10A2Unorm`,
+/// `RG16Float`, `R16Float`, `RG16Uint`), invalidating the 8-bit `surface_cache`
+/// and stamping `guest_write_gen`.
+pub fn write_native_uncached<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+    src: &[u8],
+    width: u32,
+    height: u32,
+    resident_layout: pixel_format::TexelLayout,
+) -> bool {
+    if !scanout_extent_ok(width, height) {
+        return false;
+    }
+    let (base_off, surface_bpr, span_end, bpp) = {
+        let Some(m) = state.mappings.get(&mapping_id) else {
+            return false;
+        };
+        if !m.mapped || m.page_entries.is_empty() {
+            return false;
+        }
+        let (mw, mh, format) = mapping_write_geometry(m, width, height);
+        if mw != width || mh != height {
+            return false;
+        }
+        if pixel_format::store_texel_order(format) != Some(resident_layout) {
+            return false;
+        }
+        let Some((base_off, bpr, span_end)) = type11_sample_window(m, mw, mh, format) else {
+            return false;
+        };
+        (base_off, bpr, span_end, resident_layout.bytes_per_texel())
+    };
+    let Some(src_stride) = width.checked_mul(bpp) else {
+        return false;
+    };
+    if !write_full_rect_raw_at(
+        state,
+        host,
+        mapping_id,
+        base_off,
+        surface_bpr,
+        span_end,
+        width,
+        height,
+        bpp,
+        src,
+        src_stride,
+    ) {
+        return false;
+    }
+    crate::runtime::surface_cache::forget(state, mapping_id);
+    crate::runtime::mapper::stamp_guest_write_gen(state, host, mapping_id);
+    true
+}
+
 /// A check that stopped a resident's frame from reaching the guest's pages
 /// without a host copy, so the flush owes the copying rail instead.
 ///
