@@ -1524,6 +1524,226 @@ pub fn solid_bgra8(w: u32, h: u32, clear: &[f64; 4]) -> Vec<u8> {
     solid_image8(w, h, [b, g, r, a])
 }
 
+/// IEEE-754 binary32 to binary16 conversion with round-to-nearest-even,
+/// preserving signed zeros, negative channels, extended-range (> 1.0) HDR
+/// values, infinities, and quiet NaNs.
+pub fn f32_to_f16(value: f32) -> u16 {
+    let x = value.to_bits();
+    let sign = ((x >> F16_F32_SIGN_SHIFT) as u16) & F16_SIGN_MASK;
+    let raw_exp = (x >> F32_EXP_SHIFT) & F32_EXP_MASK;
+    let mut m = x & F32_MANT_MASK;
+
+    if raw_exp == F32_EXP_MASK {
+        return if m != 0 {
+            sign | F16_INF_BITS | 0x0200
+        } else {
+            sign | F16_INF_BITS
+        };
+    }
+    if raw_exp == 0 {
+        return sign;
+    }
+
+    let e = raw_exp as i32 - F32_EXP_BIAS + F16_EXP_BIAS;
+    if e >= F16_EXP_INF_NAN as i32 {
+        return sign | F16_INF_BITS;
+    }
+    if e <= 0 {
+        if e < F16_SUBNORMAL_EXP_MIN {
+            return sign;
+        }
+        m |= F32_HIDDEN_BIT;
+        let shift = (F16_SUBNORMAL_SHIFT_BASE - e) as u32;
+        let half = 1u32 << (shift - 1);
+        let rem = m & ((1u32 << shift) - 1);
+        let mut hm = m >> shift;
+        if rem > half || (rem == half && (hm & 1) != 0) {
+            hm += 1;
+        }
+        return sign | (hm as u16);
+    }
+
+    let mut h = sign | (((e as u32) << F16_EXP_SHIFT) as u16) | ((m >> F16_F32_MANT_SHIFT) as u16);
+    let rem = m & ((1u32 << F16_F32_MANT_SHIFT) - 1);
+    if rem > F32_TO_F16_ROUND_BIT || (rem == F32_TO_F16_ROUND_BIT && (h & 1) != 0) {
+        h = h.wrapping_add(1);
+    }
+    h
+}
+
+fn f64_to_unorm16(v: f64) -> u16 {
+    if !v.is_finite() || v <= 0.0 {
+        0
+    } else if v >= 1.0 {
+        u16::MAX
+    } else {
+        (v * f64::from(u16::MAX) + 0.5) as u16
+    }
+}
+
+fn f64_to_unorm10(v: f64) -> u32 {
+    if !v.is_finite() || v <= 0.0 {
+        0
+    } else if v >= 1.0 {
+        1023
+    } else {
+        (v * 1023.0 + 0.5) as u32
+    }
+}
+
+fn f64_to_unorm2(v: f64) -> u32 {
+    if !v.is_finite() || v <= 0.0 {
+        0
+    } else if v >= 1.0 {
+        3
+    } else {
+        (v * 3.0 + 0.5) as u32
+    }
+}
+
+fn f64_to_u16_clamped(v: f64) -> u16 {
+    if !v.is_finite() || v <= 0.0 {
+        0
+    } else if v >= f64::from(u16::MAX) {
+        u16::MAX
+    } else {
+        v as u16
+    }
+}
+
+/// Build `w * h` tightly packed native texels for `layout` directly from the
+/// 64-bit clear channels without quantizing float/10-bit/16-bit formats through
+/// 8-bit UNORM.
+pub fn solid_native_texels(
+    w: u32,
+    h: u32,
+    layout: TexelLayout,
+    clear: &[f64; 4],
+) -> Option<Vec<u8>> {
+    let mut texel = [0u8; 8];
+    let bpp: usize = match layout {
+        TexelLayout::Rgba8 => {
+            texel[..4].copy_from_slice(&unorm8_rgba(clear));
+            4
+        }
+        TexelLayout::Bgra8 => {
+            let [r, g, b, a] = unorm8_rgba(clear);
+            texel[..4].copy_from_slice(&[b, g, r, a]);
+            4
+        }
+        TexelLayout::R8 => {
+            texel[0] = f64_to_unorm8(clear[COMPONENT_R]);
+            1
+        }
+        TexelLayout::Rg8 => {
+            texel[0] = f64_to_unorm8(clear[COMPONENT_R]);
+            texel[1] = f64_to_unorm8(clear[COMPONENT_G]);
+            2
+        }
+        TexelLayout::R16Float => {
+            st16(&mut texel[0..2], f32_to_f16(clear[COMPONENT_R] as f32));
+            2
+        }
+        TexelLayout::Rg16Float => {
+            st16(&mut texel[0..2], f32_to_f16(clear[COMPONENT_R] as f32));
+            st16(&mut texel[2..4], f32_to_f16(clear[COMPONENT_G] as f32));
+            4
+        }
+        TexelLayout::Rgba16Float => {
+            st16(&mut texel[0..2], f32_to_f16(clear[COMPONENT_R] as f32));
+            st16(&mut texel[2..4], f32_to_f16(clear[COMPONENT_G] as f32));
+            st16(&mut texel[4..6], f32_to_f16(clear[COMPONENT_B] as f32));
+            st16(&mut texel[6..8], f32_to_f16(clear[COMPONENT_A] as f32));
+            8
+        }
+        TexelLayout::R32Float => {
+            texel[0..4].copy_from_slice(&(clear[COMPONENT_R] as f32).to_le_bytes());
+            4
+        }
+        TexelLayout::Rg32Float => {
+            texel[0..4].copy_from_slice(&(clear[COMPONENT_R] as f32).to_le_bytes());
+            texel[4..8].copy_from_slice(&(clear[COMPONENT_G] as f32).to_le_bytes());
+            8
+        }
+        TexelLayout::R16Unorm => {
+            st16(&mut texel[0..2], f64_to_unorm16(clear[COMPONENT_R]));
+            2
+        }
+        TexelLayout::Rg16Unorm => {
+            st16(&mut texel[0..2], f64_to_unorm16(clear[COMPONENT_R]));
+            st16(&mut texel[2..4], f64_to_unorm16(clear[COMPONENT_G]));
+            4
+        }
+        TexelLayout::Rgba16Unorm => {
+            st16(&mut texel[0..2], f64_to_unorm16(clear[COMPONENT_R]));
+            st16(&mut texel[2..4], f64_to_unorm16(clear[COMPONENT_G]));
+            st16(&mut texel[4..6], f64_to_unorm16(clear[COMPONENT_B]));
+            st16(&mut texel[6..8], f64_to_unorm16(clear[COMPONENT_A]));
+            8
+        }
+        TexelLayout::Rg16Uint => {
+            st16(&mut texel[0..2], f64_to_u16_clamped(clear[COMPONENT_R]));
+            st16(&mut texel[2..4], f64_to_u16_clamped(clear[COMPONENT_G]));
+            4
+        }
+        TexelLayout::Rgb10a2Unorm => {
+            let word = f64_to_unorm10(clear[COMPONENT_R])
+                | (f64_to_unorm10(clear[COMPONENT_G]) << 10)
+                | (f64_to_unorm10(clear[COMPONENT_B]) << 20)
+                | (f64_to_unorm2(clear[COMPONENT_A]) << 30);
+            texel[0..4].copy_from_slice(&word.to_le_bytes());
+            4
+        }
+        TexelLayout::Bgr10a2Unorm => {
+            let word = f64_to_unorm10(clear[COMPONENT_B])
+                | (f64_to_unorm10(clear[COMPONENT_G]) << 10)
+                | (f64_to_unorm10(clear[COMPONENT_R]) << 20)
+                | (f64_to_unorm2(clear[COMPONENT_A]) << 30);
+            texel[0..4].copy_from_slice(&word.to_le_bytes());
+            4
+        }
+        TexelLayout::Rg11b10Float => return None,
+    };
+    let count = (w as usize).checked_mul(h as usize)?;
+    let total = count.checked_mul(bpp)?;
+    let mut out = Vec::with_capacity(total);
+    if total == 0 {
+        return Some(out);
+    }
+    let pat = &texel[..bpp];
+    out.extend_from_slice(pat);
+    while out.len() < total {
+        let take = out.len().min(total - out.len());
+        out.extend_from_within(..take);
+    }
+    Some(out)
+}
+
+/// Fill one row (`pixels` texels) of `format` directly from `clear`, preserving
+/// float and wide-channel precision when `store_texel_order(format)` names a
+/// native layout and falling back to RGBA8 row conversion otherwise.
+pub fn encode_solid_native_row(
+    format: u16,
+    pixels: u32,
+    clear: &[f64; 4],
+    dst: &mut [u8],
+) -> bool {
+    if pixels == 0 {
+        return true;
+    }
+    if let Some(layout) = store_texel_order(format) {
+        if let Some(bytes) = solid_native_texels(pixels, 1, layout, clear) {
+            if dst.len() < bytes.len() {
+                return false;
+            }
+            dst[..bytes.len()].copy_from_slice(&bytes);
+            return true;
+        }
+    }
+    let rgba = solid_rgba8(pixels, 1, clear);
+    convert_rgba8_to_row(format, &rgba, pixels, dst)
+}
+
 /// The clear colour as one unorm8 RGBA texel.
 fn unorm8_rgba(clear: &[f64; 4]) -> [u8; 4] {
     [
@@ -2418,6 +2638,32 @@ mod tests {
     /// window away when there is a CPU path to turn it away *to*, so a `true`
     /// here that the loader does not honour is a black sample rather than a
     /// slow one.
+    #[test]
+    fn solid_native_texels_preserves_signed_and_hdr_float16_channels() {
+        let clear = [-1.5, 0.0, 2.25, 0.5];
+        let bytes = solid_native_texels(2, 1, TexelLayout::Rgba16Float, &clear)
+            .expect("Rgba16Float native clear encodes");
+        assert_eq!(bytes.len(), 16);
+        let c0 = u16::from_le_bytes([bytes[0], bytes[1]]);
+        let c1 = u16::from_le_bytes([bytes[2], bytes[3]]);
+        let c2 = u16::from_le_bytes([bytes[4], bytes[5]]);
+        let c3 = u16::from_le_bytes([bytes[6], bytes[7]]);
+        assert_eq!(c0, 0xbe00); // -1.5 in IEEE binary16
+        assert_eq!(c1, 0x0000); // +0.0
+        assert_eq!(c2, 0x4080); // +2.25
+        assert_eq!(c3, 0x3800); // +0.5
+        assert_eq!(&bytes[0..8], &bytes[8..16]);
+
+        let mut row = [0u8; 16];
+        assert!(encode_solid_native_row(
+            MTL_FORMAT_RGBA16_FLOAT,
+            2,
+            &clear,
+            &mut row
+        ));
+        assert_eq!(row, bytes.as_slice());
+    }
+
     #[test]
     fn the_cpu_loader_arm_predicate_agrees_with_the_loader() {
         // One representative Metal format per layout, and a source buffer wide

@@ -134,101 +134,6 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
     // why its draws were skipped instead of guessing. `None` means the engine
     // draw was never attempted — this record carried no pipeline or no vertices.
     let mut engine_refusal: Option<&'static str> = None;
-    // Solid CLEAR seed Stores only when this record owns guest writeback
-    // (last of a serialized chain, or unified always-writeback).
-    crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::PrepSeed);
-    if writeback_guest && clear_seed_enabled() {
-        for (i, c) in colors.iter().enumerate() {
-            // Reports an out-of-contract value; the gate below is unchanged, and
-            // it is the site that disagrees with this module's writeback loop
-            // about what such a value means. See `super::store_action_in_contract`.
-            let _ = super::store_action_in_contract(req.pipeline_ref, c.store_action);
-            if !crate::contract::pass_action::store_action_publishes_single_sample(c.store_action) {
-                continue;
-            }
-            if c.load_action != MTL_LOAD_ACTION_CLEAR && c.load_action != MTL_LOAD_ACTION_DONT_CARE
-            {
-                // Load/composite needs real encode (metal2vulkan) — skip Store.
-                continue;
-            }
-            if c.width == 0 || c.height == 0 {
-                continue;
-            }
-            // Neither writer below takes a full-surface RGBA copy — the GVA
-            // landing repeats a single row and the type-11 landing builds its own
-            // image in the mapping's order — so the only reader of one is the
-            // clear-only exit, and it is the one place that builds it.
-            let solid = (i == 0).then_some((c.width, c.height, c.clear_color));
-            // Which branch this loop actually takes, how many bytes it lands and
-            // what the landing costs. `prep_seed_us` is 8.6 µs of a 41 µs chain
-            // on the `blur=40` dial and rebuilding the images without their two
-            // redundant passes did not move it by a hundredth, so the cost is in
-            // one of these two writes and there was no reading that said which.
-            let seed_kb = u64::from(c.width)
-                .saturating_mul(u64::from(c.height))
-                .saturating_mul(u64::from(RGBA8_BPP))
-                / 1024;
-            let ok = if c.target_gva != 0 {
-                let _span = StoreCostSpan::new("clear_seed_gva_us");
-                crate::runtime::drain::note_store_route("clear_seed_gva");
-                crate::runtime::drain::note_store_route_n("clear_seed_gva_kb", seed_kb);
-                // A solid landing, so the writer converts one row rather than
-                // this surface's thousand identical ones. The full RGBA image
-                // above is built for `color0_rgba` and is not this write's
-                // source.
-                write_gva_solid8(
-                    state,
-                    host,
-                    req.task_id,
-                    c.target_gva,
-                    c.width,
-                    c.height,
-                    c.row_stride,
-                    c.format,
-                    &c.clear_color,
-                )
-                .is_ok()
-            } else if c.mapping_id != 0 {
-                // Type-11 CLEAR. `write_bgra8` takes guest scanout order and
-                // converts to the mapping's native format per row; it handles a
-                // fragmented mapping too, staging native rows and landing them
-                // through `mapper::write_mapping_bytes`. (A comment here used to
-                // call it contig-only, which it has not been.)
-                //
-                // Built from the swapped *pixel* rather than by exchanging the
-                // channels of the RGBA image: a solid image is one repeated
-                // word, so the exchange belongs to the word and doing it per
-                // texel cost an allocation and two passes over the whole
-                // surface. See `contract::pixel_format::solid_bgra8`.
-                let _span = StoreCostSpan::new("clear_seed_t11_us");
-                crate::runtime::drain::note_store_route("clear_seed_t11");
-                crate::runtime::drain::note_store_route_n("clear_seed_t11_kb", seed_kb);
-                let bgra = solid_bgra8(c.width, c.height, &c.clear_color);
-                let stride = c.width.saturating_mul(RGBA8_BPP);
-                mapping_write::write_bgra8(
-                    state,
-                    host,
-                    c.mapping_id,
-                    &bgra,
-                    stride,
-                    c.width,
-                    c.height,
-                )
-            } else {
-                false
-            };
-            if ok {
-                any_store = true;
-                if i == 0 {
-                    color0_solid = solid;
-                }
-                crate::observe::line(format!(
-                    "linux_clear_store mid={} gva={:#x} {}x{} pipe={} load={}",
-                    c.mapping_id, c.target_gva, c.width, c.height, req.pipeline_ref, c.load_action
-                ));
-            }
-        }
-    }
 
     // Pages the eager GVA fallback below is allowed to reach, resolved
     // **before** any GPU work.
@@ -808,6 +713,112 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                 // before the Store arms. Returning the frame here handed a whole
                 // framebuffer to a binding that is dropped unread.
                 return (EncodeStatus::Ok, None);
+            }
+        }
+    }
+
+    // Solid CLEAR fallback Store: runs ONLY when no engine draw returned or
+    // stored above (a clear-only record with no pipeline/vertices, or a refused
+    // engine draw). Running this before `try_metal2vulkan_draw` wiped live
+    // `MTLLoadActionDontCare` guest pages (such as the Menu Bar surface) and
+    // superseded residents before the real GPU draw or `PipelinePending` ran.
+    crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::PrepSeed);
+    if writeback_guest && clear_seed_enabled() {
+        for (i, c) in colors.iter().enumerate() {
+            let _ = super::store_action_in_contract(req.pipeline_ref, c.store_action);
+            if !crate::contract::pass_action::store_action_publishes_single_sample(c.store_action) {
+                continue;
+            }
+            if c.load_action != MTL_LOAD_ACTION_CLEAR && c.load_action != MTL_LOAD_ACTION_DONT_CARE
+            {
+                continue;
+            }
+            if engine_refusal.is_some() && c.load_action == MTL_LOAD_ACTION_DONT_CARE {
+                // A refused draw on a DontCare target must not wipe guest pages
+                // that already hold prior frame contents.
+                continue;
+            }
+            if c.width == 0 || c.height == 0 {
+                continue;
+            }
+            let solid = (i == 0).then_some((c.width, c.height, c.clear_color));
+            let seed_kb = u64::from(c.width)
+                .saturating_mul(u64::from(c.height))
+                .saturating_mul(u64::from(RGBA8_BPP))
+                / 1024;
+            let ok = if c.target_gva != 0 {
+                let _span = StoreCostSpan::new("clear_seed_gva_us");
+                crate::runtime::drain::note_store_route("clear_seed_gva");
+                crate::runtime::drain::note_store_route_n("clear_seed_gva_kb", seed_kb);
+                super::write_gva_solid_native_within(
+                    state,
+                    host,
+                    req.task_id,
+                    c.target_gva,
+                    c.width,
+                    c.height,
+                    c.row_stride,
+                    c.format,
+                    &c.clear_color,
+                    if i == 0 {
+                        sync_store_pages.as_ref().map(|p| p.membership())
+                    } else {
+                        None
+                    },
+                )
+                .is_ok()
+            } else if c.mapping_id != 0 {
+                let _span = StoreCostSpan::new("clear_seed_t11_us");
+                crate::runtime::drain::note_store_route("clear_seed_t11");
+                crate::runtime::drain::note_store_route_n("clear_seed_t11_kb", seed_kb);
+                let native_ok = state
+                    .mappings
+                    .get(&c.mapping_id)
+                    .map(mapping_write::mapping_store_format)
+                    .and_then(pixel_format::store_texel_order)
+                    .filter(|layout| !layout.is_four_byte_color())
+                    .and_then(|layout| {
+                        pixel_format::solid_native_texels(c.width, c.height, layout, &c.clear_color)
+                            .map(|texels| {
+                                mapping_write::write_native_uncached(
+                                    state,
+                                    host,
+                                    c.mapping_id,
+                                    &texels,
+                                    c.width,
+                                    c.height,
+                                    layout,
+                                )
+                            })
+                    })
+                    .unwrap_or(false);
+                if native_ok {
+                    true
+                } else {
+                    let bgra = solid_bgra8(c.width, c.height, &c.clear_color);
+                    let stride = c.width.saturating_mul(RGBA8_BPP);
+                    mapping_write::write_bgra8(
+                        state,
+                        host,
+                        c.mapping_id,
+                        &bgra,
+                        stride,
+                        c.width,
+                        c.height,
+                    )
+                }
+            } else {
+                false
+            };
+            if ok {
+                any_store = true;
+                if i == 0 {
+                    color0_solid = solid;
+                }
+                crate::observe::line(format!(
+                    "linux_clear_store mid={} gva={:#x} {}x{} pipe={} load={}",
+                    c.mapping_id, c.target_gva, c.width, c.height, req.pipeline_ref, c.load_action
+                ));
             }
         }
     }
@@ -9850,6 +9861,73 @@ pub(crate) fn heap_target_identity(
 
 /// Acquire or refresh a serialized `TaskResource`'s lease over its heap
 /// resident so deleting or replacing the heap texture retires the image.
+/// Execute a clear-only render pass targeting a GVA-backed attachment.
+///
+/// When the target is eligible for host-authoritative GPU residency, clears the
+/// Vulkan resident directly via [`crate::backend::vulkan::engine::clear_resident_target`]
+/// and arms [`crate::runtime::writeback_debt::arm_gva`] so subsequent `LOAD` or
+/// sampled binds see the cleared resident instead of stale pre-clear GPU texels.
+/// Otherwise (buffer-backed texture, portability host, or headless test), drops
+/// any unpaid GVA debt, invalidates host copies, and writes native-precision
+/// clear texels directly to guest pages.
+pub fn apply_gva_clear<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    mut req: DrawEncodeRequest,
+    clear_color: &[f64; 4],
+) -> bool {
+    req.gva_alloc_gen = gva_alloc_generation(state, host, &req);
+    let Some(c0) = req.colors.first().cloned() else {
+        return false;
+    };
+    if crate::backend::vulkan::engine::deferred_gpu_only_content_allowed()
+        && gva_store_defer_eligible(&req)
+    {
+        if let Some(identity) = gva_chain_identity(&req) {
+            if crate::backend::vulkan::engine::clear_resident_target(
+                identity.clone(),
+                *clear_color,
+                c0.format,
+            )
+            .is_ok()
+            {
+                if let Some(resource) = state
+                    .task_resources
+                    .get(task_id, c0.texture_ref)
+                    .filter(|r| resource_type_owns_gva_resident(r.entry.object_type))
+                {
+                    let _ = resource.resident_target_backing(&identity);
+                }
+                if crate::runtime::writeback_debt::arm_gva(state, host, task_id, &c0, &identity) {
+                    note_type11_store_route("gva_resident_authoritative");
+                    return true;
+                }
+                crate::backend::vulkan::engine::note_resident_content_copied_out(&identity);
+            }
+        }
+    }
+    crate::runtime::writeback_debt::supersede_gva_plane(
+        state,
+        task_id,
+        c0.texture_ref,
+        c0.target_gva,
+    );
+    super::write_gva_solid_native_within(
+        state,
+        host,
+        task_id,
+        c0.target_gva,
+        c0.width,
+        c0.height,
+        c0.row_stride,
+        c0.format,
+        clear_color,
+        None,
+    )
+    .is_ok()
+}
+
 pub(crate) fn retain_heap_target(
     state: &DeviceState,
     task_id: u32,
@@ -13173,6 +13251,47 @@ mod vulkan_split_tests {
 
         req.colors[0].buffer_backed = true;
         assert!(!super::gva_store_defer_eligible(&req));
+    }
+
+    #[test]
+    fn sync_gva_clear_supersedes_unpaid_debt_and_writes_native_float16() {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        map_one_gva_page(&mut host, 4);
+        state.define_task(1, 0x1_0000, 2);
+
+        let mut req = one_page_gva_request();
+        req.colors[0].format = crate::contract::pixel_format::MTL_FORMAT_RGBA16_FLOAT;
+        req.colors[0].width = 4;
+        req.colors[0].height = 4;
+        req.colors[0].row_stride = 32;
+        req.colors[0].buffer_backed = true; // Force synchronous guest-page arm without a GPU.
+        req.gva_alloc_gen = super::gva_alloc_generation(&mut state, &mut host, &req);
+        let id = super::gva_chain_identity(&req).expect("GVA identity");
+
+        // Simulate a prior unpaid resident debt on the same plane.
+        let mut prior_c0 = req.colors[0].clone();
+        prior_c0.buffer_backed = false;
+        assert!(crate::runtime::writeback_debt::arm_gva(
+            &mut state, &mut host, 1, &prior_c0, &id
+        ));
+        assert!(crate::runtime::writeback_debt::gva_resident_authoritative(
+            &state, &id
+        ));
+
+        let clear = [-1.5, 0.0, 2.25, 1.0];
+        assert!(super::apply_gva_clear(&mut state, &mut host, 1, req, &clear));
+        assert!(
+            !crate::runtime::writeback_debt::gva_resident_authoritative(&state, &id),
+            "synchronous GVA clear must supersede stale unpaid resident debt"
+        );
+
+        let mut texel0 = [0u8; 8];
+        host.read_gpa(4 * 0x1000, &mut texel0).unwrap();
+        assert_eq!(u16::from_le_bytes([texel0[0], texel0[1]]), 0xbe00); // -1.5
+        assert_eq!(u16::from_le_bytes([texel0[2], texel0[3]]), 0x0000); //  0.0
+        assert_eq!(u16::from_le_bytes([texel0[4], texel0[5]]), 0x4080); // +2.25
+        assert_eq!(u16::from_le_bytes([texel0[6], texel0[7]]), 0x3c00); // +1.0
     }
 
     #[test]

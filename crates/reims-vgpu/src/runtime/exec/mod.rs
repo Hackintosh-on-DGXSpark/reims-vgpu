@@ -12,7 +12,7 @@ use crate::contract::pass_action::{
     MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE,
 };
 use crate::contract::pixel_format::{
-    f64_to_unorm8, solid_rgba8, MTL_FORMAT_BGRA8_UNORM, RGBA8_BPP,
+    MTL_FORMAT_BGRA8_UNORM, RGBA8_BPP,
 };
 use crate::model::DeviceState;
 use crate::runtime::blit_exec::{self, BlitStatus};
@@ -4453,23 +4453,35 @@ fn apply_clear<M: HostMemory + HostOps>(
         );
         return false;
     };
-    let c0 = req.colors.first().unwrap_or_else(|| unreachable!());
+    let c0 = req.colors.first().unwrap_or_else(|| unreachable!()).clone();
     let w = c0.width;
     let h = c0.height;
-    let rgba = solid_rgba8(w, h, &att.clear_color);
     if c0.target_gva != 0 {
-        return draw::write_gva_rgba8(
-            state,
-            host,
-            task_id,
-            c0.target_gva,
-            w,
-            h,
-            c0.row_stride,
-            c0.format,
-            &rgba,
-        )
-        .is_ok();
+        #[cfg(feature = "backend-vulkan")]
+        {
+            return draw::apply_gva_clear(state, host, task_id, req, &att.clear_color);
+        }
+        #[cfg(not(feature = "backend-vulkan"))]
+        {
+            crate::runtime::writeback_debt::supersede_gva_plane(
+                state,
+                task_id,
+                c0.texture_ref,
+                c0.target_gva,
+            );
+            return draw::write_gva_solid8(
+                state,
+                host,
+                task_id,
+                c0.target_gva,
+                w,
+                h,
+                c0.row_stride,
+                c0.format,
+                &att.clear_color,
+            )
+            .is_ok();
+        }
     }
     #[cfg(feature = "backend-vulkan")]
     if c0.mapping_id == 0 && !c0.memoryless {
@@ -4491,22 +4503,36 @@ fn apply_clear<M: HostMemory + HostOps>(
     if c0.mapping_id == 0 {
         return false;
     }
-    let r = f64_to_unorm8(att.clear_color[0]);
-    let g = f64_to_unorm8(att.clear_color[1]);
-    let b = f64_to_unorm8(att.clear_color[2]);
-    let a = f64_to_unorm8(att.clear_color[3]);
-    let px = [b, g, r, a];
-    let stride = w.saturating_mul(RGBA8_BPP);
-    let mut img = vec![0u8; (stride as usize).saturating_mul(h as usize)];
-    for y in 0..h as usize {
-        for x in 0..w as usize {
-            let o = y * stride as usize + x * 4;
-            img[o..o + 4].copy_from_slice(&px);
-        }
-    }
-    let _ = MTL_FORMAT_BGRA8_UNORM;
-    let ok = mapping_write::write_bgra8(state, host, c0.mapping_id, &img, stride, w, h);
-    // host_cache also updated inside write_bgra8 (surface_cache::store).
+    let native_ok = state
+        .mappings
+        .get(&c0.mapping_id)
+        .map(mapping_write::mapping_store_format)
+        .and_then(crate::contract::pixel_format::store_texel_order)
+        .filter(|layout| !layout.is_four_byte_color())
+        .and_then(|layout| {
+            crate::contract::pixel_format::solid_native_texels(w, h, layout, &att.clear_color).map(
+                |texels| {
+                    mapping_write::write_native_uncached(
+                        state,
+                        host,
+                        c0.mapping_id,
+                        &texels,
+                        w,
+                        h,
+                        layout,
+                    )
+                },
+            )
+        })
+        .unwrap_or(false);
+    let ok = if native_ok {
+        true
+    } else {
+        let img = crate::contract::pixel_format::solid_bgra8(w, h, &att.clear_color);
+        let stride = w.saturating_mul(RGBA8_BPP);
+        let _ = MTL_FORMAT_BGRA8_UNORM;
+        mapping_write::write_bgra8(state, host, c0.mapping_id, &img, stride, w, h)
+    };
     state.note_surface_clear(c0.mapping_id);
     ok
 }

@@ -5240,20 +5240,74 @@ pub(crate) fn write_gva_solid8<M: HostMemory + HostOps>(
     format: u16,
     clear: &[f64; 4],
 ) -> Result<(), crate::runtime::host::MemError> {
-    let row = pixel_format::solid_rgba8(width, 1, clear);
-    write_gva_rows_within(
-        state,
-        host,
-        task_id,
-        gva,
-        width,
-        height,
-        bpr,
-        format,
-        &row,
-        SourceRows::Repeated,
-        None,
-    )
+    write_gva_solid_native_within(state, host, task_id, gva, width, height, bpr, format, clear, None)
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors the target GVA and native row geometry every GVA writer takes"
+)]
+pub(crate) fn write_gva_solid_native_within<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    gva: u64,
+    width: u32,
+    height: u32,
+    bpr: u32,
+    format: u16,
+    clear: &[f64; 4],
+    allowed: crate::runtime::gva_view::WindowPages<'_>,
+) -> Result<(), crate::runtime::host::MemError> {
+    use crate::runtime::host::MemError;
+    if gva == 0 || width == 0 || height == 0 || bpr == 0 {
+        return Err(MemError::BadArgs);
+    }
+    let Some(tight) = pixel_format::tight_row_bytes(width, format) else {
+        return Err(MemError::BadArgs);
+    };
+    if bpr < tight {
+        return Err(MemError::BadArgs);
+    }
+    let tight_usize = tight as usize;
+    let mut row = vec![0u8; tight_usize];
+    if !pixel_format::encode_solid_native_row(format, width, clear, &mut row) {
+        return Err(MemError::BadArgs);
+    }
+    let span = (height as u64).saturating_mul(bpr as u64);
+    if let Some(span_map) =
+        crate::runtime::gva_view::map_fresh_span_within(state, host, task_id, gva, span, allowed)
+    {
+        let (base, avail) = (span_map.ptr, span_map.avail);
+        let mut res = Ok(());
+        for y in 0..height as usize {
+            let off = y.saturating_mul(bpr as usize);
+            if off + tight_usize > avail {
+                res = Err(MemError::RunOutOfRange);
+                break;
+            }
+            unsafe {
+                std::ptr::copy_nonoverlapping(row.as_ptr(), base.add(off), tight_usize);
+            }
+        }
+        crate::runtime::gva_view::unmap_fresh_span(host, span_map);
+        return res;
+    }
+    for y in 0..height as usize {
+        let row_gva = gva.saturating_add((y as u64).saturating_mul(bpr as u64));
+        if let Err(err) =
+            crate::runtime::gva_view::write_span_within(state, host, task_id, row_gva, &row, allowed)
+        {
+            let reason = crate::observe::Decline::slug(&err);
+            crate::observe::fail(format!(
+                "gva_write fail reason={reason} task={task_id} gva={row_gva:#x} span={span:#x} 
+                 row={y} rowlen={:#x} (solid native multi)",
+                row.len()
+            ));
+            return Err(err);
+        }
+    }
+    Ok(())
 }
 
 /// Whether the source buffer holds one row per destination row, or a single row
@@ -5273,7 +5327,7 @@ pub(crate) enum SourceRows {
     ///
     /// Constructed only by [`write_gva_solid8`], which the Metal rail does not
     /// reach — the two arms seed a CLEAR through different encoders.
-    #[cfg_attr(not(feature = "backend-vulkan"), allow(dead_code))]
+    #[allow(dead_code)]
     Repeated,
 }
 

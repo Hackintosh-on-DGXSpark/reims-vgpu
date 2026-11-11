@@ -1375,10 +1375,42 @@ pub fn supersede_for_mapping(
     mapping_id: u32,
     site: crate::runtime::render_writeback::SettleSite,
 ) {
-    if state.pending_writebacks.take(mapping_id).is_some() {
+    if let Some(debt) = state.pending_writebacks.take(mapping_id) {
         crate::runtime::drain::note_store_route("wbdebt_superseded_by_skipping_write");
+        #[cfg(feature = "backend-vulkan")]
+        crate::backend::vulkan::engine::note_resident_content_copied_out(&debt.identity);
+        #[cfg(not(feature = "backend-vulkan"))]
+        let _ = debt;
     }
     crate::runtime::render_writeback::settle_guest_writes(site);
+}
+
+/// Drop an unpaid GVA plane debt and invalidate host-side copies before a
+/// synchronous CPU write replaces the plane directly in guest memory.
+pub fn supersede_gva_plane(
+    state: &mut DeviceState,
+    task_id: u32,
+    texture_ref: u32,
+    gva: u64,
+) {
+    if texture_ref != 0 {
+        let key = GvaResourceKey {
+            task_id,
+            texture_ref,
+        };
+        if let Some(debt) = state.pending_writebacks.take_gva_plane(key.plane(gva)) {
+            crate::runtime::drain::note_store_route("gvadebt_superseded");
+            #[cfg(feature = "backend-vulkan")]
+            release_gva(debt);
+            #[cfg(not(feature = "backend-vulkan"))]
+            let _ = debt;
+        }
+        state.invalidate_object_host_copies(task_id, texture_ref);
+        crate::runtime::surface_cache::evict_texture(state, task_id, texture_ref);
+    }
+    if gva != 0 {
+        crate::runtime::surface_cache::evict_gva(state, gva);
+    }
 }
 
 /// [`settle_for_mapping`] for a caller that cannot name the mapping it is about
