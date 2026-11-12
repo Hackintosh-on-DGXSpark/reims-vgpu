@@ -31,6 +31,29 @@ fn render_pass_chain_edges_follow_the_decoded_encoder() {
     assert_eq!(render_pass_chain_position(2, 3), (true, false));
 }
 
+#[test]
+fn a_later_record_loads_depth_and_stencil_as_well_as_colour() {
+    let mut req = draw::DrawEncodeRequest {
+        colors: vec![draw::ColorRtRequest {
+            load_action: MTL_LOAD_ACTION_CLEAR,
+            ..Default::default()
+        }],
+        depth_attach: Some(DepthAttachment {
+            load_action: MTL_LOAD_ACTION_CLEAR,
+            ..Default::default()
+        }),
+        stencil_attach: Some(StencilAttachment {
+            load_action: MTL_LOAD_ACTION_CLEAR,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    load_prior_record(&mut req);
+    assert_eq!(req.colors[0].load_action, MTL_LOAD_ACTION_LOAD);
+    assert_eq!(req.depth_attach.map(|d| d.load_action), Some(MTL_LOAD_ACTION_LOAD));
+    assert_eq!(req.stencil_attach.map(|s| s.load_action), Some(MTL_LOAD_ACTION_LOAD));
+}
+
 /// The abandon line must say how much guest work it dropped.
 ///
 /// This break was silent, and the counter that would have caught it

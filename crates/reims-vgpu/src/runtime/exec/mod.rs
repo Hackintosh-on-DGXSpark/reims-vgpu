@@ -3636,14 +3636,12 @@ fn finish_stream_draws<M: HostMemory + HostOps>(
                     .map(|c| c.mapping_id != 0)
                     .unwrap_or(false);
                 // Records 2+ of a chain composite over the prior record: force
-                // loadAction=Load on every color. Leaving the pass action alone
+                // loadAction=Load on every attachment. Leaving the pass action alone
                 // on a type-11 target let a CLEAR re-run before each record,
                 // wiping the full composite drawn by record 1 (live poison=1:
                 // mid peak 10.9M native → 2.5M after later records).
                 if di > 0 {
-                    for c in &mut req.colors {
-                        c.load_action = MTL_LOAD_ACTION_LOAD;
-                    }
+                    load_prior_record(&mut req);
                     // Chain from the engine resident when available; otherwise
                     // seed from the prior encode output (archive "thread each
                     // record's output as next initial content"). MoltenVK's
@@ -4029,6 +4027,28 @@ impl crate::observe::Decline for ChainAbandonDecline {
 fn render_pass_chain_position(index: usize, len: usize) -> (bool, bool) {
     debug_assert!(index < len);
     (index > 0, index + 1 < len)
+}
+
+/// Make a record after the first in one Metal render encoder continue from the
+/// attachments the records before it left.
+///
+/// Each record is its own Vulkan render pass, so the pass's load action, which
+/// Metal applies once when the encoder begins, has to become `Load` for every
+/// attachment of every later record — depth and stencil as much as colour. A
+/// depth buffer cleared again lets a later draw pass a test the first draw was
+/// meant to make it fail: RenderBox on 26 and 27 draws a shape, then fills
+/// outside it with a full-target quad behind a `GreaterEqual` depth test, and a
+/// re-cleared buffer let that quad erase the shape.
+fn load_prior_record(req: &mut draw::DrawEncodeRequest) {
+    for c in &mut req.colors {
+        c.load_action = MTL_LOAD_ACTION_LOAD;
+    }
+    if let Some(depth) = req.depth_attach.as_mut() {
+        depth.load_action = MTL_LOAD_ACTION_LOAD;
+    }
+    if let Some(stencil) = req.stencil_attach.as_mut() {
+        stencil.load_action = MTL_LOAD_ACTION_LOAD;
+    }
 }
 
 fn render_pass_attachment_template(first: &draw::DrawEncodeRequest) -> draw::DrawEncodeRequest {
