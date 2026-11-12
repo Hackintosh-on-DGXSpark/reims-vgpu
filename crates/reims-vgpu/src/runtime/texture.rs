@@ -23,6 +23,19 @@ pub fn register_type11_geom(
         if m.has_geom && m.width == width && m.height == height && m.format == format {
             return true;
         }
+        // A multi-plane IOSurface ('b3a8' two-plane XR10 or biplanar YCbCr)
+        // creates per-plane single-format type-11 views (e.g. BGR10_XR on plane 0
+        // and R8Unorm on plane 1) alongside the whole-surface view. Keep the
+        // whole-surface geometry/format on the mapping entry so per-plane views
+        // do not clobber each other or hide Plane 1 from whole-surface readers.
+        let mapping_multiplane = crate::runtime::objects::mapping_is_multiplanar(m)
+            || crate::contract::pixel_format::is_two_plane_xr10(m.format)
+            || crate::runtime::ycbcr::Sampling::of(m.format).is_some();
+        let view_multiplane = crate::contract::pixel_format::is_two_plane_xr10(format)
+            || crate::runtime::ycbcr::Sampling::of(format).is_some();
+        if m.has_geom && mapping_multiplane && !view_multiplane {
+            return true;
+        }
     }
     state.set_mapping_geom(mapping_id, width, height, format)
 }

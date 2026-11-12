@@ -45,22 +45,29 @@ use ash::vk;
 /// refuses that pair by name and the copying rail converts, exactly as it did.
 /// No capability is asked here: a host that cannot render the format refuses
 /// the pass before any image is created (`host_color_attachment`).
-fn surface_format(state: &DeviceState, mapping_id: u32) -> vk::Format {
+fn surface_format_with_override(
+    state: &DeviceState,
+    mapping_id: u32,
+    format_override: Option<u16>,
+) -> vk::Format {
     use crate::backend::vulkan::translate::pixel;
-    state
-        .mappings
-        .get(&mapping_id)
-        .map(crate::runtime::mapping_write::mapping_store_format)
-        .and_then(|format| pixel::color_attachment(format).ok())
+    let mtl = format_override.filter(|&f| f != 0).or_else(|| {
+        state
+            .mappings
+            .get(&mapping_id)
+            .map(crate::runtime::mapping_write::mapping_store_format)
+    });
+    mtl.and_then(|format| pixel::color_attachment(format).ok())
         .map(|(attachment, _)| pixel::ResidentFormat::of(attachment).allocation())
         .unwrap_or(pixel::SCANOUT_FORMAT)
 }
 
-pub fn surface_identity(
+pub fn surface_identity_for_format(
     state: &DeviceState,
     mapping_id: u32,
     width: u32,
     height: u32,
+    format_override: Option<u16>,
 ) -> TargetIdentity {
     let gen = state
         .mappings
@@ -72,8 +79,17 @@ pub fn surface_identity(
         width,
         height,
         generation: gen,
-        format: surface_format(state, mapping_id),
+        format: surface_format_with_override(state, mapping_id, format_override),
     }
+}
+
+pub fn surface_identity(
+    state: &DeviceState,
+    mapping_id: u32,
+    width: u32,
+    height: u32,
+) -> TargetIdentity {
+    surface_identity_for_format(state, mapping_id, width, height, None)
 }
 
 #[cfg(test)]

@@ -899,6 +899,26 @@ fn resolve_render_target<M: HostMemory + HostOps>(
         }
         .ok_or(C::Type11Unresolved.at(resolved_ref))?;
         let _ = mapper::ensure_resolved_for_scanout(state, host, mapping_id);
+        let (decl_w, decl_h, decl_fmt) = if live_type == Some(OBJECT_TYPE_IOSURFACE) {
+            objects::resolve_resource(state, host, task_id, resolved_ref)
+                .ok()
+                .and_then(|res| match res.decoded().as_ref().ok() {
+                    Some(crate::runtime::decode::resource::Descriptor::IOSurfaceTexture {
+                        width,
+                        height,
+                        pixel_format,
+                        ..
+                    }) => Some((*width, *height, *pixel_format)),
+                    _ => crate::contract::iosurface_pages::decode_texture_descriptor(
+                        &res.descriptor,
+                    )
+                    .ok()
+                    .map(|t| (t.width, t.height, t.pixel_format)),
+                })
+                .unwrap_or((0, 0, 0))
+        } else {
+            (0, 0, 0)
+        };
         // This rung is terminal either way, and both directions were already
         // true before it said so. A live type-11 that fails geometry must not
         // be decoded as type-2/3 — that is the sticky-latch bug above. And in
@@ -910,20 +930,35 @@ fn resolve_render_target<M: HostMemory + HostOps>(
             .mappings
             .get(&mapping_id)
             .ok_or(C::Type11NoMapping { mapping_id }.at(resolved_ref))?;
-        if !m.has_geom || m.width == 0 || m.height == 0 {
+        let rt_w = if decl_w != 0 && decl_h != 0 {
+            decl_w
+        } else {
+            m.width
+        };
+        let rt_h = if decl_w != 0 && decl_h != 0 {
+            decl_h
+        } else {
+            m.height
+        };
+        if (!m.has_geom && (rt_w == 0 || rt_h == 0)) || rt_w == 0 || rt_h == 0 {
             return Err(C::Type11Geometry {
                 mapping_id,
                 has_geom: m.has_geom,
-                width: m.width,
-                height: m.height,
+                width: rt_w,
+                height: rt_h,
             }
             .at(resolved_ref));
         }
         // Not `rt_type4_base_format`: a type-11 mapping's format has
         // writers other than the type-4 decoder, so 0 here can mean "not
         // latched yet" rather than "refused", and BGRA8 is the display
-        // contract's default for that case. See that function.
-        let base_fmt = if m.format != 0 {
+        // contract's default for that case. When the live type-11 texture
+        // descriptor names a per-plane format (e.g. BGR10_XR on plane 0 or
+        // R8Unorm on plane 1 of a 'b3a8' surface), honour its declared format
+        // rather than the whole-surface mapping format.
+        let base_fmt = if decl_fmt != 0 {
+            decl_fmt
+        } else if m.format != 0 {
             m.format
         } else {
             MTL_FORMAT_BGRA8_UNORM
@@ -935,8 +970,8 @@ fn resolve_render_target<M: HostMemory + HostOps>(
         return Ok(ResolvedRenderTarget {
             mapping_id,
             target_gva: 0,
-            width: m.width,
-            height: m.height,
+            width: rt_w,
+            height: rt_h,
             row_stride: 0,
             format: fmt,
             sample_count: 1,

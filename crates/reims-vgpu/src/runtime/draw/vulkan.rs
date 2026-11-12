@@ -268,8 +268,17 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                     .first()
                     .map(|c0| (c0.mapping_id, c0.width, c0.height, c0.format));
                 let stored = c0_store
-                    .map(|(mid, cw, ch, _)| {
-                        store_surface_resident(state, host, &identity, mid, cw, ch, guest_store)
+                    .map(|(mid, cw, ch, fmt)| {
+                        store_surface_resident_with_format(
+                            state,
+                            host,
+                            &identity,
+                            mid,
+                            cw,
+                            ch,
+                            guest_store,
+                            Some(fmt),
+                        )
                     })
                     .unwrap_or(false);
                 match (stored, c0_store) {
@@ -301,8 +310,16 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                         if let Some(expected_layout) = req
                             .colors
                             .first()
-                            .and_then(|c0| state.mappings.get(&c0.mapping_id))
-                            .map(mapping_write::mapping_store_format)
+                            .and_then(|c0| {
+                                if c0.format != 0 {
+                                    Some(c0.format)
+                                } else {
+                                    state
+                                        .mappings
+                                        .get(&c0.mapping_id)
+                                        .map(mapping_write::mapping_store_format)
+                                }
+                            })
                             .and_then(mapping_write::mapping_native_resident_layout)
                         {
                             if let Ok(rb) =
@@ -454,7 +471,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                     // resolve rendered into a pooled RGBA target.
                     let mut bgra = rgba;
                     let native_ok = draw_native.as_ref().is_some_and(|(native_bytes, layout)| {
-                        mapping_write::write_native_uncached(
+                        mapping_write::write_native_uncached_format(
                             state,
                             host,
                             c0.mapping_id,
@@ -462,6 +479,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                             c0.width,
                             c0.height,
                             *layout,
+                            Some(c0.format),
                         )
                     });
                     let ok = if native_ok {
@@ -859,26 +877,30 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                 let _span = StoreCostSpan::new("clear_seed_t11_us");
                 crate::runtime::drain::note_store_route("clear_seed_t11");
                 crate::runtime::drain::note_store_route_n("clear_seed_t11_kb", seed_kb);
-                let native_ok = state
-                    .mappings
-                    .get(&c.mapping_id)
-                    .map(mapping_write::mapping_store_format)
-                    .and_then(mapping_write::mapping_native_resident_layout)
-                    .and_then(|layout| {
-                        pixel_format::solid_native_texels(c.width, c.height, layout, &c.clear_color)
-                            .map(|texels| {
-                                mapping_write::write_native_uncached(
-                                    state,
-                                    host,
-                                    c.mapping_id,
-                                    &texels,
-                                    c.width,
-                                    c.height,
-                                    layout,
-                                )
-                            })
-                    })
-                    .unwrap_or(false);
+                let native_ok = (if c.format != 0 {
+                    Some(c.format)
+                } else {
+                    state
+                        .mappings
+                        .get(&c.mapping_id)
+                        .map(mapping_write::mapping_store_format)
+                })
+                .and_then(|fmt| {
+                    let layout = mapping_write::mapping_native_resident_layout(fmt)?;
+                    let texels =
+                        pixel_format::solid_native_texels(c.width, c.height, layout, &c.clear_color)?;
+                    Some(mapping_write::write_native_uncached_format(
+                        state,
+                        host,
+                        c.mapping_id,
+                        &texels,
+                        c.width,
+                        c.height,
+                        layout,
+                        Some(fmt),
+                    ))
+                })
+                .unwrap_or(false);
                 if native_ok {
                     true
                 } else {
@@ -1567,6 +1589,49 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                 objects::resolve_type11_resource(state, task_id, texture_ref, resource)
             })
         });
+        // A type-11 texture created on one plane of a multi-plane surface
+        // ('b3a8' plane 0 as BGR10_XR, plane 1 as R8Unorm, or a YCbCr plane)
+        // declares that plane's format and geometry, not the surface's. The
+        // rungs below read the mapping's whole-surface geometry, so hand the
+        // declaration to the serialized-view rail, which places a plane by
+        // index — the same thing a type-5 view of the plane would carry.
+        if let (Some(mid), Some(resource)) = (surface, resolved_resource.as_ref()) {
+            if let Ok(crate::runtime::decode::resource::Descriptor::IOSurfaceTexture {
+                pixel_format: view_fmt,
+                width: view_w,
+                height: view_h,
+                ..
+            }) = resource.decoded()
+            {
+                let (view_fmt, view_w, view_h) = (*view_fmt, *view_w, *view_h);
+                type5_view = state
+                    .mappings
+                    .get(&mid)
+                    .filter(|m| {
+                        view_fmt != 0
+                            && view_w != 0
+                            && view_h != 0
+                            && objects::mapping_is_multiplanar(m)
+                            && !pixel_format::is_two_plane_xr10(view_fmt)
+                            && crate::runtime::ycbcr::Sampling::of(view_fmt).is_none()
+                    })
+                    .and_then(|m| {
+                        crate::contract::iosurface_pages::find_plane_index_in_device_desc(
+                            &m.device_desc,
+                            view_fmt,
+                            view_w,
+                            view_h,
+                        )
+                    })
+                    .map(|plane_index| objects::Type5TextureView {
+                        pixel_format: view_fmt,
+                        width: view_w,
+                        height: view_h,
+                        depth: 1,
+                        plane_index,
+                    });
+            }
+        }
     }
 
     if let Some(mid) = surface {
@@ -1639,7 +1704,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
         }
         if let Some(m) = state.mappings.get(&mid) {
             if m.has_geom && m.width > 0 && m.height > 0 {
-                let (w, h) = (m.width, m.height);
+                let (w, h, base_format) = (m.width, m.height, m.format);
                 // A biplanar YCbCr surface bound whole samples as one image,
                 // which none of the rungs below can produce: they serve the
                 // surface's bytes, and its bytes are two planes.
@@ -1661,6 +1726,37 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                                     TexelLayout::Rgba8,
                                     crate::contract::pixel_format::MTL_FORMAT_RGBA8_UNORM,
                                 ),
+                                crate::backend::vulkan::engine::SampledByteOrigin::SurfaceGuestFallback,
+                            ),
+                        ));
+                    }
+                }
+                // A two-plane XR10 surface bound whole is plane 0's colour
+                // under plane 1's alpha. No resident holds that pair — a
+                // render writes one plane or encodes both into pages — so the
+                // pages are the only place the combined texel exists. Every
+                // Store into such a surface is copied now (see
+                // `store_is_plane_override`), so they are current once any
+                // debt is paid.
+                if pixel_format::is_two_plane_xr10(base_format) {
+                    crate::runtime::writeback_debt::pay_for_mapping(state, host, mid);
+                    let memo_source =
+                        crate::runtime::draw::mapping_declared_format(state, mid, None);
+                    if let Some((rgba, identity, layout)) = load_type11_rgba_memoized(
+                        state,
+                        host,
+                        mid,
+                        native_uploads_for(memo_source),
+                    ) {
+                        crate::runtime::drain::note_store_route("t11rung_xr10_2p");
+                        return Some((
+                            w,
+                            h,
+                            mid,
+                            SampledSourceRequest::Bytes(
+                                rgba,
+                                Some(identity),
+                                SampledByteFormat::from_source(layout, memo_source),
                                 crate::backend::vulkan::engine::SampledByteOrigin::SurfaceGuestFallback,
                             ),
                         ));
@@ -1730,7 +1826,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                         w,
                         h,
                         mid,
-                        SampledSourceRequest::Target(resident_id, format),
+                        surface_target_source(state, mid, resident_id, format),
                     ));
                 }
 
@@ -1805,7 +1901,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                             w,
                             h,
                             mid,
-                            SampledSourceRequest::Target(resident_id, format),
+                            surface_target_source(state, mid, resident_id, format),
                         ));
                     }
                     note_type11_sample_rung("t11rung_resident_refused", guest_write);
@@ -2658,13 +2754,14 @@ fn stage_uses_sampled_band(textures: &[TextureBind], samplers: &[SamplerBind]) -
     textures.iter().any(|t| t.texture_ref != 0) || samplers.iter().any(|s| s.sampler_ref != 0)
 }
 
-fn try_type11_target_guest_seed<M: HostMemory + HostOps>(
+fn try_type11_target_guest_seed_for_format<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     mapping_id: u32,
     w: u32,
     h: u32,
     target_format: ash::vk::Format,
+    format_override: Option<u16>,
 ) -> Option<crate::backend::vulkan::engine::GuestTargetSeed> {
     use crate::backend::vulkan::engine::{GuestRunSource, GuestTargetSeed};
     use crate::runtime::mapping_write::type11_sample_window;
@@ -2674,18 +2771,21 @@ fn try_type11_target_guest_seed<M: HostMemory + HostOps>(
     }
     let (base_off, bpr, layout) = {
         let mapping = state.mappings.get(&mapping_id)?;
-        if !mapping.mapped
-            || mapping.page_entries.is_empty()
-            || !mapping.has_geom
-            || mapping.width != w
-            || mapping.height != h
-        {
+        if !mapping.mapped || mapping.page_entries.is_empty() || !mapping.has_geom {
             return None;
         }
-        let format = if mapping.format == 0 {
-            pixel_format::MTL_FORMAT_BGRA8_UNORM
-        } else {
-            mapping.format
+        let format = match format_override.filter(|&f| f != 0) {
+            Some(fmt) => fmt,
+            None => {
+                if mapping.width != w || mapping.height != h {
+                    return None;
+                }
+                if mapping.format == 0 {
+                    pixel_format::MTL_FORMAT_BGRA8_UNORM
+                } else {
+                    mapping.format
+                }
+            }
         };
         let layout = pixel_format::store_texel_order(format)?;
         let (base_off, bpr, _) = type11_sample_window(mapping, w, h, format)?;
@@ -2717,6 +2817,7 @@ fn try_type11_target_guest_seed<M: HostMemory + HostOps>(
     })
 }
 
+#[cfg(test)]
 fn resolve_type11_load_seed<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -2725,7 +2826,27 @@ fn resolve_type11_load_seed<M: HostMemory + HostOps>(
     h: u32,
     target_format: ash::vk::Format,
 ) -> Option<Type11LoadSeed> {
+    resolve_type11_load_seed_for_format(state, host, mapping_id, w, h, target_format, None)
+}
+
+/// [`resolve_type11_load_seed`] for an attachment whose declared format may
+/// name one plane of a multi-plane surface. A plane seed reads that plane's
+/// window only: the host cache and the RGBA reader both describe the whole
+/// surface, so neither may serve it.
+fn resolve_type11_load_seed_for_format<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+    w: u32,
+    h: u32,
+    target_format: ash::vk::Format,
+    declared: Option<u16>,
+) -> Option<Type11LoadSeed> {
     use crate::backend::vulkan::engine::SeedOrder;
+    let format_override = declared.filter(|_| {
+        crate::runtime::render_writeback::store_is_plane_override(state, mapping_id, declared)
+    });
+    let plane = format_override.is_some();
     // A condemned incarnation is seeded from nothing. Its pages are another
     // owner's, and the cache is a copy of them; a `LOAD` that could take its
     // resident took it before coming here.
@@ -2755,7 +2876,7 @@ fn resolve_type11_load_seed<M: HostMemory + HostOps>(
     if guest_replaced {
         crate::runtime::drain::note_store_route("t11seed_cache_refused_guest_wrote");
     }
-    let cached = (!guest_replaced)
+    let cached = (!guest_replaced && !plane)
         .then(|| crate::runtime::surface_cache::get_shared(state, mapping_id, w, h))
         .flatten();
     let served = if let Some(bgra) = cached {
@@ -2764,7 +2885,15 @@ fn resolve_type11_load_seed<M: HostMemory + HostOps>(
             Type11SeedRung::Cache,
         ))
     } else {
-        try_type11_target_guest_seed(state, host, mapping_id, w, h, target_format)
+        try_type11_target_guest_seed_for_format(
+            state,
+            host,
+            mapping_id,
+            w,
+            h,
+            target_format,
+            format_override,
+        )
             .map(|seed| (Type11LoadSeed::Guest(seed), Type11SeedRung::GuestPages))
             .or_else(|| {
                 let target_layout = translate::pixel::texel_layout_of(target_format)
@@ -2772,15 +2901,24 @@ fn resolve_type11_load_seed<M: HostMemory + HostOps>(
                 if !mapper::ensure_resolved_for_scanout(state, host, mapping_id) {
                     return None;
                 }
-                let declared_fmt = state
-                    .mappings
-                    .get(&mapping_id)
-                    .map(mapping_write::mapping_store_format)?;
+                let declared_fmt = match format_override {
+                    Some(fmt) => fmt,
+                    None => state
+                        .mappings
+                        .get(&mapping_id)
+                        .map(mapping_write::mapping_store_format)?,
+                };
                 if target_layout == TexelLayout::Rgba16Float
                     && pixel_format::is_xr10(declared_fmt)
                 {
-                    let native =
-                        mapping_write::read_xr10_to_rgba16f(state, host, mapping_id, w, h)?;
+                    let native = mapping_write::read_xr10_to_rgba16f_format(
+                        state,
+                        host,
+                        mapping_id,
+                        w,
+                        h,
+                        format_override,
+                    )?;
                     return Some((
                         Type11LoadSeed::Host(
                             std::sync::Arc::new(native),
@@ -2791,11 +2929,10 @@ fn resolve_type11_load_seed<M: HostMemory + HostOps>(
                 }
                 let (base_off, surface_bpr, span_end) = {
                     let m = state.mappings.get(&mapping_id)?;
-                    let fmt = mapping_write::mapping_store_format(m);
-                    if pixel_format::store_texel_order(fmt) != Some(target_layout) {
+                    if pixel_format::store_texel_order(declared_fmt) != Some(target_layout) {
                         return None;
                     }
-                    mapping_write::type11_sample_window(m, w, h, fmt)?
+                    mapping_write::type11_sample_window(m, w, h, declared_fmt)?
                 };
                 let bpp = target_layout.bytes_per_texel();
                 let tight = w.checked_mul(bpp)?;
@@ -2828,6 +2965,9 @@ fn resolve_type11_load_seed<M: HostMemory + HostOps>(
                 ))
             })
             .or_else(|| {
+                if plane {
+                    return None;
+                }
                 load_type11_mapping_rgba(state, host, mapping_id, None)
                     .map(|(_, _, r)| r)
                     .filter(|rgba| rgba.len() == (w as usize) * (h as usize) * 4)
@@ -4772,9 +4912,9 @@ pub(super) fn try_gva_resident_sample<M: HostMemory + HostOps>(
         }
     };
     let declared_format = tex.declared_pixel_format()?;
-    let format = translate::pixel::translate(declared_format).ok()?.vk;
+    let pf = translate::pixel::translate(declared_format).ok()?;
     note_store_route("gvarung_resident");
-    Some((w, h, SampledSourceRequest::Target(identity, format)))
+    Some((w, h, target_source_with_components(identity, pf.vk, pf.components)))
 }
 
 /// Which repair would let the linear zero-copy rung carry this format, as a
@@ -6850,11 +6990,12 @@ pub(super) fn secondary_target_identity<M: HostMemory + HostOps>(
             format,
         })
     } else if c.mapping_id != 0 {
-        Some(crate::runtime::present_identity::surface_identity(
+        Some(type11_target_identity(
             state,
             c.mapping_id,
             c.width,
             c.height,
+            c.format,
         ))
     } else if let Some(&target) = (c.mapping_id == 0 && !c.memoryless)
         .then(|| state.heap_texture_targets.get(&(task_id, c.texture_ref)))
@@ -8808,13 +8949,14 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                             .as_ref()
                             .map(|identity| identity.resident_format())
                             .unwrap_or(translate::pixel::RESIDENT_RGBA_FORMAT);
-                        match resolve_type11_load_seed(
+                        match resolve_type11_load_seed_for_format(
                             state,
                             host,
                             c0.mapping_id,
                             w,
                             h,
                             target_format,
+                            Some(c0.format),
                         ) {
                             Some(Type11LoadSeed::Host(bytes, order)) => {
                                 target_rgba8 = Some(bytes);
@@ -10256,14 +10398,41 @@ pub(crate) fn render_chain_identity(
         return Some(identity);
     }
     if c0.mapping_id != 0 {
-        return Some(crate::runtime::present_identity::surface_identity(
+        return Some(type11_target_identity(
             state,
             c0.mapping_id,
             width,
             height,
+            c0.format,
         ));
     }
     gva_chain_identity(req)
+}
+
+/// The resident a type-11 attachment renders into. A per-plane view of a
+/// multi-plane surface (or a view whose storage differs from the mapping's)
+/// gets a resident of its own declared format, so plane 1's `R8Unorm` never
+/// shares an image with plane 0's half-float one.
+fn type11_target_identity(
+    state: &DeviceState,
+    mapping_id: u32,
+    width: u32,
+    height: u32,
+    declared: u16,
+) -> crate::backend::vulkan::engine::TargetIdentity {
+    let format_override = crate::runtime::render_writeback::store_is_plane_override(
+        state,
+        mapping_id,
+        Some(declared),
+    )
+    .then_some(declared);
+    crate::runtime::present_identity::surface_identity_for_format(
+        state,
+        mapping_id,
+        width,
+        height,
+        format_override,
+    )
 }
 
 /// The registry resident a type-11 composite Store renders into, if this record
@@ -10360,9 +10529,26 @@ fn type11_guest_target_backing<H: HostMemory + HostOps>(
     }
     let c0 = req.colors.first()?;
     type11_render_identity(state, req)?;
+    // A Vulkan attachment aliased over guest pages must be the guest's texel,
+    // byte for byte. XR10 packs ten-bit channels (and a separate alpha plane)
+    // where the attachment holds binary16, and a per-plane view of a
+    // multi-plane surface names one plane of an allocation whose other planes
+    // the alias would cover. Both take the copying rail instead.
+    if pixel_format::is_xr10(c0.format)
+        || crate::runtime::render_writeback::store_is_plane_override(
+            state,
+            c0.mapping_id,
+            Some(c0.format),
+        )
+    {
+        return None;
+    }
     let (plane_offset, row_pitch, span_end) = {
         let mapping = state.mappings.get(&c0.mapping_id)?;
         let format = crate::runtime::mapping_write::mapping_store_format(mapping);
+        if pixel_format::is_xr10(format) {
+            return None;
+        }
         crate::runtime::mapping_write::type11_sample_window(mapping, c0.width, c0.height, format)?
     };
     let (import, footprint) =
@@ -10486,6 +10672,42 @@ pub(super) fn type11_guest_wrote_since_store<M: HostOps>(
     }
 }
 
+/// A resident bind carrying its Metal format's channel plan when that plan is
+/// not the identity. `BGR10_XR` has no alpha bits and samples `.a = 1` in
+/// Metal; the half-float resident it renders into holds whatever the pass left
+/// in `.a`, so the plan is what makes the two agree.
+fn target_source_with_components(
+    identity: crate::backend::vulkan::engine::TargetIdentity,
+    format: ash::vk::Format,
+    components: pixel_format::SwizzlePlan,
+) -> SampledSourceRequest {
+    if components.is_identity() {
+        SampledSourceRequest::Target(identity, format)
+    } else {
+        SampledSourceRequest::TargetWithComponents(identity, format, components)
+    }
+}
+
+/// [`target_source_with_components`] for a type-4/11 surface resident, with
+/// the plan of the mapping's own declared format. Limited to XR10, the only
+/// renderable surface family whose plan is not the identity.
+fn surface_target_source(
+    state: &DeviceState,
+    mid: u32,
+    identity: crate::backend::vulkan::engine::TargetIdentity,
+    format: ash::vk::Format,
+) -> SampledSourceRequest {
+    let components = state
+        .mappings
+        .get(&mid)
+        .map(mapping_write::mapping_store_format)
+        .filter(|&fmt| pixel_format::is_xr10(fmt))
+        .and_then(|fmt| translate::pixel::translate(fmt).ok())
+        .map(|pf| pf.components)
+        .unwrap_or_else(pixel_format::swizzle_identity);
+    target_source_with_components(identity, format, components)
+}
+
 /// A sampled bind of a surface whose incarnation the wire guard condemned.
 ///
 /// From the condemnation on, its pages hold memory the guest gave to someone
@@ -10526,7 +10748,7 @@ fn condemned_sampled_source(
             });
         condemned_sample_takes_resident(backing, may_bind_resident && view_is_base).then(|| {
             let format = resident_id.resident_format();
-            (w, h, mid, SampledSourceRequest::Target(resident_id, format))
+            (w, h, mid, surface_target_source(state, mid, resident_id, format))
         })
     });
     match taken {
@@ -11254,6 +11476,7 @@ fn surface_store_plan(lazy_enabled: bool, guest_backed: bool) -> SurfaceStorePla
     }
 }
 
+#[cfg(test)]
 fn store_surface_resident<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -11263,10 +11486,53 @@ fn store_surface_resident<M: HostMemory + HostOps>(
     height: u32,
     guest_store: GuestStoreStatus,
 ) -> bool {
+    store_surface_resident_with_format(
+        state,
+        host,
+        identity,
+        mapping_id,
+        width,
+        height,
+        guest_store,
+        None,
+    )
+}
+
+/// [`store_surface_resident`] for a target whose declared format may name one
+/// plane of a multi-plane surface. Such a Store is copied now through that
+/// plane's native window: neither the lazy debt nor the guest-backed alias
+/// knows about planes, and both would publish the whole mapping.
+#[allow(clippy::too_many_arguments)]
+fn store_surface_resident_with_format<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    identity: &crate::backend::vulkan::engine::TargetIdentity,
+    mapping_id: u32,
+    width: u32,
+    height: u32,
+    guest_store: GuestStoreStatus,
+    format_override: Option<u16>,
+) -> bool {
     // The union belongs to the draws that just ran whether or not the write
     // below succeeds, and leaving it un-reset on a refused write would fold this
     // pass into the next Store's reading.
     note_pass_scissor_union(width, height);
+    if crate::runtime::render_writeback::store_is_plane_override(state, mapping_id, format_override)
+    {
+        if !crate::runtime::render_writeback::store_render_frame_with_format(
+            state,
+            host,
+            mapping_id,
+            identity,
+            width,
+            height,
+            format_override,
+        ) {
+            return false;
+        }
+        crate::runtime::mapper::stamp_guest_write_gen(state, host, mapping_id);
+        return true;
+    }
     // A copied resident may defer the transfer until something reads the
     // mapping. A guest-backed resident may not: its Store is already the draw
     // into that allocation, so deferring creates an invented second operation

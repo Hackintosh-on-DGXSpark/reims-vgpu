@@ -657,8 +657,11 @@ pub fn device_desc_format_to_mtl(raw: u32) -> u16 {
 /// Unknown formats fail closed.
 pub fn iosurface_pixel_format_to_mtl(pixel_format: u32) -> u16 {
     use crate::contract::pixel_format::{
-        MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_R8_UNORM, MTL_FORMAT_RG8_UNORM, MTL_FORMAT_RGBA16_FLOAT,
-        MTL_FORMAT_RGBA8_UNORM,
+        MTL_FORMAT_BGR10A2_UNORM, MTL_FORMAT_BGR10_XR, MTL_FORMAT_BGRA10_XR,
+        MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_R16_FLOAT, MTL_FORMAT_R16_UNORM, MTL_FORMAT_R32_FLOAT,
+        MTL_FORMAT_R8_UNORM, MTL_FORMAT_RG16_FLOAT, MTL_FORMAT_RG16_UNORM, MTL_FORMAT_RG32_FLOAT,
+        MTL_FORMAT_RG8_UNORM, MTL_FORMAT_RGB10A8_2P_XR10, MTL_FORMAT_RGBA16_FLOAT,
+        MTL_FORMAT_RGBA16_UNORM, MTL_FORMAT_RGBA32_FLOAT, MTL_FORMAT_RGBA8_UNORM,
     };
     if pixel_format == 0 {
         return 0;
@@ -680,17 +683,38 @@ pub fn iosurface_pixel_format_to_mtl(pixel_format: u32) -> u16 {
     // BGRA10_XR is 552 (0x228) and its three siblings are 553-555, so a 10-bit
     // XR surface passed 0x200 and fell into the FourCC match below regardless.
     match pixel_format {
-        // 'BGRA' / 'ARGB' (kb: ARGB fourcc → BGRA8Unorm 0x50 for render targets)
-        0x4247_5241 | 0x4152_4742 => MTL_FORMAT_BGRA8_UNORM,
+        // 'BGRA' / 'ARGB' / '&BGA' (compressed/lossless BGRA8 IOSurface)
+        0x4247_5241 | 0x4152_4742 | 0x2642_4741 => MTL_FORMAT_BGRA8_UNORM,
         // 'RGBA'
         0x5247_4241 => MTL_FORMAT_RGBA8_UNORM,
-        // 'RGhA' / half-float variants seen as AhGR in notes
-        0x5247_6841 | 0x4168_4752 => MTL_FORMAT_RGBA16_FLOAT,
-        // Single-plane R8 / RG8 OSTypes used as plane textures (not biplanar media fourcc).
-        // 'L008' / common R8 fourccs are rare on type-4; MTL ordinals already handled above.
-        // 'R8  ' / 'RG08' if ever seen as OSType:
-        0x5238_2020 => MTL_FORMAT_R8_UNORM,
-        0x5247_3038 => MTL_FORMAT_RG8_UNORM,
+        // 'RGhA' / 'AhGR' / '&RhA'
+        0x5247_6841 | 0x4168_4752 | 0x2652_6841 => MTL_FORMAT_RGBA16_FLOAT,
+        // 'RGfA'
+        0x5247_6641 => MTL_FORMAT_RGBA32_FLOAT,
+        // 'l64r'
+        0x6c36_3472 => MTL_FORMAT_RGBA16_UNORM,
+        // 'l10r' (10-bit packed RGB10A2 LE → BGR10A2Unorm)
+        0x6c31_3072 => MTL_FORMAT_BGR10A2_UNORM,
+        // 'b3a8' / '&b38' (2-plane 30-bit XR10 RGB + 8-bit alpha, Liquid Glass UI/icons)
+        0x6233_6138 | 0x2662_3338 => MTL_FORMAT_RGB10A8_2P_XR10,
+        // 'w30r' / '&w3r' (single-plane 30-bit XR10 RGB → BGR10_XR)
+        0x7733_3072 | 0x2677_3372 => MTL_FORMAT_BGR10_XR,
+        // 'w40a' / 'w40m' (64-bit XR10 RGBA → BGRA10_XR)
+        0x7734_3061 | 0x7734_306d => MTL_FORMAT_BGRA10_XR,
+        // Single-plane R / RG OSTypes used on IOSurfaces:
+        // 'R8  ' / 'L008'
+        0x5238_2020 | 0x4c30_3038 => MTL_FORMAT_R8_UNORM,
+        // 'RG08' / '2C08'
+        0x5247_3038 | 0x3243_3038 => MTL_FORMAT_RG8_UNORM,
+        // 'L016' / '2C16'
+        0x4c30_3136 => MTL_FORMAT_R16_UNORM,
+        0x3243_3136 => MTL_FORMAT_RG16_UNORM,
+        // 'L00h' / '2C0h'
+        0x4c30_3068 => MTL_FORMAT_R16_FLOAT,
+        0x3243_3068 => MTL_FORMAT_RG16_FLOAT,
+        // 'L00f' / '2C0f'
+        0x4c30_3066 => MTL_FORMAT_R32_FLOAT,
+        0x3243_3066 => MTL_FORMAT_RG32_FLOAT,
         // Unknown FourCC: 0 — callers fail closed (no BGRA invent).
         _ => 0,
     }
@@ -1031,6 +1055,10 @@ fn synthesize_device_desc_from_type4(surf: &Type4Surface) -> Vec<u8> {
                 // Only fill when FourCC is known biplanar — not a free invent for
                 // arbitrary multi-plane. Matches Metal R8/RG8 plane bind bpp.
                 let bpe = if i == 0 { 1u16 } else { 2u16 };
+                st16(&mut device_desc[base + DEVICE_PLANE_BPE..], bpe);
+            } else if crate::contract::pixel_format::is_two_plane_xr10(mtl) {
+                // 'b3a8' / '&b38': plane 0 is 30-bit XR10 RGB (4 B/px), plane 1 is R8 alpha (1 B/px).
+                let bpe = if i == 0 { 4u16 } else { 1u16 };
                 st16(&mut device_desc[base + DEVICE_PLANE_BPE..], bpe);
             }
         }
@@ -2660,10 +2688,14 @@ fn note_type4_claimants<M: HostMemory>(
 /// a freshly-read descriptor against `m.format`, which is whatever this returned
 /// last time.
 fn latched_mapping_format(surf: &Type4Surface) -> u16 {
+    let mtl = iosurface_pixel_format_to_mtl(surf.pixel_format);
+    if crate::contract::pixel_format::is_two_plane_xr10(mtl) {
+        return mtl;
+    }
     if type4_is_multiplanar(surf) {
         return 0;
     }
-    iosurface_pixel_format_to_mtl(surf.pixel_format)
+    mtl
 }
 
 /// Whether the geometry already latched on this mapping is still the geometry

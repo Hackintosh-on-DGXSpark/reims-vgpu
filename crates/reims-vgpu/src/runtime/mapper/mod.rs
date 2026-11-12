@@ -685,10 +685,29 @@ fn resolve_mapping_backing_walked<H: HostMemory + HostOps>(
     // multi-plane, prefer alloc_size already latched from the device descriptor.
     if let Some(m) = state.mappings.get(&mapping_id) {
         if m.has_geom && m.width > 0 && m.height > 0 {
-            width = m.width;
-            height = m.height;
-            format = if m.format != 0 { m.format } else { format };
             let desc_slice = device_desc.as_deref().or(m.device_desc_complete());
+            let desc_surf = desc_slice.and_then(decode_device_surface);
+            let desc_multiplane = desc_surf.is_some_and(|s| {
+                s.plane_count > 1
+                    || crate::runtime::objects::iosurface_fourcc_is_biplanar(s.pixel_format)
+            });
+            if !desc_multiplane || width == 0 || height == 0 {
+                width = m.width;
+                height = m.height;
+            }
+            format = if desc_multiplane {
+                if crate::contract::pixel_format::is_two_plane_xr10(m.format)
+                    || crate::runtime::ycbcr::Sampling::of(m.format).is_some()
+                {
+                    m.format
+                } else {
+                    format
+                }
+            } else if m.format != 0 {
+                m.format
+            } else {
+                format
+            };
             if let Some(end) = mapping_span_bound(desc_slice, format, width, height) {
                 min_size = min_size.max(end).max(guest_page);
             }

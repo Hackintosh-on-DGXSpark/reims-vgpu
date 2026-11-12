@@ -89,6 +89,18 @@ const ALPHA_IN_RED: SwizzlePlan = SwizzlePlan {
     ],
 };
 
+/// 3-channel `BGR10_XR` / `BGR10_XR_sRGB` carry no alpha bits on the wire and
+/// sample `.a = 1.0` in Metal even when rendered into an `R16G16B16A16_SFLOAT`
+/// attachment whose shader write mask or fragment output left `.a` at `0.0`.
+const OPAQUE_ALPHA: SwizzlePlan = SwizzlePlan {
+    source: [
+        SwizzleSource::R,
+        SwizzleSource::G,
+        SwizzleSource::B,
+        SwizzleSource::One,
+    ],
+};
+
 fn linear(vk: vk::Format, bytes_per_texel: u32) -> PixelFormat {
     PixelFormat {
         vk,
@@ -164,10 +176,13 @@ pub fn translate(mtl: u16) -> Result<PixelFormat, TranslateReason> {
         p::MTL_FORMAT_RGBA16_UNORM => linear(vk::Format::R16G16B16A16_UNORM, 8),
         p::MTL_FORMAT_RGBA16_UINT => linear(vk::Format::R16G16B16A16_UINT, 8),
         p::MTL_FORMAT_RGBA16_FLOAT => linear(vk::Format::R16G16B16A16_SFLOAT, 8),
-        p::MTL_FORMAT_RGB10A8_2P_XR10
-        | p::MTL_FORMAT_RGB10A8_2P_XR10_SRGB
-        | p::MTL_FORMAT_BGR10_XR
-        | p::MTL_FORMAT_BGR10_XR_SRGB => linear(vk::Format::R16G16B16A16_SFLOAT, 4),
+        p::MTL_FORMAT_RGB10A8_2P_XR10 | p::MTL_FORMAT_RGB10A8_2P_XR10_SRGB => {
+            linear(vk::Format::R16G16B16A16_SFLOAT, 4)
+        }
+        p::MTL_FORMAT_BGR10_XR | p::MTL_FORMAT_BGR10_XR_SRGB => PixelFormat {
+            components: OPAQUE_ALPHA,
+            ..linear(vk::Format::R16G16B16A16_SFLOAT, 4)
+        },
         p::MTL_FORMAT_BGRA10_XR | p::MTL_FORMAT_BGRA10_XR_SRGB => {
             linear(vk::Format::R16G16B16A16_SFLOAT, 8)
         }

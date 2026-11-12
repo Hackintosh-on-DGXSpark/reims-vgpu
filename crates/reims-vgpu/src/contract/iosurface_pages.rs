@@ -568,18 +568,89 @@ pub fn sample_window_from_device_desc(
 /// This is the only place the allocation bound is applied, and it is why nothing
 /// may reach for [`packed_span_estimate`] directly and then take the span this
 /// refused.
+/// Find the unique plane index in `desc` whose geometry and element size match
+/// `(width, height, pixel_format)` (falling back to row-byte-equivalent planes
+/// in the same order as [`sample_window_from_device_desc`]).
+pub fn find_plane_index_in_device_desc(
+    desc: &[u8],
+    pixel_format: u16,
+    width: u32,
+    height: u32,
+) -> Option<u32> {
+    if desc.len() < DEVICE_DESC_LEN {
+        return None;
+    }
+    let surf = decode_device_surface(desc)?;
+    if surf.plane_count == 0 {
+        return None;
+    }
+    let bpp = format_bytes_per_pixel(pixel_format)?;
+    let cap = surf
+        .plane_count
+        .min(reims_vgpu_wire::device_desc::TYPE4_PLANE_CAP as u8);
+    let mut found = None;
+    let mut matches = 0u32;
+    for p in 0..cap {
+        if let Some((cand, _)) = device_desc_plane(desc, p as u32) {
+            if cand.width == width
+                && cand.height == height
+                && (cand.bytes_per_element == 0 || cand.bytes_per_element as u32 == bpp)
+                && sample_window_from_device_plane(&cand, pixel_format, width, height).is_some()
+            {
+                matches += 1;
+                found = Some(p as u32);
+            }
+        }
+    }
+    if matches == 0 {
+        for p in 0..cap {
+            if let Some((cand, _)) = device_desc_plane(desc, p as u32) {
+                if cand.height == height
+                    && cand.bytes_per_element != 0
+                    && u64::from(cand.width) * u64::from(cand.bytes_per_element)
+                        == u64::from(width) * u64::from(bpp)
+                    && sample_window_from_device_plane(&cand, pixel_format, width, height)
+                        .is_some()
+                {
+                    matches += 1;
+                    found = Some(p as u32);
+                }
+            }
+        }
+    }
+    (matches == 1).then_some(found).flatten()
+}
+
 pub fn mapping_span_bound(
     desc: Option<&[u8]>,
     pixel_format: u16,
     width: u32,
     height: u32,
 ) -> Option<u64> {
-    if let Some((_, _, end)) =
+    if let Some((_, _, mut end)) =
         sample_window_from_device_desc(desc, None, pixel_format, width, height)
     {
+        if pixel_format::is_two_plane_xr10(pixel_format) {
+            if let Some((_, _, a_end)) = sample_window_from_device_desc(
+                desc,
+                Some(1),
+                pixel_format::MTL_FORMAT_R8_UNORM,
+                width,
+                height,
+            ) {
+                end = end.max(a_end);
+            }
+        }
         return Some(end);
     }
-    let end = packed_span_estimate(pixel_format, width, height)?;
+    let mut end = packed_span_estimate(pixel_format, width, height)?;
+    if pixel_format::is_two_plane_xr10(pixel_format) {
+        if let Some(a_span) =
+            packed_span_estimate(pixel_format::MTL_FORMAT_R8_UNORM, width, height)
+        {
+            end = checked_add_u64(end, a_span)?;
+        }
+    }
     if let Some(desc) = desc {
         if desc.len() >= DEVICE_DESC_LEN {
             if let Some(surf) = decode_device_surface(desc) {
@@ -1451,5 +1522,43 @@ mod tests {
             350
         )
         .is_none());
+    }
+
+    #[test]
+    fn two_plane_xr10_span_bound_and_plane_index_lookup() {
+        use crate::contract::endian::{st16, st32, st64};
+        use crate::contract::pixel_format::{
+            MTL_FORMAT_BGR10_XR, MTL_FORMAT_R8_UNORM, MTL_FORMAT_RGB10A8_2P_XR10,
+        };
+
+        let mut desc = vec![0u8; DEVICE_DESC_LEN];
+        st32(&mut desc[DEVICE_DESC_ALLOC_SIZE..], 0x40000);
+        st32(&mut desc[DEVICE_DESC_PIXEL_FORMAT..], 0x6233_6138); // 'b3a8'
+        desc[DEVICE_DESC_PLANE_COUNT] = 2;
+        // Plane 0: 64x64 BGR10_XR (bpe=4, bpr=256, offset=0, size=16384)
+        let p0 = DEVICE_DESC_PLANES;
+        st32(&mut desc[p0 + DEVICE_PLANE_OFFSET..], 0);
+        st32(&mut desc[p0 + DEVICE_PLANE_SIZE..], 16384);
+        st64(&mut desc[p0 + DEVICE_PLANE_DIMS..], pack_plane_dims(64, 64));
+        st32(&mut desc[p0 + DEVICE_PLANE_BPR..], 256);
+        st16(&mut desc[p0 + DEVICE_PLANE_BPE..], 4);
+        // Plane 1: 64x64 R8_UNORM (bpe=1, bpr=64, offset=16384, size=4096)
+        let p1 = DEVICE_DESC_PLANES + DEVICE_PLANE_DESC_LEN;
+        st32(&mut desc[p1 + DEVICE_PLANE_OFFSET..], 16384);
+        st32(&mut desc[p1 + DEVICE_PLANE_SIZE..], 4096);
+        st64(&mut desc[p1 + DEVICE_PLANE_DIMS..], pack_plane_dims(64, 64));
+        st32(&mut desc[p1 + DEVICE_PLANE_BPR..], 64);
+        st16(&mut desc[p1 + DEVICE_PLANE_BPE..], 1);
+
+        assert_eq!(
+            find_plane_index_in_device_desc(&desc, MTL_FORMAT_BGR10_XR, 64, 64),
+            Some(0)
+        );
+        assert_eq!(
+            find_plane_index_in_device_desc(&desc, MTL_FORMAT_R8_UNORM, 64, 64),
+            Some(1)
+        );
+        let bound = mapping_span_bound(Some(&desc), MTL_FORMAT_RGB10A8_2P_XR10, 64, 64).unwrap();
+        assert_eq!(bound, 16384 + 63 * 64 + 64);
     }
 }

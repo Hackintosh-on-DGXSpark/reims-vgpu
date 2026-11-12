@@ -845,8 +845,79 @@ pub fn store_render_frame<M: HostMemory + HostOps>(
     width: u32,
     height: u32,
 ) -> bool {
+    store_render_frame_with_format(state, host, mapping_id, identity, width, height, None)
+}
+
+/// Whether a Store into `mapping_id` under `format_override` names one plane
+/// of a multi-plane surface (or a view whose format is not the mapping's own),
+/// so it must land through that plane's native window and nothing else.
+#[cfg(feature = "backend-vulkan")]
+pub fn store_is_plane_override(state: &DeviceState, mapping_id: u32, format_override: Option<u16>) -> bool {
+    let Some(m) = state.mappings.get(&mapping_id) else {
+        return false;
+    };
+    let multiplane = crate::runtime::objects::mapping_is_multiplanar(m)
+        || crate::contract::pixel_format::is_two_plane_xr10(m.format);
+    let Some(fmt) = format_override.filter(|&f| f != 0) else {
+        return false;
+    };
+    let own = crate::runtime::mapping_write::mapping_store_format(m);
+    multiplane
+        || crate::contract::pixel_format::bytes_per_pixel(fmt)
+            != crate::contract::pixel_format::bytes_per_pixel(own)
+        || crate::contract::pixel_format::is_xr10(fmt) != crate::contract::pixel_format::is_xr10(own)
+}
+
+/// [`store_render_frame`] for a target whose declared format may differ from
+/// the mapping's: a per-plane type-11 view of a multi-plane surface writes only
+/// its own plane, through the native rail.
+#[cfg(feature = "backend-vulkan")]
+pub fn store_render_frame_with_format<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+    identity: &crate::backend::vulkan::engine::TargetIdentity,
+    width: u32,
+    height: u32,
+    format_override: Option<u16>,
+) -> bool {
     let started = std::time::Instant::now();
     crate::runtime::drain::note_store_route("surface_flush");
+    if store_is_plane_override(state, mapping_id, format_override) {
+        let fmt = format_override.unwrap_or(0);
+        let expected = if crate::contract::pixel_format::is_xr10(fmt) {
+            Some(crate::contract::pixel_format::TexelLayout::Rgba16Float)
+        } else {
+            crate::contract::pixel_format::store_texel_order(fmt)
+        };
+        let read = crate::backend::vulkan::engine::read_target_native(identity);
+        let ok = match (&read, expected) {
+            (Ok(rb), Some(layout)) if rb.layout == layout => {
+                crate::runtime::mapping_write::write_native_uncached_format(
+                    state,
+                    host,
+                    mapping_id,
+                    &rb.pixels,
+                    width,
+                    height,
+                    rb.layout,
+                    Some(fmt),
+                )
+            }
+            _ => false,
+        };
+        if !ok {
+            crate::observe::fail(format!(
+                "render_store_lost mapping={mapping_id} {width}x{height} fmt={fmt:#x} reason=plane_write_refused layout={:?}",
+                read.as_ref().ok().map(|rb| rb.layout)
+            ));
+            return false;
+        }
+        crate::runtime::drain::note_store_route("render_flush_plane_native");
+        let len = read.map(|rb| rb.pixels.len()).unwrap_or(0);
+        finish(state, mapping_id, identity, len, started, false);
+        return true;
+    }
     // The GPU writes the guest's pages directly. Tried first because when it
     // works there is nothing left to do: no staging buffer is mapped and no
     // host pass over the frame happens at all.

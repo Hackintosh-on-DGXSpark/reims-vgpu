@@ -4513,25 +4513,29 @@ fn apply_clear<M: HostMemory + HostOps>(
     if c0.mapping_id == 0 {
         return false;
     }
-    let native_ok = state
-        .mappings
-        .get(&c0.mapping_id)
-        .map(mapping_write::mapping_store_format)
-        .and_then(mapping_write::mapping_native_resident_layout)
-        .and_then(|layout| {
-            crate::contract::pixel_format::solid_native_texels(w, h, layout, &att.clear_color).map(
-                |texels| {
-                    mapping_write::write_native_uncached(
-                        state,
-                        host,
-                        c0.mapping_id,
-                        &texels,
-                        w,
-                        h,
-                        layout,
-                    )
-                },
-            )
+    let effective_fmt = if c0.format != 0 {
+        Some(c0.format)
+    } else {
+        state
+            .mappings
+            .get(&c0.mapping_id)
+            .map(mapping_write::mapping_store_format)
+    };
+    let native_ok = effective_fmt
+        .and_then(|fmt| {
+            let layout = mapping_write::mapping_native_resident_layout(fmt)?;
+            let texels =
+                crate::contract::pixel_format::solid_native_texels(w, h, layout, &att.clear_color)?;
+            Some(mapping_write::write_native_uncached_format(
+                state,
+                host,
+                c0.mapping_id,
+                &texels,
+                w,
+                h,
+                layout,
+                Some(fmt),
+            ))
         })
         .unwrap_or(false);
     let ok = if native_ok {

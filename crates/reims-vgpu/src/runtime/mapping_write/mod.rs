@@ -720,6 +720,32 @@ pub fn write_native_uncached<M: HostMemory + HostOps>(
     height: u32,
     resident_layout: pixel_format::TexelLayout,
 ) -> bool {
+    write_native_uncached_format(
+        state,
+        host,
+        mapping_id,
+        src,
+        width,
+        height,
+        resident_layout,
+        None,
+    )
+}
+
+/// [`write_native_uncached`] for a per-plane type-11 view of a multi-plane
+/// surface: `format_override` names the view's own format and geometry, so the
+/// write lands in that plane's window and leaves the others untouched.
+#[allow(clippy::too_many_arguments)]
+pub fn write_native_uncached_format<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+    src: &[u8],
+    width: u32,
+    height: u32,
+    resident_layout: pixel_format::TexelLayout,
+    format_override: Option<u16>,
+) -> bool {
     if !scanout_extent_ok(width, height) {
         return false;
     }
@@ -730,7 +756,10 @@ pub fn write_native_uncached<M: HostMemory + HostOps>(
         if !m.mapped || m.page_entries.is_empty() {
             return false;
         }
-        let (mw, mh, format) = mapping_write_geometry(m, width, height);
+        let (mw, mh, format) = match format_override.filter(|&f| f != 0) {
+            Some(fmt) => (width, height, fmt),
+            None => mapping_write_geometry(m, width, height),
+        };
         if mw != width || mh != height {
             return false;
         }
@@ -2708,6 +2737,19 @@ pub fn read_xr10_to_rgba16f<M: HostMemory + HostOps>(
     width: u32,
     height: u32,
 ) -> Option<Vec<u8>> {
+    read_xr10_to_rgba16f_format(state, host, mapping_id, width, height, None)
+}
+
+/// [`read_xr10_to_rgba16f`] for a per-plane view whose declared format and
+/// geometry differ from the whole-surface mapping.
+pub fn read_xr10_to_rgba16f_format<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+    width: u32,
+    height: u32,
+    format_override: Option<u16>,
+) -> Option<Vec<u8>> {
     if !scanout_extent_ok(width, height) {
         return None;
     }
@@ -2717,7 +2759,10 @@ pub fn read_xr10_to_rgba16f<M: HostMemory + HostOps>(
         if !m.mapped || m.page_entries.is_empty() {
             return None;
         }
-        let (mw, mh, format) = mapping_write_geometry(m, width, height);
+        let (mw, mh, format) = match format_override.filter(|&f| f != 0) {
+            Some(fmt) => (width, height, fmt),
+            None => mapping_write_geometry(m, width, height),
+        };
         if mw != width || mh != height || !pixel_format::is_xr10(format) {
             return None;
         }
