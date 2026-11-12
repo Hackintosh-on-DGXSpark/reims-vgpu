@@ -2516,19 +2516,85 @@ fn reply_heap_texture_size_and_align<H: HostMemory + HostOps>(
             return false;
         }
     };
-    // A live slot or nothing. `resolved_task` is gone with the arm that made the
-    // two differ: the only slot this can act on is the one the guest named.
-    let Some(task_id) = resolve_task_word(
+    // A live slot, or one the guest has defined and this device has not reached:
+    // the definition sits in another channel's ring, held behind a shader
+    // translation, while the query naming the task is answered now. The guest
+    // reads the reply as soon as its doorbell returns, so the reply is written
+    // through the queued definition's page tables, and the drain still defines
+    // the task in its own turn.
+    match resolve_task_word(
         &state.tasks,
         TaskWordSite::HeapTextureQuery,
         request.task_id,
-    ) else {
+    ) {
+        Some(task_id) => reply_heap_query_for_task(state, host, &request, task_id),
+        None => reply_heap_query_through_queued_task(state, host, &request),
+    }
+}
+
+fn reply_heap_query_through_queued_task<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    request: &crate::runtime::heap_query::Request,
+) -> bool {
+    let task_id = request.task_id;
+    let Some(entry) = queued_task_definition(state, host, task_id) else {
         Emit::decline("heap_texture_query", &QueryError::BadTask)
-            .field("task", request.task_id)
+            .field("task", task_id)
             .field("gva", format!("{:#x}", request.reply_gva))
             .fail();
         return false;
     };
+    let previous = state.tasks.get(task_id).cloned();
+    state.tasks.define(task_id, entry);
+    let answered = reply_heap_query_for_task(state, host, request, task_id);
+    match previous {
+        Some(previous) => state.tasks.define(task_id, previous),
+        None => state.tasks.remove(task_id),
+    }
+    crate::observe::off(format!(
+        "heap_texture_query queued_task task={task_id} answered={answered}"
+    ));
+    answered
+}
+
+/// The newest `DefineTask2` for `task_id` still queued in a child ring, as the
+/// entry the drain will install when it reaches it.
+fn queued_task_definition<H: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &H,
+    task_id: u32,
+) -> Option<crate::model::TaskEntry> {
+    (1..MAX_CHANNELS as u32)
+        .flat_map(|channel| {
+            crate::runtime::reply_fence::queued(
+                host,
+                state.gfx.root_page,
+                state.page_shift,
+                channel,
+                CHILD_OP_DEFINE_TASK2,
+            )
+        })
+        .filter(|packet| packet.payload.len() >= DEFINE_TASK_LEN)
+        .filter(|packet| {
+            let raw_id = ld32(&packet.payload[DEFINE_TASK_RAW_ID..]);
+            raw_id & 1 == 0 && raw_id >> DEFINE_TASK_ID_SHIFT == task_id
+        })
+        .last()
+        .map(|packet| {
+            crate::model::TaskEntry::define(
+                define_task_length(&packet.payload),
+                ld32(&packet.payload[DEFINE_TASK_DIRECTORY_PFN..]),
+            )
+        })
+}
+
+fn reply_heap_query_for_task<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    request: &crate::runtime::heap_query::Request,
+    task_id: u32,
+) -> bool {
     let requirement = match crate::runtime::heap_query::query_size_and_align(&request.descriptor) {
         Ok(requirement) => requirement,
         Err(error) => {

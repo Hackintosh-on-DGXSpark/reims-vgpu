@@ -74,6 +74,51 @@ pub fn find<M: HostMemory>(
     channel: u32,
     cache: &mut RingPages,
 ) -> Option<Pending> {
+    let (queries, head_gpa, after) = scan(
+        mem,
+        root_page,
+        page_shift,
+        channel,
+        cache,
+        CHILD_OP_HEAP_TEXTURE_SIZE_AND_ALIGN,
+    )?;
+    (!queries.is_empty()).then_some(Pending {
+        queries,
+        head_gpa,
+        after,
+    })
+}
+
+/// Every `opcode` packet between `channel`'s head and tail that the drain has
+/// not run yet, oldest first. Read from guest memory and nothing else, like
+/// [`find`].
+pub fn queued<M: HostMemory>(
+    mem: &M,
+    root_page: u32,
+    page_shift: u32,
+    channel: u32,
+    opcode: u16,
+) -> Vec<Query> {
+    scan(
+        mem,
+        root_page,
+        page_shift,
+        channel,
+        &mut RingPages::default(),
+        opcode,
+    )
+    .map(|(queries, _, _)| queries)
+    .unwrap_or_default()
+}
+
+fn scan<M: HostMemory>(
+    mem: &M,
+    root_page: u32,
+    page_shift: u32,
+    channel: u32,
+    cache: &mut RingPages,
+    opcode: u16,
+) -> Option<(Vec<Query>, u64, u32)> {
     if root_page == 0 {
         return None;
     }
@@ -123,7 +168,7 @@ pub fn find<M: HostMemory>(
         }
         let payload_at =
             PACKET_HEADER_LEN + u32::from(ld16(&header[PACKET_STAMP_COUNT..])) * PACKET_STAMP_LEN;
-        if ld16(&header[PACKET_OPCODE..]) == CHILD_OP_HEAP_TEXTURE_SIZE_AND_ALIGN
+        if ld16(&header[PACKET_OPCODE..]) == opcode
             && payload_at <= total
             && total <= MAX_QUERY_LEN
         {
@@ -137,11 +182,7 @@ pub fn find<M: HostMemory>(
         at = at.wrapping_add(total);
         remaining -= total;
     }
-    (!queries.is_empty()).then_some(Pending {
-        queries,
-        head_gpa: regs_gpa + CHILD_REG_HEAD,
-        after,
-    })
+    Some((queries, regs_gpa + CHILD_REG_HEAD, after))
 }
 
 fn read_ring<M: HostMemory>(
