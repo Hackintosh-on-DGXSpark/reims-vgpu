@@ -303,8 +303,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                             .first()
                             .and_then(|c0| state.mappings.get(&c0.mapping_id))
                             .map(mapping_write::mapping_store_format)
-                            .and_then(pixel_format::store_texel_order)
-                            .filter(|layout| !layout.is_four_byte_color())
+                            .and_then(mapping_write::mapping_native_resident_layout)
                         {
                             if let Ok(rb) =
                                 crate::backend::vulkan::engine::read_target_native(&identity)
@@ -864,8 +863,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                     .mappings
                     .get(&c.mapping_id)
                     .map(mapping_write::mapping_store_format)
-                    .and_then(pixel_format::store_texel_order)
-                    .filter(|layout| !layout.is_four_byte_color())
+                    .and_then(mapping_write::mapping_native_resident_layout)
                     .and_then(|layout| {
                         pixel_format::solid_native_texels(c.width, c.height, layout, &c.clear_color)
                             .map(|texels| {
@@ -2774,6 +2772,23 @@ fn resolve_type11_load_seed<M: HostMemory + HostOps>(
                 if !mapper::ensure_resolved_for_scanout(state, host, mapping_id) {
                     return None;
                 }
+                let declared_fmt = state
+                    .mappings
+                    .get(&mapping_id)
+                    .map(mapping_write::mapping_store_format)?;
+                if target_layout == TexelLayout::Rgba16Float
+                    && pixel_format::is_xr10(declared_fmt)
+                {
+                    let native =
+                        mapping_write::read_xr10_to_rgba16f(state, host, mapping_id, w, h)?;
+                    return Some((
+                        Type11LoadSeed::Host(
+                            std::sync::Arc::new(native),
+                            SeedOrder::Native(TexelLayout::Rgba16Float),
+                        ),
+                        Type11SeedRung::GuestPages,
+                    ));
+                }
                 let (base_off, surface_bpr, span_end) = {
                     let m = state.mappings.get(&mapping_id)?;
                     let fmt = mapping_write::mapping_store_format(m);
@@ -2998,6 +3013,9 @@ pub(super) fn load_type5_view_rgba<M: HostMemory + HostOps>(
             pixel_format::MTL_FORMAT_RGBA16_UNORM if native_uploads.unorm16 => {
                 TexelLayout::Rgba16Unorm
             }
+            _ if pixel_format::is_xr10(view.pixel_format) && native_uploads.float16 => {
+                TexelLayout::Rgba16Float
+            }
             pixel_format::MTL_FORMAT_RGBA16_FLOAT if native_uploads.float16 => {
                 TexelLayout::Rgba16Float
             }
@@ -3056,7 +3074,36 @@ pub(super) fn load_type5_view_rgba<M: HostMemory + HostOps>(
     // RGBA8 formats expand per-pixel into a fresh RGBA8 buffer; native R8/RG8
     // upload the plane bytes verbatim (the memo stores those bytes as both the
     // memcmp key and the upload payload).
-    let rgba: std::sync::Arc<Vec<u8>> = if byte_format.layout() == TexelLayout::Rgba8 {
+    let rgba: std::sync::Arc<Vec<u8>> = if pixel_format::is_xr10(view.pixel_format)
+        && byte_format.layout() == TexelLayout::Rgba16Float
+    {
+        let Some(f16_stride) = view.width.checked_mul(pixel_format::RGBA16F_BPP) else {
+            return fail(Type5ViewDecline::RgbaStride);
+        };
+        let Some(f16_len) = (f16_stride as u64)
+            .checked_mul(view.height as u64)
+            .and_then(host_alloc_len)
+        else {
+            return fail(Type5ViewDecline::RgbaLen { stride: f16_stride });
+        };
+        let mut decoded = vec![0u8; f16_len];
+        for y in 0..view.height as usize {
+            let src_off = y.saturating_mul(tight as usize);
+            let dst_off = y.saturating_mul(f16_stride as usize);
+            let src = &native[src_off..src_off + tight as usize];
+            let dst = &mut decoded[dst_off..dst_off + f16_stride as usize];
+            if !pixel_format::decode_xr10_row_to_rgba16f(
+                view.pixel_format,
+                view.width,
+                src,
+                None,
+                dst,
+            ) {
+                return fail(Type5ViewDecline::Convert { row: y, bpp });
+            }
+        }
+        std::sync::Arc::new(decoded)
+    } else if byte_format.layout() == TexelLayout::Rgba8 {
         let Some(rgba_stride) = view.width.checked_mul(RGBA8_BPP) else {
             return fail(Type5ViewDecline::RgbaStride);
         };
@@ -11342,16 +11389,24 @@ fn arm_surface_writeback_debt<M: HostMemory + HostOps>(
     // observes, which is the one thing that switch's doc promises they never do.
     // Nothing else drops an entry from that map and no guest-write witness feeds
     // it, so a stale claim is held until the window is written some other way.
-    if let Some(m) = state.mappings.get(&mapping_id) {
+    let residency_windows = state.mappings.get(&mapping_id).map(|m| {
         let format = if m.format != 0 {
             m.format
         } else {
             pixel_format::MTL_FORMAT_BGRA8_UNORM
         };
-        if let Some((base_off, _bpr, span_end)) =
-            crate::runtime::mapping_write::type11_sample_window(m, width, height, format)
-        {
+        let p0 = crate::runtime::mapping_write::type11_sample_window(m, width, height, format);
+        let p1 = pixel_format::is_two_plane_xr10(format)
+            .then(|| crate::runtime::mapping_write::two_plane_xr10_alpha_window(m, width, height))
+            .flatten();
+        (p0, p1)
+    });
+    if let Some((p0, p1)) = residency_windows {
+        if let Some((base_off, _bpr, span_end)) = p0 {
             state.invalidate_storage_residency_window(mapping_id, base_off, span_end);
+        }
+        if let Some((a_off, _a_bpr, a_end)) = p1 {
+            state.invalidate_storage_residency_window(mapping_id, a_off, a_end);
         }
     }
     // The one call that says "these pixels changed and the guest's pages do not

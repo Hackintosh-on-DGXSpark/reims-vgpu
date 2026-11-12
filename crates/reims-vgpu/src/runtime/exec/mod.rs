@@ -4507,8 +4507,7 @@ fn apply_clear<M: HostMemory + HostOps>(
         .mappings
         .get(&c0.mapping_id)
         .map(mapping_write::mapping_store_format)
-        .and_then(crate::contract::pixel_format::store_texel_order)
-        .filter(|layout| !layout.is_four_byte_color())
+        .and_then(mapping_write::mapping_native_resident_layout)
         .and_then(|layout| {
             crate::contract::pixel_format::solid_native_texels(w, h, layout, &att.clear_color).map(
                 |texels| {

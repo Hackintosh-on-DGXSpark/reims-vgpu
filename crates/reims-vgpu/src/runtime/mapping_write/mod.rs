@@ -214,6 +214,9 @@ fn sample_window(
     format: u16,
 ) -> Option<(u64, u32, u64)> {
     let Some(desc) = m.device_desc_complete() else {
+        if plane_index.is_some_and(|p| p != 0) {
+            return None;
+        }
         let end = packed_span_estimate(format, width, height)?;
         // The estimate is a whole number of aligned rows, so dividing it back
         // out is the row it was built from rather than a second derivation.
@@ -255,6 +258,87 @@ pub fn type5_sample_window(
     format: u16,
 ) -> Option<(u64, u32, u64)> {
     sample_window(m, Some(plane_index), width, height, format)
+}
+
+/// Resolve Plane 1 (`R8Unorm` alpha) on a two-plane XR10 IOSurface (`550`/`551`).
+pub fn two_plane_xr10_alpha_window(
+    m: &MappingEntry,
+    width: u32,
+    height: u32,
+) -> Option<(u64, u32, u64)> {
+    let desc = m.device_desc_complete()?;
+    sample_window_from_device_desc(
+        Some(desc),
+        Some(1),
+        pixel_format::MTL_FORMAT_R8_UNORM,
+        width,
+        height,
+    )
+}
+
+/// Expected GPU resident [`pixel_format::TexelLayout`] for non-narrowed
+/// writeback into a type-11 IOSurface `format`.
+pub fn mapping_native_resident_layout(format: u16) -> Option<pixel_format::TexelLayout> {
+    if pixel_format::is_xr10(format) {
+        Some(pixel_format::TexelLayout::Rgba16Float)
+    } else {
+        pixel_format::store_texel_order(format).filter(|layout| !layout.is_four_byte_color())
+    }
+}
+
+/// Write a tight `width x height` `R8Unorm` Plane 1 alpha image into
+/// `alpha_window`, respecting `skip` mapping-offset ranges and invalidating
+/// storage residency over Plane 1.
+#[allow(clippy::too_many_arguments)]
+fn write_two_plane_alpha_vouched<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+    alpha_window: (u64, u32, u64),
+    width: u32,
+    height: u32,
+    alpha_tight: &[u8],
+    skip: SkipRanges<'_>,
+    vouched: &mapper::PagesVouched,
+) -> Result<(), (u64, usize)> {
+    let (a_off, a_bpr_u32, a_end) = alpha_window;
+    let a_tight = width as usize;
+    let a_bpr = a_bpr_u32 as usize;
+    let need_alpha = a_tight.saturating_mul(height as usize);
+    if alpha_tight.len() < need_alpha || a_bpr < a_tight {
+        return Err((a_off, need_alpha));
+    }
+    let frame_len = (height as usize)
+        .saturating_sub(1)
+        .saturating_mul(a_bpr)
+        .saturating_add(a_tight);
+    let mut frame = vec![0u8; frame_len];
+    let mut runs: Vec<(u64, u64)> = Vec::new();
+    for y in 0..height {
+        let src_off = (y as usize) * a_tight;
+        let dst_off = (y as usize) * a_bpr;
+        frame[dst_off..dst_off + a_tight].copy_from_slice(&alpha_tight[src_off..src_off + a_tight]);
+        let row_lo = a_off.saturating_add((y as u64).saturating_mul(a_bpr_u32 as u64));
+        for (lo, hi) in unskipped(row_lo, row_lo.saturating_add(a_tight as u64), skip) {
+            match runs.last_mut() {
+                Some(last) if last.1 == lo => last.1 = hi,
+                _ => runs.push((lo, hi)),
+            }
+        }
+    }
+    if !mapper::write_mapping_bytes_only(
+        state,
+        host,
+        mapping_id,
+        a_off,
+        &frame,
+        Some(&runs),
+        vouched,
+    ) {
+        return Err((a_off, frame.len()));
+    }
+    state.invalidate_storage_residency_window(mapping_id, a_off, a_end);
+    Ok(())
 }
 
 /// Revalidate + packed contig host view covering at least `span_end` bytes.
@@ -639,7 +723,7 @@ pub fn write_native_uncached<M: HostMemory + HostOps>(
     if !scanout_extent_ok(width, height) {
         return false;
     }
-    let (base_off, surface_bpr, span_end, bpp) = {
+    let (format, base_off, surface_bpr, span_end, alpha_window) = {
         let Some(m) = state.mappings.get(&mapping_id) else {
             return false;
         };
@@ -650,14 +734,96 @@ pub fn write_native_uncached<M: HostMemory + HostOps>(
         if mw != width || mh != height {
             return false;
         }
-        if pixel_format::store_texel_order(format) != Some(resident_layout) {
-            return false;
+        if pixel_format::is_xr10(format) {
+            if resident_layout != pixel_format::TexelLayout::Rgba16Float {
+                return false;
+            }
+            let Some((base_off, bpr, span_end)) = type11_sample_window(m, mw, mh, format) else {
+                return false;
+            };
+            let alpha_window = if pixel_format::is_two_plane_xr10(format) {
+                let win = two_plane_xr10_alpha_window(m, mw, mh);
+                if m.device_desc_complete().is_some() && win.is_none() {
+                    return false;
+                }
+                win
+            } else {
+                None
+            };
+            (format, base_off, bpr, span_end, alpha_window)
+        } else {
+            if pixel_format::store_texel_order(format) != Some(resident_layout) {
+                return false;
+            }
+            let Some((base_off, bpr, span_end)) = type11_sample_window(m, mw, mh, format) else {
+                return false;
+            };
+            (format, base_off, bpr, span_end, None)
         }
-        let Some((base_off, bpr, span_end)) = type11_sample_window(m, mw, mh, format) else {
+    };
+    if pixel_format::is_xr10(format) {
+        let Some(p0_bpp) = pixel_format::bytes_per_pixel(format) else {
             return false;
         };
-        (base_off, bpr, span_end, resident_layout.bytes_per_texel())
-    };
+        let Some(p0_stride) = width.checked_mul(p0_bpp) else {
+            return false;
+        };
+        let src_row_bytes = (width as usize).saturating_mul(pixel_format::RGBA16F_BPP as usize);
+        let need_src = src_row_bytes.saturating_mul(height as usize);
+        if src.len() < need_src {
+            return false;
+        }
+        let p0_row_bytes = p0_stride as usize;
+        let mut p0_tight = vec![0u8; p0_row_bytes.saturating_mul(height as usize)];
+        let mut p1_tight = alpha_window
+            .map(|_| vec![0u8; (width as usize).saturating_mul(height as usize)]);
+        for y in 0..height as usize {
+            let s = &src[y * src_row_bytes..(y + 1) * src_row_bytes];
+            let d0 = &mut p0_tight[y * p0_row_bytes..(y + 1) * p0_row_bytes];
+            let d1 = p1_tight
+                .as_mut()
+                .map(|buf| &mut buf[y * (width as usize)..(y + 1) * (width as usize)]);
+            if !pixel_format::encode_xr10_row_from_rgba16f(format, width, s, d0, d1) {
+                return false;
+            }
+        }
+        if !write_full_rect_raw_at(
+            state,
+            host,
+            mapping_id,
+            base_off,
+            surface_bpr,
+            span_end,
+            width,
+            height,
+            p0_bpp,
+            &p0_tight,
+            p0_stride,
+        ) {
+            return false;
+        }
+        if let (Some((a_off, a_bpr, a_end)), Some(p1)) = (alpha_window, p1_tight.as_deref()) {
+            if !write_full_rect_raw_at(
+                state,
+                host,
+                mapping_id,
+                a_off,
+                a_bpr,
+                a_end,
+                width,
+                height,
+                1,
+                p1,
+                width,
+            ) {
+                return false;
+            }
+        }
+        crate::runtime::surface_cache::forget(state, mapping_id);
+        crate::runtime::mapper::stamp_guest_write_gen(state, host, mapping_id);
+        return true;
+    }
+    let bpp = resident_layout.bytes_per_texel();
     let Some(src_stride) = width.checked_mul(bpp) else {
         return false;
     };
@@ -703,7 +869,7 @@ pub fn write_native_skipping<M: HostMemory + HostOps>(
     if !scanout_extent_ok(width, height) {
         return false;
     }
-    let (base_off, surface_bpr, span_end, bpp) = {
+    let (format, base_off, surface_bpr, span_end, alpha_window) = {
         let Some(m) = state.mappings.get(&mapping_id) else {
             return false;
         };
@@ -714,14 +880,119 @@ pub fn write_native_skipping<M: HostMemory + HostOps>(
         if mw != width || mh != height {
             return false;
         }
-        if pixel_format::store_texel_order(format) != Some(resident_layout) {
-            return false;
+        if pixel_format::is_xr10(format) {
+            if resident_layout != pixel_format::TexelLayout::Rgba16Float {
+                return false;
+            }
+            let Some((base_off, bpr, span_end)) = type11_sample_window(m, mw, mh, format) else {
+                return false;
+            };
+            let alpha_window = if pixel_format::is_two_plane_xr10(format) {
+                let win = two_plane_xr10_alpha_window(m, mw, mh);
+                if m.device_desc_complete().is_some() && win.is_none() {
+                    return false;
+                }
+                win
+            } else {
+                None
+            };
+            (format, base_off, bpr, span_end, alpha_window)
+        } else {
+            if pixel_format::store_texel_order(format) != Some(resident_layout) {
+                return false;
+            }
+            let Some((base_off, bpr, span_end)) = type11_sample_window(m, mw, mh, format) else {
+                return false;
+            };
+            (format, base_off, bpr, span_end, None)
         }
-        let Some((base_off, bpr, span_end)) = type11_sample_window(m, mw, mh, format) else {
+    };
+    if pixel_format::is_xr10(format) {
+        let Some(p0_bpp) = pixel_format::bytes_per_pixel(format) else {
             return false;
         };
-        (base_off, bpr, span_end, resident_layout.bytes_per_texel())
-    };
+        let p0_tight = (width as usize).saturating_mul(p0_bpp as usize);
+        let src_row_bytes = (width as usize).saturating_mul(pixel_format::RGBA16F_BPP as usize);
+        let need_src = src_row_bytes.saturating_mul(height as usize);
+        if src.len() < need_src || (surface_bpr as usize) < p0_tight {
+            return false;
+        }
+        let mut p0_encoded = vec![0u8; p0_tight.saturating_mul(height as usize)];
+        let mut p1_encoded = alpha_window
+            .map(|_| vec![0u8; (width as usize).saturating_mul(height as usize)]);
+        for y in 0..height as usize {
+            let s = &src[y * src_row_bytes..(y + 1) * src_row_bytes];
+            let d0 = &mut p0_encoded[y * p0_tight..(y + 1) * p0_tight];
+            let d1 = p1_encoded
+                .as_mut()
+                .map(|buf| &mut buf[y * (width as usize)..(y + 1) * (width as usize)]);
+            if !pixel_format::encode_xr10_row_from_rgba16f(format, width, s, d0, d1) {
+                return false;
+            }
+        }
+        crate::runtime::writeback_debt::supersede_for_mapping(
+            state,
+            mapping_id,
+            crate::runtime::render_writeback::SettleSite::MappingBgra8Write,
+        );
+        let Some(vouched) = vouch_for_write(state, host, mapping_id, "native_skip") else {
+            return false;
+        };
+        let bpr = surface_bpr as usize;
+        let frame_len = (height as usize)
+            .saturating_sub(1)
+            .saturating_mul(bpr)
+            .saturating_add(p0_tight);
+        let mut frame = vec![0u8; frame_len];
+        let mut runs: Vec<(u64, u64)> = Vec::new();
+        for y in 0..height {
+            let src_off = (y as usize) * p0_tight;
+            let dst_off = (y as usize) * bpr;
+            frame[dst_off..dst_off + p0_tight]
+                .copy_from_slice(&p0_encoded[src_off..src_off + p0_tight]);
+            let row_lo = base_off.saturating_add((y as u64).saturating_mul(surface_bpr as u64));
+            for (lo, hi) in unskipped(row_lo, row_lo.saturating_add(p0_tight as u64), skip) {
+                match runs.last_mut() {
+                    Some(last) if last.1 == lo => last.1 = hi,
+                    _ => runs.push((lo, hi)),
+                }
+            }
+        }
+        if !mapper::write_mapping_bytes_only(
+            state,
+            host,
+            mapping_id,
+            base_off,
+            &frame,
+            Some(&runs),
+            &vouched,
+        ) {
+            return false;
+        }
+        if let (Some(a_win), Some(p1)) = (alpha_window, p1_encoded.as_deref()) {
+            if write_two_plane_alpha_vouched(
+                state,
+                host,
+                mapping_id,
+                a_win,
+                width,
+                height,
+                p1,
+                skip,
+                &vouched,
+            )
+            .is_err()
+            {
+                return false;
+            }
+        }
+        state.invalidate_storage_residency_window(mapping_id, base_off, span_end);
+        let _ = state.mark_mapping_written(mapping_id);
+        crate::runtime::surface_cache::forget(state, mapping_id);
+        crate::runtime::mapper::stamp_guest_write_gen(state, host, mapping_id);
+        return true;
+    }
+    let bpp = resident_layout.bytes_per_texel();
     let tight = (width as usize).saturating_mul(bpp as usize);
     let need_src = tight.saturating_mul(height as usize);
     if src.len() < need_src || (surface_bpr as usize) < tight {
@@ -1466,6 +1737,22 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
             },
         );
     };
+    let alpha_window = if pixel_format::is_two_plane_xr10(format) {
+        let win = two_plane_xr10_alpha_window(m, mw, mh);
+        if m.device_desc_complete().is_some() && win.is_none() {
+            return refuse(
+                mapping_id,
+                SurfaceWriteRefusal::WindowUnresolved {
+                    width: mw,
+                    height: mh,
+                    format,
+                },
+            );
+        }
+        win
+    } else {
+        None
+    };
     // Deferred-writeback flush-on-access: land pending resident content in
     // these pages before touching them.
     //
@@ -1744,6 +2031,31 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
             land_started.elapsed().as_micros() as u64,
         );
     }
+    if let Some(a_win) = alpha_window {
+        let px_w = mw as usize;
+        let mut alpha_tight = vec![0u8; px_w.saturating_mul(mh as usize)];
+        for y in 0..mh as usize {
+            let src_off = y * (src_stride as usize);
+            let src_row = &src[src_off..src_off + px_w * (RGBA8_BPP as usize)];
+            let dst_row = &mut alpha_tight[y * px_w..(y + 1) * px_w];
+            for x in 0..px_w {
+                dst_row[x] = src_row[x * 4 + 3];
+            }
+        }
+        if let Err((lo, len)) = write_two_plane_alpha_vouched(
+            state,
+            host,
+            mapping_id,
+            a_win,
+            mw,
+            mh,
+            &alpha_tight,
+            skip,
+            &vouched,
+        ) {
+            return refuse(mapping_id, SurfaceWriteRefusal::MapperWrite { lo, len });
+        }
+    }
     state.invalidate_storage_residency_window(mapping_id, base_off, span_end);
     let _ = state.mark_mapping_written(mapping_id);
     if !skip.is_empty() {
@@ -1901,6 +2213,22 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
             },
         );
     };
+    let alpha_window = if pixel_format::is_two_plane_xr10(format) {
+        let win = two_plane_xr10_alpha_window(m, mw, mh);
+        if m.device_desc_complete().is_some() && win.is_none() {
+            return refuse(
+                mapping_id,
+                SurfaceWriteRefusal::WindowUnresolved {
+                    width: mw,
+                    height: mh,
+                    format,
+                },
+            );
+        }
+        win
+    } else {
+        None
+    };
     let bpr = bpr_u32 as u64;
     let Some(tight) = pixel_format::tight_row_bytes(mw, format) else {
         return refuse(mapping_id, SurfaceWriteRefusal::FormatRowLength { format });
@@ -2033,6 +2361,31 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
                     len: native.len(),
                 },
             );
+        }
+    }
+    if let Some(a_win) = alpha_window {
+        let px_w = mw as usize;
+        let mut alpha_tight = vec![0u8; px_w.saturating_mul(mh as usize)];
+        for y in 0..mh as usize {
+            let src_off = y * (rgba_stride as usize);
+            let src_row = &rgba[src_off..src_off + px_w * (RGBA8_BPP as usize)];
+            let dst_row = &mut alpha_tight[y * px_w..(y + 1) * px_w];
+            for x in 0..px_w {
+                dst_row[x] = src_row[x * 4 + 3];
+            }
+        }
+        if let Err((lo, len)) = write_two_plane_alpha_vouched(
+            state,
+            host,
+            mapping_id,
+            a_win,
+            mw,
+            mh,
+            &alpha_tight,
+            &[],
+            &vouched,
+        ) {
+            return refuse(mapping_id, SurfaceWriteRefusal::MapperWrite { lo, len });
         }
     }
     state.invalidate_storage_residency_window(mapping_id, base_off, span_end);
@@ -2342,6 +2695,112 @@ pub fn read_rect_raw<M: HostMemory + HostOps>(
         return false;
     };
     read_rect_raw_at(state, host, mapping_id, window, rect, dst, dst_stride)
+}
+
+/// Read an XR10 IOSurface (`550`/`551` two-plane, `554`/`555` `BGR10_XR`, or
+/// `558`/`559` `BGRA10_XR`) from guest pages and decode into tight `Rgba16Float`
+/// (`width * height * 8` bytes), preserving extended-range channels and Plane 1
+/// alpha.
+pub fn read_xr10_to_rgba16f<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+    width: u32,
+    height: u32,
+) -> Option<Vec<u8>> {
+    if !scanout_extent_ok(width, height) {
+        return None;
+    }
+    let _ = mapper::ensure_resolved_for_scanout(state, host, mapping_id);
+    let (format, base_off, surface_bpr, span_end, alpha_window) = {
+        let m = state.mappings.get(&mapping_id)?;
+        if !m.mapped || m.page_entries.is_empty() {
+            return None;
+        }
+        let (mw, mh, format) = mapping_write_geometry(m, width, height);
+        if mw != width || mh != height || !pixel_format::is_xr10(format) {
+            return None;
+        }
+        let (base_off, bpr, span_end) = type11_sample_window(m, mw, mh, format)?;
+        let alpha_window = if pixel_format::is_two_plane_xr10(format) {
+            let win = two_plane_xr10_alpha_window(m, mw, mh);
+            if m.device_desc_complete().is_some() && win.is_none() {
+                return None;
+            }
+            win
+        } else {
+            None
+        };
+        (format, base_off, bpr, span_end, alpha_window)
+    };
+    let p0_bpp = pixel_format::bytes_per_pixel(format)?;
+    let p0_tight = width.checked_mul(p0_bpp)?;
+    let p0_len = usize::try_from((p0_tight as u64).checked_mul(height as u64)?).ok()?;
+    let mut p0_bytes = vec![0u8; p0_len];
+    if !read_rect_raw_at(
+        state,
+        host,
+        mapping_id,
+        SurfaceWindow {
+            base_off,
+            bpr: surface_bpr,
+            span_end,
+            bpp: p0_bpp,
+        },
+        Rect {
+            origin_x: 0,
+            origin_y: 0,
+            width,
+            height,
+        },
+        &mut p0_bytes,
+        p0_tight,
+    ) {
+        return None;
+    }
+    let p1_bytes = if let Some((a_off, a_bpr, a_end)) = alpha_window {
+        let a_len = usize::try_from((width as u64).checked_mul(height as u64)?).ok()?;
+        let mut buf = vec![0u8; a_len];
+        if !read_rect_raw_at(
+            state,
+            host,
+            mapping_id,
+            SurfaceWindow {
+                base_off: a_off,
+                bpr: a_bpr,
+                span_end: a_end,
+                bpp: 1,
+            },
+            Rect {
+                origin_x: 0,
+                origin_y: 0,
+                width,
+                height,
+            },
+            &mut buf,
+            width,
+        ) {
+            return None;
+        }
+        Some(buf)
+    } else {
+        None
+    };
+    let out_row = (width as usize).checked_mul(pixel_format::RGBA16F_BPP as usize)?;
+    let out_len = out_row.checked_mul(height as usize)?;
+    let mut out = vec![0u8; out_len];
+    let p0_row = p0_tight as usize;
+    for y in 0..height as usize {
+        let s0 = &p0_bytes[y * p0_row..(y + 1) * p0_row];
+        let s1 = p1_bytes
+            .as_deref()
+            .map(|buf| &buf[y * (width as usize)..(y + 1) * (width as usize)]);
+        let dst = &mut out[y * out_row..(y + 1) * out_row];
+        if !pixel_format::decode_xr10_row_to_rgba16f(format, width, s0, s1, dst) {
+            return None;
+        }
+    }
+    Some(out)
 }
 
 /// Read a rect using an explicit sample window (plane base + bpr + span).

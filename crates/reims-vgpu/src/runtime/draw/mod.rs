@@ -6157,6 +6157,24 @@ fn load_sampled_rgba_static<M: HostMemory + HostOps>(
     // Type-11 path via resolve.
     if let Some(mid) = objects::resolve_type11_ref(state, host, task_id, texture_ref) {
         let source = mapping_declared_format(state, mid, None);
+        if native.float16 && pixel_format::is_xr10(source) {
+            let _ = mapper::ensure_resolved_for_scanout(state, host, mid);
+            let geom = state
+                .mappings
+                .get(&mid)
+                .filter(|m| m.has_geom && m.width > 0 && m.height > 0)
+                .map(|m| (m.width, m.height));
+            if let Some((w, h)) = geom {
+                if let Some(bytes) =
+                    crate::runtime::mapping_write::read_xr10_to_rgba16f(state, host, mid, w, h)
+                {
+                    return Some((
+                        bytes,
+                        SampledByteFormat::from_source(TexelLayout::Rgba16Float, source),
+                    ));
+                }
+            }
+        }
         return load_type11_mapping_rgba(state, host, mid, None)
             .map(|(_, _, r)| (r, SampledByteFormat::from_source(TexelLayout::Rgba8, source)));
     }
@@ -6252,6 +6270,147 @@ fn load_type11_rgba_memoized<M: HostMemory + HostOps>(
     };
     let identity_key = (1u64 << 63) | (1u64 << 62) | mid as u64;
     let key = (mid, w, h);
+    if native_uploads.float16 && pixel_format::is_xr10(declared_fmt) {
+        if crate::runtime::mapper::ensure_resolved_for_scanout(state, host, mid) {
+            let windows = state.mappings.get(&mid).and_then(|m| {
+                let p0 = crate::runtime::mapping_write::type11_sample_window(
+                    m,
+                    w,
+                    h,
+                    declared_fmt,
+                )?;
+                let p1 = if pixel_format::is_two_plane_xr10(declared_fmt) {
+                    let win = crate::runtime::mapping_write::two_plane_xr10_alpha_window(m, w, h);
+                    if m.device_desc_complete().is_some() && win.is_none() {
+                        return None;
+                    }
+                    win
+                } else {
+                    None
+                };
+                Some((p0, p1))
+            });
+            if let Some(((base_off, surface_bpr, span_end), alpha_window)) = windows {
+                let p0_bpp = pixel_format::bytes_per_pixel(declared_fmt)?;
+                let p0_tight = w.checked_mul(p0_bpp)?;
+                let p0_len = host_alloc_len((p0_tight as u64).checked_mul(h as u64)?)?;
+                let p1_len = if alpha_window.is_some() {
+                    host_alloc_len((w as u64).checked_mul(h as u64)?)?
+                } else {
+                    0
+                };
+                let total_native = p0_len.checked_add(p1_len)?;
+                if p0_len > 0 {
+                    let mut scratch = std::mem::take(&mut state.type11_memo_scratch);
+                    prepare_memo_scratch(&mut scratch, total_native, total_native);
+                    let mut read_ok = crate::runtime::mapping_write::read_rect_raw_at(
+                        state,
+                        host,
+                        mid,
+                        crate::runtime::mapping_write::SurfaceWindow {
+                            base_off,
+                            bpr: surface_bpr,
+                            span_end,
+                            bpp: p0_bpp,
+                        },
+                        crate::runtime::mapping_write::Rect {
+                            origin_x: 0,
+                            origin_y: 0,
+                            width: w,
+                            height: h,
+                        },
+                        &mut scratch[..p0_len],
+                        p0_tight,
+                    );
+                    if read_ok {
+                        if let Some((a_off, a_bpr, a_end)) = alpha_window {
+                            read_ok = crate::runtime::mapping_write::read_rect_raw_at(
+                                state,
+                                host,
+                                mid,
+                                crate::runtime::mapping_write::SurfaceWindow {
+                                    base_off: a_off,
+                                    bpr: a_bpr,
+                                    span_end: a_end,
+                                    bpp: 1,
+                                },
+                                crate::runtime::mapping_write::Rect {
+                                    origin_x: 0,
+                                    origin_y: 0,
+                                    width: w,
+                                    height: h,
+                                },
+                                &mut scratch[p0_len..total_native],
+                                w,
+                            );
+                        }
+                    }
+                    if read_ok {
+                        if let Some(m) = state.type11_memo.get_touch(&key) {
+                            if m.layout == crate::contract::pixel_format::TexelLayout::Rgba16Float
+                                && m.native == scratch
+                            {
+                                let rgba = m.rgba.clone();
+                                let generation = m.generation;
+                                state.type11_memo_scratch = scratch;
+                                return Some((
+                                    rgba,
+                                    LinearSampleIdentity {
+                                        key: identity_key,
+                                        generation,
+                                    },
+                                    crate::contract::pixel_format::TexelLayout::Rgba16Float,
+                                ));
+                            }
+                        }
+                        let out_row =
+                            (w as usize).checked_mul(pixel_format::RGBA16F_BPP as usize)?;
+                        let out_len = out_row.checked_mul(h as usize)?;
+                        let mut decoded = vec![0u8; out_len];
+                        let p0_row = p0_tight as usize;
+                        let decode_ok = (0..h as usize).all(|y| {
+                            let s0 = &scratch[y * p0_row..(y + 1) * p0_row];
+                            let s1 = alpha_window.map(|_| {
+                                &scratch[p0_len + y * (w as usize)..p0_len + (y + 1) * (w as usize)]
+                            });
+                            let dst = &mut decoded[y * out_row..(y + 1) * out_row];
+                            pixel_format::decode_xr10_row_to_rgba16f(
+                                declared_fmt,
+                                w,
+                                s0,
+                                s1,
+                                dst,
+                            )
+                        });
+                        if decode_ok {
+                            let payload = std::sync::Arc::new(decoded);
+                            let generation = state.next_sampled_content_generation();
+                            let entry_bytes = scratch.len() + payload.len();
+                            state.type11_memo.insert(
+                                key,
+                                crate::model::GuestLinearMemo {
+                                    native: scratch,
+                                    rgba: payload.clone(),
+                                    layout: crate::contract::pixel_format::TexelLayout::Rgba16Float,
+                                    generation,
+                                },
+                                entry_bytes,
+                            );
+                            return Some((
+                                payload,
+                                LinearSampleIdentity {
+                                    key: identity_key,
+                                    generation,
+                                },
+                                crate::contract::pixel_format::TexelLayout::Rgba16Float,
+                            ));
+                        }
+                    }
+                    state.type11_memo_scratch = scratch;
+                }
+            }
+        }
+    }
     if let Some(native_layout) = linear_native_upload_format(declared_fmt, native_uploads)
         .filter(|layout| !layout.is_four_byte_color())
     {

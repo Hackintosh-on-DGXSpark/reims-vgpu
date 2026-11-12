@@ -1023,6 +1023,16 @@ fn paint_mapping<M: HostMemory + crate::runtime::host::HostOps>(
     let Some((base_off, bpr_u32, span_end)) = type11_sample_window(m, mw, mh, format) else {
         return fail(CaptureDecline::NoSampleWindow);
     };
+    let alpha_window = if pixel_format::is_two_plane_xr10(format) {
+        let win = crate::runtime::mapping_write::two_plane_xr10_alpha_window(m, mw, mh);
+        if m.device_desc_complete().is_some() && win.is_none() {
+            return fail(CaptureDecline::NoSampleWindow);
+        }
+        win
+    } else {
+        None
+    };
+    let max_span_end = alpha_window.map_or(span_end, |(_, _, a_end)| span_end.max(a_end));
     let bpr = bpr_u32 as usize;
     if (bpr as u64) < tight as u64 {
         return fail(CaptureDecline::BprBelowTight {
@@ -1040,10 +1050,10 @@ fn paint_mapping<M: HostMemory + crate::runtime::host::HostOps>(
         if ptr == 0 {
             return fail(CaptureDecline::ContigViewNull);
         }
-        if (contig_len as u64) < span_end {
+        if (contig_len as u64) < max_span_end {
             return fail(CaptureDecline::ContigViewShort {
                 contig_len: contig_len as u64,
-                span_end,
+                span_end: max_span_end,
             });
         }
         if base_off >= span_end {
@@ -1078,8 +1088,32 @@ fn paint_mapping<M: HostMemory + crate::runtime::host::HostOps>(
     } else {
         None
     };
+    let alpha_multi = if let Some((a_off, _, a_end)) = alpha_window {
+        if a_off >= a_end {
+            return fail(CaptureDecline::BaseBeyondSpan {
+                base_off: a_off,
+                span_end: a_end,
+                contig: contig.is_some(),
+            });
+        }
+        if contig.is_none() {
+            let len = a_end.saturating_sub(a_off) as usize;
+            let mut bytes = vec![0u8; len];
+            if !crate::runtime::mapper::read_mapping_bytes(
+                state, host, mapping_id, a_off, &mut bytes,
+            ) {
+                return fail(CaptureDecline::MultiReadFailed { len });
+            }
+            Some(bytes)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     let mut src_row = vec![0u8; tight as usize];
+    let mut alpha_row = alpha_window.map(|_| vec![0u8; mw as usize]);
     let mut rgba_row = if format == MTL_FORMAT_BGRA8_UNORM
         || format == pixel_format::MTL_FORMAT_BGRA8_UNORM_SRGB
     {
@@ -1113,7 +1147,36 @@ fn paint_mapping<M: HostMemory + crate::runtime::host::HostOps>(
                 return fail(CaptureDecline::ConvertRowMissing { row: y });
             }
             let dst_row = &mut dst[dst_off..dst_off + dst_row_len];
-            if !convert_row_to_rgba8(format, &src_row[..tight as usize], mw, rgba) {
+            let converted = if let (Some((a_off, a_bpr, _)), Some(a_row)) =
+                (alpha_window, alpha_row.as_mut())
+            {
+                let a_src_off = (y as usize).saturating_mul(a_bpr as usize);
+                let px_w = mw as usize;
+                if let Some((ptr, _)) = contig {
+                    let src_a = unsafe { (ptr as *const u8).add(a_off as usize + a_src_off) };
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(src_a, a_row.as_mut_ptr(), px_w);
+                    }
+                } else if let Some(a_bytes) = alpha_multi.as_ref() {
+                    let end = a_src_off.saturating_add(px_w);
+                    let Some(row) = a_bytes.get(a_src_off..end) else {
+                        return fail(CaptureDecline::ConvertRowOob { row: y });
+                    };
+                    a_row.copy_from_slice(row);
+                } else {
+                    return fail(CaptureDecline::ConvertRowMissing { row: y });
+                }
+                pixel_format::decode_xr10_row_to_rgba8(
+                    format,
+                    mw,
+                    &src_row[..tight as usize],
+                    Some(a_row.as_slice()),
+                    rgba,
+                )
+            } else {
+                convert_row_to_rgba8(format, &src_row[..tight as usize], mw, rgba)
+            };
+            if !converted {
                 return fail(CaptureDecline::ConvertToRgba { format });
             }
             if !convert_rgba8_to_row(MTL_FORMAT_BGRA8_UNORM, rgba, mw, dst_row) {

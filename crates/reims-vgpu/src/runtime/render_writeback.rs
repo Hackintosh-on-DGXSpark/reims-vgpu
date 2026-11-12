@@ -949,8 +949,7 @@ pub fn store_render_frame<M: HostMemory + HostOps>(
                 .mappings
                 .get(&mapping_id)
                 .map(crate::runtime::mapping_write::mapping_store_format)
-                .and_then(crate::contract::pixel_format::store_texel_order)
-                .filter(|layout| !layout.is_four_byte_color());
+                .and_then(crate::runtime::mapping_write::mapping_native_resident_layout);
             if let Some(expected_layout) = native_layout {
                 if let Ok(rb) = crate::backend::vulkan::engine::read_target_native(identity) {
                     if rb.layout == expected_layout {
