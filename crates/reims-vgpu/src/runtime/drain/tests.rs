@@ -6788,3 +6788,49 @@ fn the_mapper_ring_backlog_names_an_overrun_and_a_consumer_ahead() {
     assert_eq!(ring_backlog(10, 4, 4), RingBacklog::Overrun { lost: 2 });
     assert_eq!(ring_backlog(3, 4, 4), RingBacklog::ConsumerAhead);
 }
+
+#[test]
+fn set_object_list_converts_wire_byte_length_to_12_byte_slot_count() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    state.define_task(3, 0x1000, 1);
+
+    let mut root_payload = Vec::with_capacity(12);
+    root_payload.extend_from_slice(&3u32.to_le_bytes());
+    root_payload.extend_from_slice(&0x1u32.to_le_bytes());
+    root_payload.extend_from_slice(&49_152u32.to_le_bytes());
+    process_root_packet(
+        &mut state,
+        &mut host,
+        &Packet {
+            opcode: ROOT_OP_SET_OBJECT_LIST,
+            stamp_waits: Vec::new(),
+            total_size: PACKET_HEADER_LEN + 12,
+            completion_stamp: 0,
+            payload: root_payload,
+            next_head: 0,
+        },
+    );
+    assert_eq!(state.tasks[3].object_list_pfn, 0x1);
+    assert_eq!(state.tasks[3].object_list_count, 4096);
+
+    let mut child_payload = Vec::with_capacity(12);
+    child_payload.extend_from_slice(&3u32.to_le_bytes());
+    child_payload.extend_from_slice(&0x914u32.to_le_bytes());
+    child_payload.extend_from_slice(&98_304u32.to_le_bytes());
+    process_child_packet(
+        &mut state,
+        &mut host,
+        2,
+        &Packet {
+            opcode: CHILD_OP_SET_OBJECT_LIST,
+            stamp_waits: Vec::new(),
+            total_size: PACKET_HEADER_LEN + 12,
+            completion_stamp: 0,
+            payload: child_payload,
+            next_head: 0,
+        },
+    );
+    assert_eq!(state.tasks[3].object_list_pfn, 0x914);
+    assert_eq!(state.tasks[3].object_list_count, 8192);
+}

@@ -511,7 +511,13 @@ fn apply_set_object_list(state: &mut DeviceState, payload: &[u8], channel: Optio
     }
     let task_id = ld32(&payload[SET_OBJECT_LIST_TASK_ID..]);
     let pfn = ld32(&payload[SET_OBJECT_LIST_PFN..]);
-    let count = ld32(&payload[SET_OBJECT_LIST_COUNT..]);
+    // Wire `+0x08` carries the object-list allocation's byte length
+    // (`49_152` = 3 × 16 KiB = 4 096 × 12 B on arm64, growing to `98_304` =
+    // 8 192 × 12 B; `1_048_576` = 1 MiB = 87 381 × 12 B on x86), not an entry
+    // count. Converting to 12-byte slots bounds speculative probes to the
+    // mapped list allocation instead of walking 12× past its end.
+    let byte_len = ld32(&payload[SET_OBJECT_LIST_COUNT..]);
+    let count = byte_len / (crate::runtime::decode::resource::OBJECT_LIST_ENTRY_LEN as u32);
     // A new object list changes the construction input for references this
     // device has not constructed yet. Exact-window buffer resolutions are not
     // object states and therefore retire here. Typed objects already
@@ -529,7 +535,7 @@ fn apply_set_object_list(state: &mut DeviceState, payload: &[u8], channel: Optio
         (u64::from(task_id) << 48) ^ (u64::from(pfn) << 24) ^ u64::from(count),
     ) {
         crate::observe::off(format!(
-            "set_object_list site={} task={task_id} pfn={pfn:#x} count={count} \
+            "set_object_list site={} task={task_id} pfn={pfn:#x} bytes={byte_len} count={count} \
              applied={} plen={}",
             packet_site(channel),
             applied as u8,

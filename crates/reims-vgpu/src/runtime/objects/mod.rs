@@ -2296,6 +2296,40 @@ fn apply_type4_backing<M: HostMemory>(
     true
 }
 
+/// Whether `ref_` in `task_id` can directly name a type-4 surface id.
+///
+/// A slot in `task_id` that already holds a non-surface task-local resource
+/// (e.g. a type-2/3/12/16 GVA texture, buffer, or memoryless target) is never a
+/// global `surface_id` in another task's heap. Skipping the cross-task type-4
+/// search in that case avoids probing every live task's object list on ordinary
+/// GVA texture binds and attachments. When `task_id` has no entry at `ref_`,
+/// `true` keeps the search open for callers naming a bare `surface_id` owned by
+/// task 0.
+pub fn ref_may_name_type4_surface<M: HostMemory>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    ref_: u32,
+) -> bool {
+    if !crate::model::is_mapping_id(ref_) {
+        return false;
+    }
+    let obj_type = state
+        .task_resources
+        .get(task_id, ref_)
+        .map(|r| r.entry.object_type)
+        .or_else(|| probe_list_entry(state, host, task_id, ref_).map(|e| e.object_type));
+    match obj_type {
+        None => true,
+        Some(
+            OBJECT_TYPE_SURFACE
+            | OBJECT_TYPE_REF_TEXTURE
+            | crate::runtime::decode::resource::OBJECT_TYPE_TEXTURE_VIEW,
+        ) => true,
+        Some(_) => false,
+    }
+}
+
 /// Resolve present `surface_id` to type-4 backing pages + geometry.
 ///
 /// Scans active tasks: object-list slot `surface_id` must be type-4 (heap is

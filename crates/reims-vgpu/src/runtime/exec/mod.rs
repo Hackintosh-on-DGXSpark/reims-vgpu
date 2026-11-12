@@ -1969,7 +1969,9 @@ fn handle_render_record<M: HostMemory + HostOps>(
                         if !out.type11_mappings.contains(&m) {
                             out.type11_mappings.push(m);
                         }
-                    } else if objects::resolve_type4_surface(state, host, texture_ref) {
+                    } else if objects::ref_may_name_type4_surface(state, host, task_id, texture_ref)
+                        && objects::resolve_type4_surface(state, host, texture_ref)
+                    {
                         // x86 type-4: object ref is surface_id / mapping_id.
                         if !out.type11_mappings.contains(&texture_ref) {
                             out.type11_mappings.push(texture_ref);
@@ -2218,7 +2220,13 @@ fn handle_render_record<M: HostMemory + HostOps>(
                         if !out.type11_mappings.contains(&m) {
                             out.type11_mappings.push(m);
                         }
-                    } else if objects::resolve_type4_surface(state, host, published_ref) {
+                    } else if objects::ref_may_name_type4_surface(
+                        state,
+                        host,
+                        task_id,
+                        published_ref,
+                    ) && objects::resolve_type4_surface(state, host, published_ref)
+                    {
                         // A type-4 attachment is its own mapping id — the arm
                         // below pushes `att.texture_ref` where the type-11 arm
                         // pushes the id it resolved to.
@@ -4302,7 +4310,9 @@ fn dirty_color_targets<M: HostMemory + HostOps>(
             // The guest pages are the only copy of a type-11 surface, so there
             // is no mirror to drop — only bump gen for scanout skips.
             let _ = state.mark_mapping_written(mid);
-        } else if objects::resolve_type4_surface(state, host, tex_ref) {
+        } else if objects::ref_may_name_type4_surface(state, host, task_id, tex_ref)
+            && objects::resolve_type4_surface(state, host, tex_ref)
+        {
             let _ = state.mark_mapping_written(tex_ref);
         }
     }
