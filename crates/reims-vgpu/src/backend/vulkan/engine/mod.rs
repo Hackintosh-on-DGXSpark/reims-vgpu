@@ -2383,19 +2383,24 @@ pub fn max_render_target_dimension() -> u32 {
 /// What this Vulkan device can execute, for the GPU-dependent half of the
 /// guest's device-info reply.
 ///
-/// Before a device is resolved the answer is the Vulkan 1.2 floor rather than
-/// the reply table's own values: the served reply is only ever *reduced* by
-/// this, so a boot that answers before the device is up must not be the one
-/// that promises the most.
+/// The device is brought up here if no draw has done it yet. The guest asks
+/// once, about four seconds into boot, before any draw. Answering from
+/// whatever context happened to exist served the Vulkan 1.2 floor on every
+/// boot: one sample, no D24S8, 128 threads, 16 KiB of threadgroup memory and
+/// no native FP16. The guest keeps that answer for the life of the boot, so
+/// it was told it ran on a far smaller GPU than the one doing the work.
+///
+/// The floor is still the answer when the device cannot be created: the served
+/// reply is only ever *reduced* by this, so a host that cannot say must not be
+/// the one that promises the most.
 pub fn device_info_limits() -> crate::model::DeviceInfoLimits {
     use crate::backend::vulkan::caps::device_features::{
         VULKAN_MIN_COMPUTE_SHARED_MEMORY_BYTES, VULKAN_MIN_COMPUTE_WORKGROUP_SIZE,
     };
-    lock_engine()
-        .owner
-        .ctx
-        .as_ref()
-        .map(|ctx| crate::model::DeviceInfoLimits {
+    let mut guard = lock_engine();
+    let engine = &mut *guard;
+    match engine.owner.ensure(&engine.counters) {
+        Ok(ctx) => crate::model::DeviceInfoLimits {
             max_sample_count: ctx.features.max_sample_count,
             d24_stencil8: ctx.features.d24_unorm_s8_attachment,
             max_threads_per_threadgroup: ctx.features.max_compute_workgroup_size,
@@ -2407,14 +2412,15 @@ pub fn device_info_limits() -> crate::model::DeviceInfoLimits {
             // let the Apple plugin choose its non-native-FP16 path.
             native_fp16: ctx.features.float16
                 && ctx.caps.device_type != ash::vk::PhysicalDeviceType::CPU,
-        })
-        .unwrap_or(crate::model::DeviceInfoLimits {
+        },
+        Err(_) => crate::model::DeviceInfoLimits {
             max_sample_count: 1,
             d24_stencil8: false,
             max_threads_per_threadgroup: VULKAN_MIN_COMPUTE_WORKGROUP_SIZE,
             max_threadgroup_memory_bytes: VULKAN_MIN_COMPUTE_SHARED_MEMORY_BYTES,
             native_fp16: false,
-        })
+        },
+    }
 }
 
 /// `(maxTotalThreadsPerThreadgroup, threadExecutionWidth)` for this host, as
