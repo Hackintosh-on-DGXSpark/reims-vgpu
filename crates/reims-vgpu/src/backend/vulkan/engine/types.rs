@@ -849,6 +849,10 @@ impl PrimitiveTopology {
     pub(crate) fn vk(self) -> vk::PrimitiveTopology {
         translate::raster::vk_topology(self)
     }
+
+    pub(crate) fn primitive_restart(self) -> bool {
+        translate::raster::primitive_restart(self)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]

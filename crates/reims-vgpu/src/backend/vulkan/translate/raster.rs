@@ -118,6 +118,22 @@ pub fn vk_topology(topology: PrimitiveTopology) -> vk::PrimitiveTopology {
     }
 }
 
+/// Whether Metal unconditionally enables primitive restart (`0xFFFF` for `U16`,
+/// `0xFFFFFFFF` for `U32`) on indexed draws of this topology.
+///
+/// Metal has no state toggle for primitive restart: it is always active on
+/// `MTLPrimitiveTypeLineStrip` and `MTLPrimitiveTypeTriangleStrip`, and never
+/// on list topologies. That matches Vulkan 1.0 core
+/// (`VUID-VkPipelineInputAssemblyStateCreateInfo-topology-00428`), which allows
+/// `primitiveRestartEnable` on strip topologies without any optional device
+/// feature and ignores it on non-indexed draws.
+pub fn primitive_restart(topology: PrimitiveTopology) -> bool {
+    match topology {
+        PrimitiveTopology::LineStrip | PrimitiveTopology::TriangleStrip => true,
+        PrimitiveTopology::Point | PrimitiveTopology::Line | PrimitiveTopology::Triangle => false,
+    }
+}
+
 pub fn vk_compare_op(compare: SamplerCompareFunction) -> vk::CompareOp {
     match compare {
         SamplerCompareFunction::Never => vk::CompareOp::NEVER,
@@ -484,5 +500,14 @@ mod tests {
         assert_eq!(index_type(2), None);
         assert_eq!(vk_index_type(IndexType::U16), vk::IndexType::UINT16);
         assert_eq!(vk_index_type(IndexType::U32), vk::IndexType::UINT32);
+    }
+
+    #[test]
+    fn primitive_restart_is_enabled_on_strip_topologies_only() {
+        assert!(!primitive_restart(PrimitiveTopology::Point));
+        assert!(!primitive_restart(PrimitiveTopology::Line));
+        assert!(primitive_restart(PrimitiveTopology::LineStrip));
+        assert!(!primitive_restart(PrimitiveTopology::Triangle));
+        assert!(primitive_restart(PrimitiveTopology::TriangleStrip));
     }
 }

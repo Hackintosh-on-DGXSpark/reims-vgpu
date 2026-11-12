@@ -2828,8 +2828,9 @@ pub(crate) unsafe fn create_graphics_pipeline(
     if !vertex_binding_divisors.is_empty() {
         vtx_input = vtx_input.push_next(&mut vertex_divisor_state);
     }
-    let input_asm =
-        vk::PipelineInputAssemblyStateCreateInfo::default().topology(key.topology.vk());
+    let input_asm = vk::PipelineInputAssemblyStateCreateInfo::default()
+        .topology(key.topology.vk())
+        .primitive_restart_enable(key.topology.primitive_restart());
     // Dynamic viewport/scissor so L5 key need not include extent (flip flag is static).
     // Stencil reference is dynamic (Metal's `SetStencilReferenceValue` is a
     // command distinct from the state object) so distinct references reuse

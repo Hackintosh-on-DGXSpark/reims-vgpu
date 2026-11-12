@@ -408,3 +408,92 @@ fn with_the_switch_off_a_cold_pipeline_is_built_inside_its_draw() {
     assert_eq!(CENSUS.jobs.load(Ordering::Relaxed), jobs_before + 1);
     assert_eq!(CENSUS.in_draw.load(Ordering::Relaxed), in_draw_before + 1);
 }
+
+/// Indexed `TriangleStrip` draws split multiple quads with Metal's `0xFFFF`
+/// (`U16`) and `0xFFFFFFFF` (`U32`) primitive-restart sentinels (e.g. RenderBox
+/// `path_exterior_vertex` 13-quad / 64-index strips). Vertices `0..4` cover
+/// `x in [-1.0, -0.5]`, vertices `4..8` cover `x in [0.5, 1.0]`, and any
+/// out-of-bounds index (`>= 8`, including `0xFFFF` / `0xFFFFFFFF` if restart
+/// were left disabled) emits `(0.0, 0.0)` in the centre gap.
+const STRIP_RESTART_VERT: [u32; 199] = [
+    0x07230203, 0x00010500, 0x00070000, 0x00000026, 0x00000000, 0x00020011, 0x00000001, 0x0003000e,
+    0x00000000, 0x00000000, 0x0007000f, 0x00000000, 0x00000001, 0x6e69616d, 0x00000000, 0x00000002,
+    0x00000003, 0x00040047, 0x00000002, 0x0000000b, 0x0000002a, 0x00040047, 0x00000003, 0x0000000b,
+    0x00000000, 0x00020013, 0x00000004, 0x00030021, 0x00000005, 0x00000004, 0x00040015, 0x00000006,
+    0x00000020, 0x00000000, 0x00020014, 0x00000007, 0x00030016, 0x00000008, 0x00000020, 0x00040017,
+    0x00000009, 0x00000008, 0x00000004, 0x00040020, 0x0000000a, 0x00000001, 0x00000006, 0x00040020,
+    0x0000000b, 0x00000003, 0x00000009, 0x0004003b, 0x0000000a, 0x00000002, 0x00000001, 0x0004003b,
+    0x0000000b, 0x00000003, 0x00000003, 0x0004002b, 0x00000006, 0x0000000c, 0x00000001, 0x0004002b,
+    0x00000006, 0x0000000d, 0x00000002, 0x0004002b, 0x00000006, 0x0000000e, 0x00000004, 0x0004002b,
+    0x00000006, 0x0000000f, 0x00000008, 0x0004002b, 0x00000008, 0x00000010, 0x00000000, 0x0004002b,
+    0x00000008, 0x00000011, 0x3f800000, 0x0004002b, 0x00000008, 0x00000012, 0xbf800000, 0x0004002b,
+    0x00000008, 0x00000013, 0xbf000000, 0x0004002b, 0x00000008, 0x00000014, 0x3f000000, 0x0007002c,
+    0x00000009, 0x00000015, 0x00000010, 0x00000010, 0x00000010, 0x00000011, 0x00050036, 0x00000004,
+    0x00000001, 0x00000000, 0x00000005, 0x000200f8, 0x00000016, 0x0004003d, 0x00000006, 0x00000017,
+    0x00000002, 0x000500ae, 0x00000007, 0x00000018, 0x00000017, 0x0000000f, 0x000300f7, 0x00000019,
+    0x00000000, 0x000400fa, 0x00000018, 0x0000001a, 0x0000001b, 0x000200f8, 0x0000001a, 0x0003003e,
+    0x00000003, 0x00000015, 0x000200f9, 0x00000019, 0x000200f8, 0x0000001b, 0x000500ae, 0x00000007,
+    0x0000001c, 0x00000017, 0x0000000e, 0x000600a9, 0x00000008, 0x0000001d, 0x0000001c, 0x00000014,
+    0x00000012, 0x000600a9, 0x00000008, 0x0000001e, 0x0000001c, 0x00000011, 0x00000013, 0x000500c7,
+    0x00000006, 0x0000001f, 0x00000017, 0x0000000c, 0x000500ab, 0x00000007, 0x00000020, 0x0000001f,
+    0x0000000c, 0x000600a9, 0x00000008, 0x00000021, 0x00000020, 0x0000001d, 0x0000001e, 0x000500c7,
+    0x00000006, 0x00000022, 0x00000017, 0x0000000d, 0x000500ab, 0x00000007, 0x00000023, 0x00000022,
+    0x0000000d, 0x000600a9, 0x00000008, 0x00000024, 0x00000023, 0x00000012, 0x00000011, 0x00070050,
+    0x00000009, 0x00000025, 0x00000021, 0x00000024, 0x00000010, 0x00000011, 0x0003003e, 0x00000003,
+    0x00000025, 0x000200f9, 0x00000019, 0x000200f8, 0x00000019, 0x000100fd, 0x00010038,
+];
+
+#[test]
+fn indexed_triangle_strip_restarts_on_u16_and_u32_sentinels() {
+    use crate::backend::vulkan::engine::{BufferContent, IndexType, IndexedDrawResource};
+
+    crate::observe::redirect_logs_for_tests();
+    let vert = Arc::new(STRIP_RESTART_VERT.to_vec());
+    let frag = frag_variant(42);
+
+    let u16_indices: [u16; 9] = [0, 1, 2, 3, 0xFFFF, 4, 5, 6, 7];
+    let mut u16_bytes = Vec::with_capacity(18);
+    for idx in u16_indices {
+        u16_bytes.extend_from_slice(&idx.to_le_bytes());
+    }
+    let u32_indices: [u32; 9] = [0, 1, 2, 3, 0xFFFF_FFFF, 4, 5, 6, 7];
+    let mut u32_bytes = Vec::with_capacity(36);
+    for idx in u32_indices {
+        u32_bytes.extend_from_slice(&idx.to_le_bytes());
+    }
+
+    for (index_type, raw) in [(IndexType::U16, u16_bytes), (IndexType::U32, u32_bytes)] {
+        let req = DrawRequest {
+            vert_spirv: Arc::clone(&vert),
+            frag_spirv: Arc::clone(&frag),
+            width: 8,
+            height: 4,
+            instance_count: Some(1),
+            primitive_topology: PrimitiveTopology::TriangleStrip,
+            indexed: Some(IndexedDrawResource {
+                index_type,
+                index_count: 9,
+                vertex_offset: 0,
+                content: BufferContent::Bytes(Arc::new(raw)),
+            }),
+            ..Default::default()
+        };
+        let pixels = match super::super::execute_draw_request_blocking(&req) {
+            Ok(out) => out.pixels,
+            Err(DrawError::Init(_)) => return,
+            Err(e) => panic!("indexed strip draw failed ({index_type:?}): {e}"),
+        };
+        let alpha_at = |x: usize, y: usize| pixels[(y * 8 + x) * 4 + 3];
+        assert_eq!(alpha_at(0, 2), 255, "left quad must cover x=0 ({index_type:?})");
+        assert_eq!(alpha_at(1, 2), 255, "left quad must cover x=1 ({index_type:?})");
+        for gap_x in 2..6 {
+            assert_eq!(
+                alpha_at(gap_x, 2),
+                0,
+                "gap x={gap_x} bridged across restart sentinel ({index_type:?})"
+            );
+        }
+        assert_eq!(alpha_at(6, 2), 255, "right quad must cover x=6 ({index_type:?})");
+        assert_eq!(alpha_at(7, 2), 255, "right quad must cover x=7 ({index_type:?})");
+    }
+}
