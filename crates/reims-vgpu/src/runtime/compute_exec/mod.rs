@@ -2415,8 +2415,9 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
         let mut bytes = vec![0u8; need];
         let from_resident = serve.is_none()
             && !is_storage
-            && condemned_type11_resident(
+            && current_type11_resident(
                 state,
+                host,
                 mapping_id,
                 surface_offset,
                 surface_bpr,
@@ -3273,20 +3274,27 @@ fn mapping_geom_format(
 }
 
 /// A sampled type-11 window read back from the surface's resident, when the
-/// wire guard has condemned the surface's guest pages. `true` when `out` was
-/// filled.
+/// resident is the newest copy. `true` when `out` was filled.
 ///
-/// Condemned pages belong to another surface, so reading them fails, and the
-/// draw rail already binds the resident in their place
-/// (`condemned_sampled_source`). Compute did not. macOS 27 captures each
-/// Liquid Glass backdrop with a kernel sampling the display surface being
-/// composed, and when that surface's pages were condemned every capture failed:
-/// the dispatches were dropped and the glass drew black. Only a ready device
-/// allocation counts, as on the draw rail.
+/// The draw rail's rule, applied to compute. The draw rail binds a ready
+/// resident unless the hypervisor saw the guest write the surface's pages since
+/// the Store that stamped them (`t11rung_resident`), and binds it whatever the
+/// verdict once the wire guard has condemned the pages, which then belong to
+/// another surface (`condemned_sampled_source`). Compute read the pages.
+///
+/// macOS 27 captures each Liquid Glass backdrop with a kernel sampling the
+/// display surface being composed, after the draws beneath the glass. Those
+/// draws are in the resident and not yet in the pages. Read from the pages,
+/// the capture behind a window held the wallpaper instead of the window's own
+/// background, so the window's glass rim was tinted by the wallpaper and met
+/// its white content in a hard seam; where the pages were condemned the read
+/// failed and the dispatch was dropped. Only a ready device allocation counts,
+/// as on the draw rail.
 #[cfg(feature = "backend-vulkan")]
 #[allow(clippy::too_many_arguments)]
-fn condemned_type11_resident(
+fn current_type11_resident<M: HostMemory + HostOps>(
     state: &DeviceState,
+    host: &M,
     mapping_id: u32,
     surface_offset: u64,
     surface_bpr: u32,
@@ -3296,7 +3304,11 @@ fn condemned_type11_resident(
     out: &mut [u8],
 ) -> bool {
     use crate::backend::vulkan::engine::{self as vk_engine, ResidentContentBacking};
-    if !crate::runtime::mapper::wire_watch::guest_pages_condemned(state, mapping_id) {
+    use crate::runtime::mapper::{mapping_guest_write_verdict, GuestWriteVerdict};
+    let condemned = crate::runtime::mapper::wire_watch::guest_pages_condemned(state, mapping_id);
+    if !condemned
+        && mapping_guest_write_verdict(state, host, mapping_id) == GuestWriteVerdict::Wrote
+    {
         return false;
     }
     if surface_bpr == 0 || bpp == 0 || tight == 0 {
@@ -3334,14 +3346,19 @@ fn condemned_type11_resident(
         };
         dst.copy_from_slice(src);
     }
-    crate::runtime::drain::note_store_route("compute_t11_condemned_resident");
+    crate::runtime::drain::note_store_route(if condemned {
+        "compute_t11_condemned_resident"
+    } else {
+        "compute_t11_resident"
+    });
     true
 }
 
 #[cfg(not(feature = "backend-vulkan"))]
 #[allow(clippy::too_many_arguments)]
-fn condemned_type11_resident(
+fn current_type11_resident<M: HostMemory + HostOps>(
     _state: &DeviceState,
+    _host: &M,
     _mapping_id: u32,
     _surface_offset: u64,
     _surface_bpr: u32,
