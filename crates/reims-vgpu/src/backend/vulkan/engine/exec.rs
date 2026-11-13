@@ -2056,11 +2056,13 @@ unsafe fn upload_buffer_to_sampled_image(
     array_layers: u32,
     extent_depth: u32,
     row_length_texels: u32,
+    mip_levels: u32,
 ) {
+    let mip_levels = mip_levels.max(1);
     let range = vk::ImageSubresourceRange {
         aspect_mask: vk::ImageAspectFlags::COLOR,
         base_mip_level: 0,
-        level_count: 1,
+        level_count: mip_levels,
         base_array_layer: 0,
         layer_count: array_layers,
     };
@@ -2101,13 +2103,76 @@ unsafe fn upload_buffer_to_sampled_image(
         vk::ImageLayout::TRANSFER_DST_OPTIMAL,
         &copy,
     );
-    let to_shader = [vk::ImageMemoryBarrier::default()
+    // Each level above 0 is the one below it halved with a linear blit. The
+    // source level moves to TRANSFER_SRC before its blit; the last level
+    // stays TRANSFER_DST, so the two groups leave for the shader separately.
+    let level = |base_mip_level, level_count| vk::ImageSubresourceRange {
+        base_mip_level,
+        level_count,
+        ..range
+    };
+    for dst in 1..mip_levels {
+        let to_source = [vk::ImageMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+            .image(image)
+            .subresource_range(level(dst - 1, 1))];
+        ctx.device.cmd_pipeline_barrier(
+            cb,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &to_source,
+        );
+        let corner = |mip: u32| vk::Offset3D {
+            x: (width >> mip).max(1) as i32,
+            y: (height >> mip).max(1) as i32,
+            z: 1,
+        };
+        let layers = |mip_level| vk::ImageSubresourceLayers {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            mip_level,
+            base_array_layer: 0,
+            layer_count: array_layers,
+        };
+        let blit = [vk::ImageBlit::default()
+            .src_subresource(layers(dst - 1))
+            .src_offsets([vk::Offset3D::default(), corner(dst - 1)])
+            .dst_subresource(layers(dst))
+            .dst_offsets([vk::Offset3D::default(), corner(dst)])];
+        ctx.device.cmd_blit_image(
+            cb,
+            image,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &blit,
+            vk::Filter::LINEAR,
+        );
+    }
+    let last = mip_levels - 1;
+    let mut to_shader = vec![vk::ImageMemoryBarrier::default()
         .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
         .dst_access_mask(vk::AccessFlags::SHADER_READ)
         .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
         .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
         .image(image)
-        .subresource_range(range)];
+        .subresource_range(level(last, 1))];
+    if last > 0 {
+        to_shader.push(
+            vk::ImageMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_READ)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .image(image)
+                .subresource_range(level(0, last)),
+        );
+    }
     ctx.device.cmd_pipeline_barrier(
         cb,
         vk::PipelineStageFlags::TRANSFER,
@@ -4766,6 +4831,7 @@ pub(crate) unsafe fn execute_draw_inner(
             if *volume { 1 } else { *layers },
             if *volume { *layers } else { 1 },
             0,
+            img.mip_levels,
         );
     }
 
@@ -4963,6 +5029,7 @@ pub(crate) unsafe fn execute_draw_inner(
             if *volume { 1 } else { *layers },
             if *volume { *layers } else { 1 },
             *row_length_texels,
+            1,
         );
     }
 
@@ -7222,6 +7289,7 @@ mod tests {
                 width: w,
                 height: h,
                 layers: 1,
+                mip_levels: 1,
                 arrayed: false,
                 volume: false,
                 cube: false,
@@ -7325,6 +7393,7 @@ mod tests {
             width: 16,
             height: 16,
             layers: 1,
+            mip_levels: 1,
             arrayed: false,
             volume: false,
             cube: false,

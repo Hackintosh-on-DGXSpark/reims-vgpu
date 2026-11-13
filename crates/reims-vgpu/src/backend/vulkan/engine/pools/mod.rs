@@ -1216,6 +1216,7 @@ pub(crate) struct SampledSlot {
     pub width: u32,
     pub height: u32,
     pub layers: u32,
+    pub mip_levels: u32,
     pub volume: bool,
     pub cube: bool,
     pub arrayed: bool,
@@ -1282,6 +1283,7 @@ pub(crate) struct SampledKey {
     pub(crate) width: u32,
     pub(crate) height: u32,
     pub(crate) layers: u32,
+    pub(crate) mip_levels: u32,
     pub(crate) volume: bool,
     pub(crate) cube: bool,
     pub(crate) arrayed: bool,
@@ -1303,6 +1305,7 @@ impl SampledKey {
             width: r.width,
             height: r.height,
             layers: r.layers,
+            mip_levels: r.mip_levels.max(1),
             volume: r.volume,
             cube: r.cube,
             arrayed: r.arrayed,
@@ -1333,6 +1336,7 @@ impl SampledSlot {
             width: self.width,
             height: self.height,
             layers: self.layers,
+            mip_levels: self.mip_levels,
             volume: self.volume,
             cube: self.cube,
             arrayed: self.arrayed,
@@ -1355,6 +1359,7 @@ impl SampledSlot {
             width: self.width,
             height: self.height,
             layers: self.layers,
+            mip_levels: self.mip_levels,
             volume: self.volume,
             cube: self.cube,
             arrayed: self.arrayed,
@@ -3293,6 +3298,7 @@ mod sampled_key_tests {
             width: 7,
             height: 5,
             layers: 3,
+            mip_levels: 1,
             arrayed,
             volume,
             cube,
@@ -3304,6 +3310,16 @@ mod sampled_key_tests {
             identity: None,
             swizzle: SwizzlePlan::default(),
         }
+    }
+
+    /// A resource that names no mip levels still gets an image with one.
+    #[test]
+    fn a_sampled_key_has_at_least_one_mip_level() {
+        let mut r = resource(false, false, false, false);
+        r.mip_levels = 0;
+        assert_eq!(SampledKey::of(&r).mip_levels, 1);
+        r.mip_levels = 5;
+        assert_eq!(SampledKey::of(&r).mip_levels, 5);
     }
 
     /// Each shape flag reaches the key field of its own name.

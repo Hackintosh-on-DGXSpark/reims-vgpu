@@ -1703,6 +1703,7 @@ pub(crate) struct HeapTexture {
     pub format: u16,
     pub sample_count: u32,
     pub texture_type: u8,
+    pub mip_levels: u32,
 }
 
 /// The heap texture a type-8 descriptor creates, or `None` for any other record.
@@ -1724,6 +1725,7 @@ pub(crate) fn heap_texture_of(desc: &[u8]) -> Option<HeapTexture> {
         format: body.pixel_format,
         sample_count: u32::from(body.sample_count.max(1)),
         texture_type: body.texture_type,
+        mip_levels: u32::from(body.mipmap_level_count).max(1),
     })
 }
 

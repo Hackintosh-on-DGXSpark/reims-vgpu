@@ -1115,6 +1115,11 @@ pub struct SampledImageResource {
     pub width: u32,
     pub height: u32,
     pub layers: u32,
+    /// Mip levels the image is created with. Level 0 is uploaded and the rest
+    /// are generated from it with linear blits. 1 for every bind but a sampled
+    /// snapshot of a mipmapped heap texture, whose higher levels no kernel here
+    /// writes.
+    pub mip_levels: u32,
     pub arrayed: bool,
     pub volume: bool,
     pub cube: bool,

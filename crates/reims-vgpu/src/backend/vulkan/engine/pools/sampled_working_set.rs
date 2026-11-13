@@ -144,6 +144,7 @@ mod tests {
             width: 64,
             height: 64,
             layers: 1,
+            mip_levels: 1,
             volume: false,
             cube: false,
             arrayed: false,
