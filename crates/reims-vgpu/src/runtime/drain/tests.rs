@@ -6834,3 +6834,34 @@ fn set_object_list_converts_wire_byte_length_to_12_byte_slot_count() {
     assert_eq!(state.tasks[3].object_list_pfn, 0x914);
     assert_eq!(state.tasks[3].object_list_count, 8192);
 }
+
+/// macOS 27's `0x44` names the same object list by task GVA; the payload
+/// below is the first one a 27.2 boot sent for task 1.
+#[test]
+fn set_object_list2_applies_its_first_list_like_set_object_list() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    state.define_task(1, 0x1000, 1);
+
+    let mut payload = Vec::with_capacity(SET_OBJECT_LIST2_LEN);
+    payload.extend_from_slice(&1u32.to_le_bytes());
+    payload.extend_from_slice(&0x4000u64.to_le_bytes());
+    payload.extend_from_slice(&0x10_4000u64.to_le_bytes());
+    payload.extend_from_slice(&0xc000u32.to_le_bytes());
+    payload.extend_from_slice(&0x1_0000u32.to_le_bytes());
+    process_child_packet(
+        &mut state,
+        &mut host,
+        2,
+        &Packet {
+            opcode: CHILD_OP_SET_OBJECT_LIST2,
+            stamp_waits: Vec::new(),
+            total_size: PACKET_HEADER_LEN + SET_OBJECT_LIST2_LEN as u32,
+            completion_stamp: 0,
+            payload,
+            next_head: 0,
+        },
+    );
+    assert_eq!(state.tasks[1].object_list_pfn, 1);
+    assert_eq!(state.tasks[1].object_list_count, 4096);
+}

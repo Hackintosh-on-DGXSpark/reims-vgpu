@@ -2412,6 +2412,7 @@ pub fn device_info_limits() -> crate::model::DeviceInfoLimits {
             // let the Apple plugin choose its non-native-FP16 path.
             native_fp16: ctx.features.float16
                 && ctx.caps.device_type != ash::vk::PhysicalDeviceType::CPU,
+            tile_memory: false,
         },
         Err(_) => crate::model::DeviceInfoLimits {
             max_sample_count: 1,
@@ -2419,6 +2420,7 @@ pub fn device_info_limits() -> crate::model::DeviceInfoLimits {
             max_threads_per_threadgroup: VULKAN_MIN_COMPUTE_WORKGROUP_SIZE,
             max_threadgroup_memory_bytes: VULKAN_MIN_COMPUTE_SHARED_MEMORY_BYTES,
             native_fp16: false,
+            tile_memory: false,
         },
     }
 }

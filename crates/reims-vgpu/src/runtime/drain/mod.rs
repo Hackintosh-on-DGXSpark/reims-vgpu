@@ -544,6 +544,53 @@ fn apply_set_object_list(state: &mut DeviceState, payload: &[u8], channel: Optio
     }
 }
 
+/// `CmdSetObjectList2` (`0x44`), macOS 27's form of [`apply_set_object_list`].
+///
+/// The first list is the same 12-byte-entry object list, now named by its task
+/// GVA rather than its page, and is applied through the same rail. The second
+/// list (16-byte entries) is the guest's, and nothing this device decodes reads
+/// it: every object reference a 27.2 boot made resolved through the first.
+fn apply_set_object_list2(state: &mut DeviceState, payload: &[u8], channel: Option<u32>) {
+    if packet_short(
+        "set_object_list2",
+        channel,
+        payload.len(),
+        SET_OBJECT_LIST2_LEN,
+    ) {
+        return;
+    }
+    let task_id = ld32(&payload[SET_OBJECT_LIST2_TASK_ID..]);
+    let gva = ld64(&payload[SET_OBJECT_LIST2_GVA..]);
+    let byte_len = ld32(&payload[SET_OBJECT_LIST2_BYTES..]);
+    let page_mask = (1u64 << state.page_shift) - 1;
+    let Some(pfn) = (gva & page_mask == 0)
+        .then_some(gva >> state.page_shift)
+        .and_then(|pfn| u32::try_from(pfn).ok())
+    else {
+        crate::observe::fail(format!(
+            "set_object_list2 refused reason=gva_not_a_page task={task_id} gva={gva:#x} site={}",
+            packet_site(channel)
+        ));
+        return;
+    };
+    let mut legacy = [0u8; SET_OBJECT_LIST_LEN];
+    legacy[SET_OBJECT_LIST_TASK_ID..SET_OBJECT_LIST_TASK_ID + 4]
+        .copy_from_slice(&task_id.to_le_bytes());
+    legacy[SET_OBJECT_LIST_PFN..SET_OBJECT_LIST_PFN + 4].copy_from_slice(&pfn.to_le_bytes());
+    legacy[SET_OBJECT_LIST_COUNT..SET_OBJECT_LIST_COUNT + 4]
+        .copy_from_slice(&byte_len.to_le_bytes());
+    if crate::observe::first_sight("set_object_list2", u64::from(task_id) << 32 ^ gva) {
+        crate::observe::off(format!(
+            "set_object_list2 site={} task={task_id} gva={gva:#x} bytes={byte_len} \
+             second_gva={:#x} second_bytes={}",
+            packet_site(channel),
+            ld64(&payload[SET_OBJECT_LIST2_SECOND_GVA..]),
+            ld32(&payload[SET_OBJECT_LIST2_SECOND_BYTES..])
+        ));
+    }
+    apply_set_object_list(state, &legacy, channel);
+}
+
 fn apply_define_task2<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut H,
@@ -2086,6 +2133,7 @@ fn device_info_limits() -> crate::model::DeviceInfoLimits {
             max_threads_per_threadgroup: [u32::MAX; 3],
             max_threadgroup_memory_bytes: u32::MAX,
             native_fp16: true,
+            tile_memory: true,
         }
     }
     #[cfg(feature = "backend-vulkan")]
@@ -4489,6 +4537,26 @@ fn process_child_packet<H: HostMemory + HostOps>(
     channel_id: u32,
     packet: &Packet,
 ) -> ChildPacketDisposition {
+    // macOS 27 submits through EXEC_INDIRECT3 and EXEC_INDIRECT_INFO, which are
+    // EXEC_INDIRECT2 with their resource records narrowed. Widen them here so
+    // the one exec rail — continuation and deferral included — serves all three.
+    let widened;
+    let packet = match packet.opcode {
+        CHILD_OP_EXEC_INDIRECT3 | CHILD_OP_EXEC_INDIRECT_INFO => {
+            match crate::runtime::decode::fifo::widen_exec_indirect3(&packet.payload) {
+                Some(payload) => {
+                    widened = Packet {
+                        opcode: CHILD_OP_EXEC_INDIRECT2,
+                        payload,
+                        ..packet.clone()
+                    };
+                    &widened
+                }
+                None => packet,
+            }
+        }
+        _ => packet,
+    };
     // A packet that stopped at a draw waiting for its pipeline is this
     // channel's head until it finishes. Something else here means the ring
     // moved under it, and it can neither finish nor run again from the top.
@@ -4507,6 +4575,9 @@ fn process_child_packet<H: HostMemory + HostOps>(
         // (object_list_count==0). Never on a well-formed boot.
         CHILD_OP_SET_OBJECT_LIST => {
             apply_set_object_list(state, &packet.payload, Some(channel_id));
+        }
+        CHILD_OP_SET_OBJECT_LIST2 => {
+            apply_set_object_list2(state, &packet.payload, Some(channel_id));
         }
         CHILD_OP_DELETE_RESOURCE => {
             if !packet_short("delete_resource", Some(channel_id), packet.payload.len(), 8) {
