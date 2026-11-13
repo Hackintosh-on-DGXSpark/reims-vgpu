@@ -2413,9 +2413,22 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             return Err(ComputeStatus::GuestIo("compute_stage_tex_type11_span"));
         }
         let mut bytes = vec![0u8; need];
+        let from_resident = serve.is_none()
+            && !is_storage
+            && condemned_type11_resident(
+                state,
+                mapping_id,
+                surface_offset,
+                surface_bpr,
+                bpp,
+                tight as usize,
+                height,
+                &mut bytes,
+            );
         if serve.is_none()
             && !private
             && !unseeded
+            && !from_resident
             && !mapping_write::read_rect_raw_at(
                 state,
                 host,
@@ -3257,6 +3270,87 @@ fn mapping_geom_format(
         ));
     }
     Ok((m.width, m.height, or_bgra8(m.format)))
+}
+
+/// A sampled type-11 window read back from the surface's resident, when the
+/// wire guard has condemned the surface's guest pages. `true` when `out` was
+/// filled.
+///
+/// Condemned pages belong to another surface, so reading them fails, and the
+/// draw rail already binds the resident in their place
+/// (`condemned_sampled_source`). Compute did not. macOS 27 captures each
+/// Liquid Glass backdrop with a kernel sampling the display surface being
+/// composed, and when that surface's pages were condemned every capture failed:
+/// the dispatches were dropped and the glass drew black. Only a ready device
+/// allocation counts, as on the draw rail.
+#[cfg(feature = "backend-vulkan")]
+#[allow(clippy::too_many_arguments)]
+fn condemned_type11_resident(
+    state: &DeviceState,
+    mapping_id: u32,
+    surface_offset: u64,
+    surface_bpr: u32,
+    bpp: u32,
+    tight: usize,
+    height: u32,
+    out: &mut [u8],
+) -> bool {
+    use crate::backend::vulkan::engine::{self as vk_engine, ResidentContentBacking};
+    if !crate::runtime::mapper::wire_watch::guest_pages_condemned(state, mapping_id) {
+        return false;
+    }
+    if surface_bpr == 0 || bpp == 0 || tight == 0 {
+        return false;
+    }
+    let Some(mapping) = state.mappings.get(&mapping_id).filter(|m| m.has_geom) else {
+        return false;
+    };
+    let identity = crate::runtime::present_identity::surface_identity(
+        state,
+        mapping_id,
+        mapping.width,
+        mapping.height,
+    );
+    if vk_engine::resident_content_backing(&identity) != ResidentContentBacking::DeviceAllocation {
+        return false;
+    }
+    let Ok(readback) = vk_engine::read_target_native(&identity) else {
+        return false;
+    };
+    if readback.layout.bytes_per_texel() != bpp {
+        return false;
+    }
+    let row = mapping.width as usize * bpp as usize;
+    let origin_y = (surface_offset / u64::from(surface_bpr)) as usize;
+    let origin_x = (surface_offset % u64::from(surface_bpr)) as usize;
+    for (y, dst) in out
+        .chunks_exact_mut(tight)
+        .take(height as usize)
+        .enumerate()
+    {
+        let start = (origin_y + y) * row + origin_x;
+        let Some(src) = readback.pixels.get(start..start + tight) else {
+            return false;
+        };
+        dst.copy_from_slice(src);
+    }
+    crate::runtime::drain::note_store_route("compute_t11_condemned_resident");
+    true
+}
+
+#[cfg(not(feature = "backend-vulkan"))]
+#[allow(clippy::too_many_arguments)]
+fn condemned_type11_resident(
+    _state: &DeviceState,
+    _mapping_id: u32,
+    _surface_offset: u64,
+    _surface_bpr: u32,
+    _bpp: u32,
+    _tight: usize,
+    _height: u32,
+    _out: &mut [u8],
+) -> bool {
+    false
 }
 
 fn u32_dim(v: u64) -> Result<u32, ComputeStatus> {
