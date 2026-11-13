@@ -1354,8 +1354,8 @@ fn walk_stream<M: HostMemory + HostOps>(
 }
 
 fn handle_info_record<M: HostMemory + HostOps>(
-    state: &DeviceState,
-    host: &M,
+    state: &mut DeviceState,
+    host: &mut M,
     task_id: u32,
     opcode: u32,
     cmd_bytes: &[u8],
@@ -1363,6 +1363,19 @@ fn handle_info_record<M: HostMemory + HostOps>(
     use crate::runtime::icb::{
         apply_icb_host_resource_info, decode_icb_host_resource_info, INFO_OP_ICB_HOST_RESOURCE,
     };
+    use reims_vgpu_wire::ops::info as w_info;
+    match opcode {
+        w_info::OPCODE_HEAP_TEXTURE_DESCRIPTOR_SIZE_AND_ALIGN
+        | w_info::OPCODE_HEAP_TEXTURE_DESCRIPTOR_SIZE_AND_ALIGN_WIDE => {
+            answer_heap_texture_info(state, host, task_id, opcode, cmd_bytes);
+            return;
+        }
+        w_info::OPCODE_COMPUTE_PIPELINE_STATE_INFO => {
+            answer_compute_pipeline_info(state, host, task_id, cmd_bytes);
+            return;
+        }
+        _ => {}
+    }
     let bytes = cmd_bytes;
     if opcode == INFO_OP_ICB_HOST_RESOURCE {
         // `icb_backing_fail` was a counter with no reason beside it: an ICB
@@ -1395,6 +1408,163 @@ fn handle_info_record<M: HostMemory + HostOps>(
             }
         }
     }
+}
+
+/// An info record's payload: the walker may hand the record with or without its
+/// eight-byte header.
+fn info_payload(opcode: u32, cmd_bytes: &[u8]) -> &[u8] {
+    if cmd_bytes.len() >= reims_vgpu_wire::OP_HEADER_LEN && ld32(cmd_bytes) == opcode {
+        &cmd_bytes[reims_vgpu_wire::OP_HEADER_LEN..]
+    } else {
+        cmd_bytes
+    }
+}
+
+/// Write an info answer at `reply_offset` into the buffer `reply_ref` names.
+fn write_info_reply<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    what: &str,
+    reply_ref: u32,
+    reply_offset: u64,
+    reply: &[u8],
+) -> bool {
+    let (gva, len) =
+        match crate::runtime::objects::resolve_buffer_span(state, host, task_id, reply_ref) {
+            Ok(span) => span,
+            Err(refusal) => {
+                crate::observe::fail(format!(
+                    "{what} refused reason=reply_buffer task={task_id} ref={reply_ref} {refusal:?}"
+                ));
+                return false;
+            }
+        };
+    if reply_offset.saturating_add(reply.len() as u64) > len {
+        crate::observe::fail(format!(
+            "{what} refused reason=reply_out_of_range task={task_id} ref={reply_ref} \
+             offset={reply_offset:#x} len={len:#x}"
+        ));
+        return false;
+    }
+    if crate::runtime::gva_mem::write_task_gva_product_within(
+        state,
+        host,
+        task_id,
+        gva + reply_offset,
+        reply,
+        None,
+    )
+    .is_err()
+    {
+        crate::observe::fail(format!(
+            "{what} refused reason=write task={task_id} gva={:#x}",
+            gva + reply_offset
+        ));
+        return false;
+    }
+    true
+}
+
+/// `heapTextureSizeAndAlignWithDescriptor:` as an info record: `0x1c3` with the
+/// 32-byte descriptor, `0x1d5` with the 40-byte one, each followed by
+/// `{reply_buffer_ref, reply_offset}`. At protocol 237 a macOS 27 guest asks
+/// this way instead of through child packet `0x40`; the answer is the same
+/// `{size, align}`. Unanswered, the guest reads size 0 and its kernel refuses
+/// the heap with `invalid arguments`.
+fn answer_heap_texture_info<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    opcode: u32,
+    cmd_bytes: &[u8],
+) {
+    use crate::runtime::heap_query;
+    use reims_vgpu_wire::ops::info as w_info;
+    let body = info_payload(opcode, cmd_bytes);
+    let wide = opcode == w_info::OPCODE_HEAP_TEXTURE_DESCRIPTOR_SIZE_AND_ALIGN_WIDE;
+    let desc_len = if wide {
+        heap_query::WIDE_TEXTURE_BODY_LEN
+    } else {
+        heap_query::TEXTURE_BODY_LEN
+    };
+    if body.len() < desc_len + 12 {
+        crate::observe::fail(format!(
+            "heap_texture_info refused reason=short op={opcode:#x} len={}",
+            cmd_bytes.len()
+        ));
+        return;
+    }
+    let desc = if wide {
+        heap_query::decode_wide_serialized_texture_descriptor(&body[..desc_len])
+    } else {
+        heap_query::decode_serialized_texture_descriptor(&body[..desc_len])
+    };
+    let requirement = match desc.and_then(|desc| heap_query::query_size_and_align(&desc)) {
+        Ok(requirement) => requirement,
+        Err(error) => {
+            crate::observe::fail(format!(
+                "heap_texture_info refused reason={error:?} op={opcode:#x} task={task_id}"
+            ));
+            return;
+        }
+    };
+    let reply_ref = ld32(&body[desc_len..]);
+    let reply_offset = ld64(&body[desc_len + 4..]);
+    write_info_reply(
+        state,
+        host,
+        task_id,
+        "heap_texture_info",
+        reply_ref,
+        reply_offset,
+        &requirement.encode(),
+    );
+}
+
+/// `computePipelineStateInfo:info:` (`0x1c2`): `{pipeline_ref, reply_buffer_ref,
+/// reply_offset}`. The guest copies 28 bytes of the reply into the pipeline:
+/// `maxTotalThreadsPerThreadgroup`, `threadExecutionWidth` and
+/// `staticThreadgroupMemoryLength` as `u64`s and a `u32` left zero. The values
+/// are the ones `CmdGetComputeInfo` (`0x3b`) answers below protocol 235.
+/// Unanswered, every one reads 0 and the guest dispatches empty grids.
+fn answer_compute_pipeline_info<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    cmd_bytes: &[u8],
+) {
+    use reims_vgpu_wire::ops::info as w_info;
+    const REPLY_LEN: usize = 28;
+    let body = info_payload(w_info::OPCODE_COMPUTE_PIPELINE_STATE_INFO, cmd_bytes);
+    if body.len() < 16 {
+        crate::observe::fail(format!(
+            "compute_pipeline_info refused reason=short len={}",
+            cmd_bytes.len()
+        ));
+        return;
+    }
+    let reply_ref = ld32(&body[4..]);
+    let reply_offset = ld64(&body[8..]);
+    let mut reply = [0u8; REPLY_LEN];
+    for (key, value) in crate::runtime::drain::compute_info_caps() {
+        let at = match key {
+            crate::runtime::drain::COMPUTE_INFO_KEY_MAX_TOTAL_THREADS => 0,
+            crate::runtime::drain::COMPUTE_INFO_KEY_THREAD_EXECUTION_WIDTH => 8,
+            crate::runtime::drain::COMPUTE_INFO_KEY_STATIC_THREADGROUP_MEMORY => 16,
+            _ => continue,
+        };
+        reply[at..at + 8].copy_from_slice(&u64::from(value).to_le_bytes());
+    }
+    write_info_reply(
+        state,
+        host,
+        task_id,
+        "compute_pipeline_info",
+        reply_ref,
+        reply_offset,
+        &reply,
+    );
 }
 
 fn handle_event_record(state: &mut DeviceState, task_id: u32, cmd_bytes: &[u8]) {

@@ -2297,7 +2297,7 @@ fn reply_device_info<H: HostMemory + HostOps>(
 /// key 2, and it is named below rather than left as a hole, because "the guest
 /// asked about five keys and we answered three" invites the wrong repair twice:
 /// there is no key 5 to add, and key 2 must not be answered the obvious way.
-const COMPUTE_INFO_KEY_MAX_TOTAL_THREADS: u32 = 1;
+pub(crate) const COMPUTE_INFO_KEY_MAX_TOTAL_THREADS: u32 = 1;
 
 /// Key 2 — `SupportsIndirectCommandBuffers`, and this device deliberately
 /// answers nothing.
@@ -2323,8 +2323,8 @@ const COMPUTE_INFO_KEY_MAX_TOTAL_THREADS: u32 = 1;
 #[allow(dead_code)] // named so a later session does not read the gap as an omission.
 const COMPUTE_INFO_KEY_SUPPORTS_ICB: u32 = 2;
 
-const COMPUTE_INFO_KEY_THREAD_EXECUTION_WIDTH: u32 = 3;
-const COMPUTE_INFO_KEY_STATIC_THREADGROUP_MEMORY: u32 = 4;
+pub(crate) const COMPUTE_INFO_KEY_THREAD_EXECUTION_WIDTH: u32 = 3;
+pub(crate) const COMPUTE_INFO_KEY_STATIC_THREADGROUP_MEMORY: u32 = 4;
 
 /// What this host answers for a compute pipeline's threadgroup limits.
 ///
@@ -2371,7 +2371,7 @@ const COMPUTE_INFO_KEY_STATIC_THREADGROUP_MEMORY: u32 = 4;
 /// open question rather than a known cost. What is established is that the 0 is
 /// wrong for any kernel that declares threadgroup memory, and that only
 /// reflection can make it right.
-fn compute_info_caps() -> [(u32, u32); 3] {
+pub(crate) fn compute_info_caps() -> [(u32, u32); 3] {
     // Apple GPUs report 1024 and 32 across every family the arm64 pathway
     // targets, and the Metal backend serves an Apple GPU to an Apple guest.
     #[cfg(not(feature = "backend-vulkan"))]
