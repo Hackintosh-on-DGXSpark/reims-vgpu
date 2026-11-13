@@ -4063,7 +4063,14 @@ pub(crate) unsafe fn execute_draw_inner(
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             SampledSource::GuestRuns(src, vouch) => {
-                if let Some(direct) = src.direct_image.as_ref() {
+                // An image over guest memory has the guest's one level; a bind that
+                // asks for more is gathered into an image whose levels are
+                // generated after the copy.
+                if let Some(direct) = src
+                    .direct_image
+                    .as_ref()
+                    .filter(|_| resource.mip_levels <= 1)
+                {
                     if let Some(bound) = unsafe {
                         pools.acquire_guest_sampled(
                             ctx,
@@ -5029,7 +5036,7 @@ pub(crate) unsafe fn execute_draw_inner(
             if *volume { 1 } else { *layers },
             if *volume { *layers } else { 1 },
             *row_length_texels,
-            1,
+            img.mip_levels,
         );
     }
 
