@@ -1311,6 +1311,12 @@ enum TextureWriteback {
         /// it was — the writer's own walk fails closed on its own terms.
         pages: std::collections::HashSet<u64>,
     },
+    /// A heap texture: no guest bytes, so its output becomes the snapshot draws
+    /// sample, under `(task, ref, generation)`, as `len` tight bytes.
+    Heap {
+        key: (u32, u32, u64),
+        len: usize,
+    },
     Type11 {
         mapping_id: u32,
         surface_offset: u64,
@@ -1846,9 +1852,16 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
         }
     }
     if let Some((heap_ref, use_offset, offset, descriptor)) = heap_texture {
+        // A mipmapped heap texture is staged as its base level. Kernels reach
+        // only level 0 here: metal2vulkan drops writes to a nonzero level, and
+        // macOS 27's glass blur pyramids (448x96 and 84x30 in five and two
+        // levels) were otherwise refused whole, and their glass drew black.
+        if descriptor.mipmap_level_count > 1 {
+            crate::runtime::drain::note_store_route("compute_heap_base_level");
+        }
         if descriptor.texture_type != 2
             || descriptor.depth != 1
-            || descriptor.mipmap_level_count != 1
+            || descriptor.mipmap_level_count == 0
             || descriptor.sample_count != 1
             || descriptor.array_length != 1
         {
@@ -1927,6 +1940,28 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             serve.and_then(ResidentServe::sample_source).is_some() as u8,
             use_offset as u8
         ));
+        // A heap texture no kernel has left a resident for holds what a pass
+        // rendered or a storage write left, the texels a draw samples, and a
+        // kernel's output goes back there for the next draw to sample.
+        let snapshot_key = objects::resolve_resource(state, host, task_id, texture_ref)
+            .ok()
+            .map(|resource| (task_id, texture_ref, resource.lifetime_ref().id()));
+        #[cfg(feature = "backend-vulkan")]
+        let bytes = snapshot_key
+            .filter(|_| serve.is_none())
+            .and_then(|snapshot_key| {
+                let target = crate::model::HeapTargetRef {
+                    base_ref: texture_ref,
+                    generation: snapshot_key.2,
+                    base_format: format,
+                };
+                let identity =
+                    crate::runtime::draw::heap_target_identity(task_id, target, width, height);
+                crate::runtime::draw::heap_texels(state, snapshot_key, &identity, need)
+            })
+            .unwrap_or_else(|| vec![0; need]);
+        #[cfg(not(feature = "backend-vulkan"))]
+        let bytes = vec![0; need];
         return Ok(StagedTexture {
             binding,
             #[cfg(feature = "backend-vulkan")]
@@ -1939,7 +1974,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             storage_selector,
             width,
             height,
-            bytes: vec![0; need],
+            bytes,
             is_storage,
             #[cfg(feature = "backend-vulkan")]
             residency: is_storage.then_some(ComputeStorageResidencyCandidate {
@@ -1948,7 +1983,10 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             }),
             #[cfg(feature = "backend-vulkan")]
             serve,
-            writeback: TextureWriteback::None,
+            writeback: match snapshot_key {
+                Some(key) if is_storage => TextureWriteback::Heap { key, len: need },
+                _ => TextureWriteback::None,
+            },
         });
     }
     let stage_entry = objects::lookup_list_entry(state, host, task_id, stage_ref);
@@ -2878,6 +2916,17 @@ fn writeback_texture<M: HostMemory + HostOps>(
 ) -> Result<(), ComputeStatus> {
     match &tex.writeback {
         TextureWriteback::None => Ok(()),
+        TextureWriteback::Heap { key, len } => {
+            if let Some(texels) = tex.bytes.get(..*len) {
+                state
+                    .heap_snapshots
+                    .insert(*key, std::sync::Arc::new(texels.to_vec()));
+                crate::runtime::drain::note_store_route("compute_heap_snapshot");
+            } else {
+                crate::runtime::drain::note_store_route("compute_heap_snapshot_short");
+            }
+            Ok(())
+        }
         TextureWriteback::Linear {
             texture_ref,
             gva,
