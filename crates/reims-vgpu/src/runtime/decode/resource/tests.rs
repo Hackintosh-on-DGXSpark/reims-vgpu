@@ -3240,3 +3240,108 @@ fn sparse_secondary_color_attachment_does_not_alias_color0() {
     assert!(pd.color_attachments[0].blending_enabled);
     assert_eq!(pd.color0, PipelineColorAttachment::default());
 }
+
+fn from_hex(hex: &str) -> Vec<u8> {
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+        .collect()
+}
+
+/// A type-9 descriptor a 27.2 guest sent at protocol 237: a `0x34` record whose
+/// descriptor is `TextureDescriptor2`'s. Narrowed, the memoryless decoder reads
+/// the format and size it reads at protocol 62.
+#[test]
+fn a_wide_new_texture_record_is_read_as_the_narrow_one() {
+    let mut desc = from_hex(
+        "34000000340000000b00000042730005000000800700003c00000001000000\
+         010001000100300000000000000000000203040500",
+    );
+    assert_eq!(desc.len(), 52);
+    assert!(normalize_object_descriptor(
+        OBJECT_TYPE_MEMORYLESS_TEXTURE,
+        &mut desc
+    ));
+    assert_eq!(desc.len(), 44);
+    assert_eq!(ld32(&desc[0..]), 1);
+    assert_eq!(ld32(&desc[4..]), 44);
+    let tex = decode_memoryless_texture_descriptor(&desc).expect("decodes");
+    assert_eq!(tex.pixel_format, 0x73);
+    assert_eq!((tex.width, tex.height), (1920, 60));
+}
+
+/// A type-11 descriptor from the same boot: an eight-byte mapping prefix, then
+/// a `0x39` IOSurface-texture record with a four-byte plane.
+#[test]
+fn a_wide_iosurface_texture_record_keeps_its_mapping_and_geometry() {
+    let mut desc = from_hex(
+        "010000000000000039000000380000000a0000004250000500000080070000\
+         3c0000000100000001000100010010000000000000000000020304050000000000",
+    );
+    assert_eq!(desc.len(), 64);
+    assert!(normalize_object_descriptor(
+        OBJECT_TYPE_IOSURFACE,
+        &mut desc
+    ));
+    assert_eq!(desc.len(), 56);
+    let Descriptor::IOSurfaceTexture {
+        mapping_id,
+        object_ref,
+        pixel_format,
+        width,
+        height,
+    } = decode_iosurface_texture_descriptor(&desc).expect("decodes")
+    else {
+        panic!("not a type-11 descriptor");
+    };
+    assert_eq!((mapping_id, object_ref), (1, 0xa));
+    assert_eq!(pixel_format, 0x50);
+    assert_eq!((width, height), (1920, 60));
+}
+
+/// A linear texture's descriptor ends in the `0x34` record; only that tail is
+/// rewritten, and the format lands where the type-2 decoder reads it.
+#[test]
+fn a_linear_texture_descriptor_has_its_trailing_record_narrowed() {
+    let mut desc = vec![0u8; 72];
+    desc.extend(from_hex(
+        "34000000340000001000000042500005000100800700008000000001000000\
+         010001000100200000000000000000000203040500",
+    ));
+    assert!(normalize_object_descriptor(OBJECT_TYPE_TEXTURE, &mut desc));
+    assert_eq!(desc.len(), 72 + 44);
+    assert_eq!(ld32(&desc[72..]), 1);
+    assert_eq!(ld16(&desc[TEXTURE_DESC_PIXEL_FORMAT..]), 0x50);
+}
+
+/// A pool buffer is listed as a buffer and its descriptor padded to a buffer's.
+#[test]
+fn a_pool_buffer_is_read_as_a_buffer() {
+    let mut entry = vec![0u8; OBJECT_LIST_ENTRY_LEN];
+    st32(
+        &mut entry[OBJECT_LIST_ENTRY_HEADER..],
+        u32::from(OBJECT_TYPE_POOL_BUFFER) | (12 << OBJECT_DESC_LEN_SHIFT),
+    );
+    let entry = decode_list_object_entry(&entry).expect("decodes");
+    assert_eq!(entry.object_type, OBJECT_TYPE_BUFFER);
+    let mut desc = from_hex("0040000000000000d4000000");
+    assert!(normalize_object_descriptor(entry.object_type, &mut desc));
+    let buffer = decode_buffer_descriptor(&desc).expect("decodes");
+    assert_eq!(buffer.allocation_size, 0x4000);
+    assert_eq!(buffer.handle, 0xd4);
+}
+
+/// A protocol-62 descriptor is left alone.
+#[test]
+fn a_narrow_descriptor_is_not_rewritten() {
+    let mut desc = from_hex(
+        "01000000000000002f000000300000000a00000042055000800700003c00000001\
+         0000000100010001001000000000000000000000000000",
+    );
+    let before = desc.clone();
+    assert!(!normalize_object_descriptor(
+        OBJECT_TYPE_IOSURFACE,
+        &mut desc
+    ));
+    assert_eq!(desc, before);
+}

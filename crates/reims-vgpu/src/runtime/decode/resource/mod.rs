@@ -9,7 +9,7 @@ use crate::runtime::heap_query; // ICB layout fixture encoder only
 use core::mem::{offset_of, size_of};
 use reims_vgpu_wire::ops::{
     backed_texture as w_backed, depth_stencil as w_ds, heap_texture as w_heap, icb as w_icb,
-    sampler as w_smp, texture_view as w_view,
+    sampler as w_smp, texture as w_tex, texture_view as w_view,
 };
 use reims_vgpu_wire::OP_HEADER_LEN as OP_HDR;
 
@@ -93,6 +93,13 @@ pub const OBJECT_TYPE_TEXTURE_VIEW: u8 = 8;
 /// of nearly every WindowServer pass.
 pub const OBJECT_TYPE_MEMORYLESS_TEXTURE: u8 = 9;
 pub const OBJECT_TYPE_IOSURFACE: u8 = 11;
+/// A buffer carved from one of the guest's resource pools, from protocol 200.
+/// Its descriptor is a type-1 descriptor without the trailing four zero bytes,
+/// `{u64 size, u32 handle}`, and every buffer rail reads it as one:
+/// [`decode_list_object_entry`] reports it as [`OBJECT_TYPE_BUFFER`] and the
+/// descriptor read pads it. A 27.2 guest hands these to the info encoder as
+/// reply buffers.
+pub const OBJECT_TYPE_POOL_BUFFER: u8 = 19;
 
 /// Type-7 first dword subtypes.
 pub const TYPE7_OBJECT_SAMPLER: u32 = w_smp::OPCODE_NEW_SAMPLER;
@@ -1807,10 +1814,10 @@ pub fn decode_list_object_entry(bytes: &[u8]) -> Result<ListObjectEntry, DecodeS
     let object_type = (first & OBJECT_TYPE_MASK) as u8;
     let twin_layout = object_type == OBJECT_TYPE_TWIN_LAYOUT_TEXTURE;
     Ok(ListObjectEntry {
-        object_type: if twin_layout {
-            OBJECT_TYPE_TEXTURE_VARIANT
-        } else {
-            object_type
+        object_type: match object_type {
+            OBJECT_TYPE_TWIN_LAYOUT_TEXTURE => OBJECT_TYPE_TEXTURE_VARIANT,
+            OBJECT_TYPE_POOL_BUFFER => OBJECT_TYPE_BUFFER,
+            other => other,
         },
         descriptor_length: first >> OBJECT_DESC_LEN_SHIFT,
         descriptor_gva: ld64(&bytes[OBJECT_LIST_ENTRY_DESC_GVA..]),
@@ -1824,6 +1831,109 @@ pub fn list_object_entry_offset(ref_: u32, entry_count: u32) -> Option<u64> {
         return None;
     }
     (ref_ as u64).checked_mul(OBJECT_LIST_ENTRY_LEN as u64)
+}
+
+/// Bytes of a pool buffer's descriptor; see [`OBJECT_TYPE_POOL_BUFFER`].
+pub const POOL_BUFFER_DESC_LEN: usize = 12;
+
+/// The record opcode a protocol-62 type-11 descriptor carries after its mapping
+/// prefix, as a 26-era guest writes it. Its `TextureDescriptor2` form is the
+/// IOSurface-texture opcode `0x39`.
+const IOSURFACE_TEXTURE_OBJECT_OPCODE: u32 = 0x2f;
+
+/// Rewrite a 40-byte `TextureDescriptor2` descriptor as the 32-byte one.
+///
+/// The wide form packs type and flags into one byte, then the pixel format,
+/// then `usage` as a `u32` of its own. The narrow form packs type and flags, an
+/// eight-bit `usage` and the pixel format into one word. Everything from
+/// `width` to the trailing `u64` is the same fields in the same order, three
+/// bytes later. Usage bits above the eighth and the swizzle the wide form
+/// appends have no slot in the narrow form and are dropped; nothing that reads
+/// the narrow form reads either.
+pub fn narrow_texture_descriptor(wide: &[u8]) -> Option<[u8; w_tex::TEXTURE_DESCRIPTOR_LEN]> {
+    let wide = wide.get(..w_tex::WIDE_TEXTURE_DESCRIPTOR_LEN)?;
+    let pixel_format = u32::from(ld16(&wide[1..]));
+    let usage = ld32(&wide[3..]);
+    let packed = u32::from(wide[0]) | ((usage & 0xff) << 8) | (pixel_format << 16);
+    let mut narrow = [0u8; w_tex::TEXTURE_DESCRIPTOR_LEN];
+    narrow[..4].copy_from_slice(&packed.to_le_bytes());
+    narrow[4..].copy_from_slice(&wide[7..7 + w_tex::TEXTURE_DESCRIPTOR_LEN - 4]);
+    Some(narrow)
+}
+
+/// Give an object-list descriptor the shape protocol 62 gives the same object,
+/// so every decoder downstream reads one layout. `true` when it changed.
+///
+/// At protocol 237 the guest's serializer writes `TextureDescriptor2` records,
+/// and an object-list descriptor embeds the record its object was made from:
+///
+/// - type 9 is a `0x34` record (`newTextureWithDescriptor:`), narrow `1`;
+/// - type 11 is an eight-byte mapping prefix and a `0x39` IOSurface-texture
+///   record, narrow `0x2f`, whose plane widens from two bytes to four;
+/// - type 2 and 3 end in the `0x34` record after the kernel's layout and level
+///   records.
+///
+/// The `0x37` buffer-texture and `0x38` heap-texture records are not rewritten:
+/// their wide forms already have decoders. A pool buffer's 12-byte descriptor
+/// is padded to the buffer descriptor's 16.
+pub fn normalize_object_descriptor(object_type: u8, bytes: &mut Vec<u8>) -> bool {
+    if object_type == OBJECT_TYPE_BUFFER && bytes.len() == POOL_BUFFER_DESC_LEN {
+        bytes.resize(LINEAR_DESC_MIN_LEN, 0);
+        return true;
+    }
+    narrow_leading_record(object_type, bytes) || narrow_trailing_record(bytes)
+}
+
+/// The record at the start of a type-9 or type-11 descriptor.
+fn narrow_leading_record(object_type: u8, bytes: &mut Vec<u8>) -> bool {
+    let base = if object_type == OBJECT_TYPE_IOSURFACE { 8 } else { 0 };
+    let Some(opcode) = bytes.get(base..base + 4).map(ld32) else {
+        return false;
+    };
+    // (narrow opcode, object refs before the descriptor, bytes kept after it)
+    let (narrow_op, refs, tail) = match opcode {
+        w_tex::OPCODE_NEW_TEXTURE_WIDE => (w_tex::OPCODE_NEW_TEXTURE, 1, 0),
+        w_backed::OPCODE_IOSURFACE_TEXTURE_WIDE => (IOSURFACE_TEXTURE_OBJECT_OPCODE, 1, 4),
+        _ => return false,
+    };
+    let desc_at = base + OP_HDR + 4 * refs;
+    let Some(narrow) = bytes.get(desc_at..).and_then(narrow_texture_descriptor) else {
+        return false;
+    };
+    let tail_at = desc_at + w_tex::WIDE_TEXTURE_DESCRIPTOR_LEN;
+    let tail_end = tail_at.saturating_add(tail).min(bytes.len());
+    let mut out = Vec::with_capacity(bytes.len());
+    out.extend_from_slice(&bytes[..desc_at]);
+    out.extend_from_slice(&narrow);
+    out.extend_from_slice(&bytes[tail_at..tail_end]);
+    let record_len = (out.len() - base) as u32;
+    out[base..base + 4].copy_from_slice(&narrow_op.to_le_bytes());
+    out[base + 4..base + 8].copy_from_slice(&record_len.to_le_bytes());
+    *bytes = out;
+    true
+}
+
+/// The `0x34` record a linear texture's descriptor ends in.
+fn narrow_trailing_record(bytes: &mut Vec<u8>) -> bool {
+    let wide_len = w_tex::NEW_TEXTURE_WIDE_TOTAL_LEN as usize;
+    let Some(at) = bytes.len().checked_sub(wide_len) else {
+        return false;
+    };
+    if at < OP_HDR
+        || ld32(&bytes[at..]) != w_tex::OPCODE_NEW_TEXTURE_WIDE
+        || ld32(&bytes[at + 4..]) as usize != wide_len
+    {
+        return false;
+    }
+    let Some(narrow) = narrow_texture_descriptor(&bytes[at + OP_HDR + 4..]) else {
+        return false;
+    };
+    bytes.truncate(at + OP_HDR + 4);
+    bytes.extend_from_slice(&narrow);
+    let narrow_len = (bytes.len() - at) as u32;
+    bytes[at..at + 4].copy_from_slice(&w_tex::OPCODE_NEW_TEXTURE.to_le_bytes());
+    bytes[at + 4..at + 8].copy_from_slice(&narrow_len.to_le_bytes());
+    true
 }
 
 pub fn decode_buffer_descriptor(bytes: &[u8]) -> Result<BufferDescriptor, DecodeStatus> {
@@ -2485,6 +2595,12 @@ const COMPUTE_PIPELINE_TAG_LABEL: u8 = 0x02;
 /// the threadgroup hint; refusing it lost every frame drawn through that
 /// kernel. Not identified, and taken as a compiler hint like its neighbours.
 const COMPUTE_PIPELINE_TAG_10: u8 = 0x0a;
+/// `MTLComputePipelineDescriptor.maxTotalThreadsPerThreadgroup`, which macOS 27
+/// sets from the `computePipelineStateInfo:` answer (1024 on every record seen).
+/// It caps the threadgroups the guest may dispatch with the pipeline; this
+/// device takes each threadgroup size from the dispatch record, and the guest
+/// sized those from the same answer, so there is nothing to apply.
+const COMPUTE_PIPELINE_TAG_MAX_TOTAL_THREADS: u8 = 0x08;
 /// `MTLComputePipelineDescriptor.stageInputDescriptor` — a byte offset from the
 /// end of the 16-byte type-7 header to a nested property list, in the same units
 /// as [`PIPELINE_TAG_VERTEX_DESCRIPTOR_OFFSET`] and
@@ -2594,10 +2710,11 @@ const RENDER_PIPELINE_TAGS_BENIGN: [u8; 4] = [
 ];
 /// The compute half of [`RENDER_PIPELINE_TAGS_BENIGN`]; same rule, and listed
 /// apart for the same reason `COMPUTE_PIPELINE_TAGS_CONSUMED` is.
-const COMPUTE_PIPELINE_TAGS_BENIGN: [u8; 3] = [
+const COMPUTE_PIPELINE_TAGS_BENIGN: [u8; 4] = [
     COMPUTE_PIPELINE_TAG_THREADGROUP_MULTIPLE,
     COMPUTE_PIPELINE_TAG_LABEL,
     COMPUTE_PIPELINE_TAG_10,
+    COMPUTE_PIPELINE_TAG_MAX_TOTAL_THREADS,
 ];
 
 /// A pipeline-descriptor field this decoder does not read **and has not
