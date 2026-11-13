@@ -1406,12 +1406,13 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
         ));
     }
 
-    // A heap texture is sampled from the resident a pass rendered it into. One
-    // nothing has rendered yet has no content anywhere this device can reach,
-    // and Metal leaves a private texture's unwritten texels undefined; it is
-    // served as transparent black rather than refusing the draw. macOS 27's
-    // menus sample small heap textures (42x42, 54x54 RGBA16F) no pass here
-    // writes, and refusing that draw dropped every menu's items.
+    // A heap texture is sampled from the resident a pass rendered it into, or
+    // from what a storage write left in `heap_snapshots` after that: macOS 27's
+    // windows and menus sample small heap textures (42x42, 54x54 RGBA16F) that
+    // only `inplace_copy_lph` writes, through a storage image. One nothing has
+    // written has no content anywhere this device can reach, and Metal leaves a
+    // private texture's unwritten texels undefined; it is served as transparent
+    // black rather than refusing the draw, which dropped every menu's items.
     let heap_resource = resource.clone().or_else(|| {
         objects::resolve_resource(state, host, task_id, texture_ref).ok()
     });
@@ -1426,8 +1427,12 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
             base_format: heap.format,
         };
         let identity = heap_target_identity(task_id, target, heap.width, heap.height);
-        if !crate::backend::vulkan::engine::resident_content_ready(&identity) {
-            return unrendered_heap_sample(&heap);
+        if state
+            .heap_snapshots
+            .contains_key(&(task_id, target.base_ref, target.generation))
+            || !crate::backend::vulkan::engine::resident_content_ready(&identity)
+        {
+            return heap_snapshot_sample(state, task_id, &target, &heap);
         }
         let pf = translate::pixel::translate(heap.format).ok()?;
         crate::runtime::drain::note_store_route("heap_sample_resident");
@@ -1519,8 +1524,12 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                     base_format: heap.format,
                 };
                 let identity = heap_target_identity(task_id, target, heap.width, heap.height);
-                if !crate::backend::vulkan::engine::resident_content_ready(&identity) {
-                    return unrendered_heap_sample(&heap);
+                if state
+                    .heap_snapshots
+                    .contains_key(&(task_id, target.base_ref, target.generation))
+                    || !crate::backend::vulkan::engine::resident_content_ready(&identity)
+                {
+                    return heap_snapshot_sample(state, task_id, &target, &heap);
                 }
                 crate::runtime::drain::note_store_route("heaptex_view");
                 crate::runtime::drain::note_store_route("heap_sample_resident");
@@ -2278,9 +2287,33 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
     ))
 }
 
-/// The sample a heap texture nothing has rendered into yet gets: transparent
-/// black at its size. See the comment where [`resolve_sampled_source`] calls it.
-fn unrendered_heap_sample(heap: &HeapTexture) -> Option<(u32, u32, u32, SampledSourceRequest)> {
+/// The sample a heap texture gets when no pass's resident holds its newest
+/// texels: what a storage write last left in it, or transparent black at its
+/// size. See the comment where [`resolve_sampled_source`] calls it.
+fn heap_snapshot_sample(
+    state: &DeviceState,
+    task_id: u32,
+    target: &crate::model::HeapTargetRef,
+    heap: &HeapTexture,
+) -> Option<(u32, u32, u32, SampledSourceRequest)> {
+    let snapshot = state
+        .heap_snapshots
+        .get(&(task_id, target.base_ref, target.generation))
+        .zip(pixel_format::store_texel_order(heap.format));
+    if let Some((bytes, layout)) = snapshot {
+        crate::runtime::drain::note_store_route("heap_sample_snapshot");
+        return Some((
+            heap.width,
+            heap.height,
+            0,
+            SampledSourceRequest::Bytes(
+                bytes.clone(),
+                None,
+                SampledByteFormat::from_source(layout, heap.format),
+                crate::backend::vulkan::engine::SampledByteOrigin::LinearTexture,
+            ),
+        ));
+    }
     crate::runtime::drain::note_store_route("heap_sample_unrendered");
     let bytes = (heap.width as usize)
         .checked_mul(heap.height as usize)?
@@ -2296,6 +2329,60 @@ fn unrendered_heap_sample(heap: &HeapTexture) -> Option<(u32, u32, u32, SampledS
             crate::backend::vulkan::engine::SampledByteOrigin::Synthetic,
         ),
     ))
+}
+
+#[cfg(test)]
+mod heap_snapshot_tests {
+    use super::*;
+
+    fn heap() -> HeapTexture {
+        HeapTexture {
+            width: 2,
+            height: 1,
+            format: crate::contract::pixel_format::MTL_FORMAT_RGBA16_FLOAT,
+            sample_count: 1,
+            texture_type: 2,
+        }
+    }
+
+    fn target() -> crate::model::HeapTargetRef {
+        crate::model::HeapTargetRef {
+            base_ref: 7,
+            generation: 3,
+            base_format: heap().format,
+        }
+    }
+
+    /// What `inplace_copy_lph` left is what the next draw samples, at the heap
+    /// texture's own size and in its own format.
+    #[test]
+    fn a_heap_snapshot_is_what_the_texture_samples() {
+        let mut state = DeviceState::new(crate::model::DeviceId::default(), 12);
+        let texels: Vec<u8> = (0..16).collect();
+        state
+            .heap_snapshots
+            .insert((1, 7, 3), std::sync::Arc::new(texels.clone()));
+        let (width, height, _, source) =
+            heap_snapshot_sample(&state, 1, &target(), &heap()).expect("sample");
+        assert_eq!((width, height), (2, 1));
+        let SampledSourceRequest::Bytes(bytes, _, format, _) = source else {
+            panic!("a snapshot is served as bytes");
+        };
+        assert_eq!(*bytes, texels);
+        assert_eq!(format.layout(), TexelLayout::Rgba16Float);
+    }
+
+    /// A heap texture nothing has written is still transparent black.
+    #[test]
+    fn an_unwritten_heap_texture_samples_transparent_black() {
+        let state = DeviceState::new(crate::model::DeviceId::default(), 12);
+        let (_, _, _, source) =
+            heap_snapshot_sample(&state, 1, &target(), &heap()).expect("sample");
+        let SampledSourceRequest::Bytes(bytes, ..) = source else {
+            panic!("transparent black is served as bytes");
+        };
+        assert!(bytes.iter().all(|b| *b == 0));
+    }
 }
 
 /// Whether a decoded resource object owns the resident reached by the surface
@@ -8086,8 +8173,9 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     // storage image (14 and 15's `inplace_copy_lph` snapshots
                     // the framebuffer this way) gets an image of its own; the
                     // pass's colour stays as it was. A level-0 linear texture
-                    // of the shader's texel width seeds that image and takes
-                    // its texels back after the draw. Anything else is scratch.
+                    // or a heap texture of the shader's texel width seeds that
+                    // image and takes its texels back after the draw. Anything
+                    // else is scratch.
                     if descriptor.access == ReflectedTextureAccess::Storage
                         && frag_stage
                         && reflection.render_targets.is_empty()
@@ -8106,7 +8194,24 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                                 req.task_id,
                                 texture_ref,
                                 format.bytes_per_texel(),
-                            );
+                            )
+                            .or_else(|| {
+                                heap_storage_target(
+                                    state,
+                                    req.task_id,
+                                    texture_ref,
+                                    retained.cloned().or_else(|| {
+                                        objects::resolve_resource(
+                                            state,
+                                            host,
+                                            req.task_id,
+                                            texture_ref,
+                                        )
+                                        .ok()
+                                    }),
+                                    format.bytes_per_texel(),
+                                )
+                            });
                             crate::runtime::drain::note_store_route("frag_storage_scratch");
                             let (width, height, seed) = match linear {
                                 Some((target, seed)) => {
@@ -9995,6 +10100,17 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // Metal pass whose counter spans several draws is several Vulkan
         // queries; the sum belongs to whoever knows the offset, which is not
         // this arm.
+        // A pass that drew into a heap texture holds its newest texels in the
+        // resident now, not in the snapshot an earlier storage write left.
+        if let Some(crate::backend::vulkan::engine::TargetIdentity::Heap {
+            task_id,
+            ref_,
+            generation,
+            ..
+        }) = resources.target_identity.as_ref()
+        {
+            state.heap_snapshots.remove(&(*task_id, *ref_, *generation));
+        }
         req.visibility_samples = out.occlusion_samples;
         for (target, pixels) in storage_writebacks.iter().zip(&out.storage_pixels) {
             land_storage_writeback(state, host, req.task_id, target, pixels);
@@ -10151,10 +10267,12 @@ pub(super) fn depth_chain_identity(
     })
 }
 
-/// Where a fragment shader's storage writes to a linear (type-2/3) texture land:
-/// that texture's level-0 rows in guest memory.
+/// Where a fragment shader's storage writes land: a linear (type-2/3)
+/// texture's level-0 rows in guest memory, or, for a heap texture,
+/// [`DeviceState::heap_snapshots`] under `heap`.
 pub(super) struct StorageWriteback {
     texture_ref: u32,
+    heap: Option<(u32, u32, u64)>,
     gva: u64,
     row_stride: u64,
     width: u32,
@@ -10200,6 +10318,7 @@ fn linear_storage_target<M: HostMemory + HostOps>(
     Some((
         StorageWriteback {
             texture_ref,
+            heap: None,
             gva,
             row_stride: layout.row_stride,
             width: layout.width,
@@ -10210,8 +10329,65 @@ fn linear_storage_target<M: HostMemory + HostOps>(
     ))
 }
 
-/// Write a fragment storage image's texels back to the linear texture it
-/// stands for, and drop host copies of that texture.
+/// A heap texture's newest texels as `len` tight bytes: the last storage
+/// write's snapshot, else the resident a pass rendered, else `None`.
+pub(crate) fn heap_texels(
+    state: &DeviceState,
+    key: (u32, u32, u64),
+    identity: &crate::backend::vulkan::engine::TargetIdentity,
+    len: usize,
+) -> Option<Vec<u8>> {
+    if let Some(snapshot) = state.heap_snapshots.get(&key) {
+        return (snapshot.len() == len).then(|| snapshot.to_vec());
+    }
+    if !crate::backend::vulkan::engine::resident_content_ready(identity) {
+        return None;
+    }
+    let readback = crate::backend::vulkan::engine::read_target_native(identity).ok()?;
+    readback.pixels.get(..len).map(<[u8]>::to_vec)
+}
+
+/// The heap texture a fragment storage write targets, seeded with its newest
+/// texels, or zeros. A heap texture has no guest bytes, so what the shader
+/// writes lands in `heap_snapshots`.
+fn heap_storage_target(
+    state: &DeviceState,
+    task_id: u32,
+    texture_ref: u32,
+    resource: Option<std::sync::Arc<crate::model::TaskResource>>,
+    bytes_per_texel: usize,
+) -> Option<(StorageWriteback, Vec<u8>)> {
+    let resource = resource.filter(|r| r.entry.object_type == OBJECT_TYPE_TEXTURE_VIEW)?;
+    let heap = heap_texture_of(&resource.descriptor)?;
+    if pixel_format::bytes_per_pixel(heap.format)? as usize != bytes_per_texel {
+        return None;
+    }
+    let key = (task_id, texture_ref, resource.lifetime_ref().id());
+    let target = crate::model::HeapTargetRef {
+        base_ref: texture_ref,
+        generation: key.2,
+        base_format: heap.format,
+    };
+    let identity = heap_target_identity(task_id, target, heap.width, heap.height);
+    let tight = (heap.width as usize).checked_mul(bytes_per_texel)?;
+    let len = tight.checked_mul(heap.height as usize)?;
+    let seed = heap_texels(state, key, &identity, len).unwrap_or_else(|| vec![0u8; len]);
+    Some((
+        StorageWriteback {
+            texture_ref,
+            heap: Some(key),
+            gva: 0,
+            row_stride: tight as u64,
+            width: heap.width,
+            height: heap.height,
+            tight,
+        },
+        seed,
+    ))
+}
+
+/// Write a fragment storage image's texels back to the texture it stands
+/// for, and drop host copies of that texture.
 fn land_storage_writeback<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -10219,6 +10395,16 @@ fn land_storage_writeback<M: HostMemory + HostOps>(
     target: &StorageWriteback,
     pixels: &[u8],
 ) {
+    if let Some(key) = target.heap {
+        let need = target.tight * target.height as usize;
+        if let Some(rows) = pixels.get(..need) {
+            state
+                .heap_snapshots
+                .insert(key, std::sync::Arc::new(rows.to_vec()));
+            crate::runtime::drain::note_store_route("frag_storage_heap_snapshot");
+        }
+        return;
+    }
     let rows = pixels.chunks_exact(target.tight).take(target.height as usize);
     let mut landed = true;
     for (y, row) in rows.enumerate() {

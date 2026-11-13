@@ -2575,6 +2575,12 @@ pub struct DeviceState {
     /// Raw compute encode for type-2/3 textures. Retained across GVA unmap;
     /// evicted on task/object lifetime end or descriptor mismatch.
     pub host_linear_textures: BTreeMap<(u32, u32), HostLinearTexture>,
+    /// What a storage write last left in a heap texture, keyed by task, texture
+    /// reference and lifetime generation, as tight rows in the texture's own
+    /// format. A heap texture has no guest bytes, and macOS 27 writes some only
+    /// this way, `inplace_copy_lph` among them. A pass that renders into the
+    /// texture again drops its entry.
+    pub heap_snapshots: BTreeMap<(u32, u32, u64), Arc<Vec<u8>>>,
     /// Perf memo for guest-CPU-produced linear textures (no host cache entry,
     /// so no producer generation exists). Coherence is re-established on
     /// every lookup by re-reading the native guest rows and comparing them
@@ -2905,6 +2911,7 @@ impl DeviceState {
             gva_cache_byte_cap: GVA_ENCODE_CACHE_BYTE_CAP,
             gva_eviction_witness: GvaEvictionWitness::default(),
             host_linear_textures: BTreeMap::new(),
+            heap_snapshots: BTreeMap::new(),
             compute_storage_residency: BTreeMap::new(),
             fence_flushed_mappings: std::collections::BTreeSet::new(),
             surface_write_kind: BTreeMap::new(),
@@ -3381,6 +3388,7 @@ impl DeviceState {
         self.node_guard.remove(&task_id);
         self.retire_task_linear_residents(task_id);
         self.host_linear_textures.retain(|&(t, _), _| t != task_id);
+        self.heap_snapshots.retain(|&(t, _, _), _| t != task_id);
         // New directory ⇒ old GVA HostOps views alias the wrong PT — retire.
         self.retire_task_gva_views(task_id);
         self.tasks
@@ -3432,6 +3440,7 @@ impl DeviceState {
         );
         self.retire_task_linear_residents(task_id);
         self.host_linear_textures.retain(|&(t, _), _| t != task_id);
+        self.heap_snapshots.retain(|&(t, _, _), _| t != task_id);
         self.host_texture_surfaces
             .retain(|&(t, _), _| t != task_id);
         // Clear texture→mapping latches for this task.
