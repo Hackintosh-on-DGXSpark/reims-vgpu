@@ -2300,12 +2300,10 @@ pub fn first_unsupported_vulkan_interface(
             count: 1,
         });
     }
-    if !reflection.imageblock_layouts.is_empty() {
-        return Some(UnsupportedVulkanInterface {
-            feature: "kernel_imageblock",
-            count: reflection.imageblock_layouts.len(),
-        });
-    }
+    // A compute kernel's explicit imageblock is not an interface the runtime
+    // provisions: the translator lowers it to a Workgroup array inside the
+    // shader, and its slice writes to ordinary storage-image writes. macOS 27's
+    // CoreAnimation blurs every Liquid Glass backdrop through such kernels.
     if !reflection.implicit_imageblock_attachments.is_empty() {
         return Some(UnsupportedVulkanInterface {
             feature: "implicit_imageblock_attachments",
