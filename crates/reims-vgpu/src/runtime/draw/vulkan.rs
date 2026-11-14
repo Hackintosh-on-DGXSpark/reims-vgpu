@@ -8802,22 +8802,29 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             );
             for (variant, stage) in [(&v_variant, "vertex"), (&f_variant, "fragment")] {
                 for reflected in variant.samplers.iter() {
-                    if sampler_binds.insert(reflected.binding) {
-                        let binding = reflected.binding;
-                        if let Some(state) = reflected.static_state {
-                            sampler_origin.insert(binding, b'c');
-                            samplers.push(
-                                reflected_static_sampler_resource(stage, binding, state)
-                                    .map_err(DrawError::DrawPreparation)?,
-                            );
-                        } else {
-                            sampler_origin.insert(binding, b'd');
-                            samplers.push(
-                                crate::backend::vulkan::engine::SamplerResource::normalized_default(
-                                    binding,
-                                ),
-                            );
+                    let binding = reflected.binding;
+                    // A constexpr sampler takes no slot in Metal's argument table, so the
+                    // translator gives it the first sampler binding the shader does not
+                    // declare. A sampler the guest left bound at that index belongs to no
+                    // argument of this shader, and Metal never consults it: the constexpr
+                    // state is what the shader samples with.
+                    if let Some(state) = reflected.static_state {
+                        if !sampler_binds.insert(binding) {
+                            samplers.retain(|sampler| sampler.binding != binding);
+                            crate::runtime::drain::note_store_route("sampler_static_over_bound");
                         }
+                        sampler_origin.insert(binding, b'c');
+                        samplers.push(
+                            reflected_static_sampler_resource(stage, binding, state)
+                                .map_err(DrawError::DrawPreparation)?,
+                        );
+                    } else if sampler_binds.insert(binding) {
+                        sampler_origin.insert(binding, b'd');
+                        samplers.push(
+                            crate::backend::vulkan::engine::SamplerResource::normalized_default(
+                                binding,
+                            ),
+                        );
                     }
                 }
             }

@@ -4349,6 +4349,11 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
         samplers.push(sampler);
     }
     for reflected in reflected_samplers.iter() {
+        // A constexpr sampler's binding is not an argument-table slot; a sampler the guest
+        // left bound at that index is not this kernel's (see the draw path's same rule).
+        if reflected.static_state.is_some() {
+            samplers.retain(|sampler| sampler.binding != reflected.binding);
+        }
         if !samplers
             .iter()
             .any(|sampler| sampler.binding == reflected.binding)
