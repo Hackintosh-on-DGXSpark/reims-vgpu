@@ -133,7 +133,7 @@ fn pipeline_cache_disk_path(uuid: &[u8; 16]) -> std::path::PathBuf {
     for b in uuid {
         let _ = write!(hex, "{b:02x}");
     }
-    std::env::temp_dir().join(format!("reims-vgpu-vk-pipeline-cache-{hex}.bin"))
+    crate::env::cache_dir().join(format!("reims-vgpu-vk-pipeline-cache-{hex}.bin"))
 }
 
 /// Outcome of one atomic pipeline-cache blob save.
@@ -1264,6 +1264,9 @@ impl DeviceContext {
         // (passing a blob not produced by vkGetPipelineCacheData for this
         // device is a Vulkan valid-usage violation, not a soft fallback).
         let pipeline_cache_path = pipeline_cache_disk_path(&props.pipeline_cache_uuid);
+        if let Some(parent) = pipeline_cache_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
         let initial_blob = match read_pipeline_cache_blob(&pipeline_cache_path, &props) {
             Ok(blob) => blob,
             Err(decline) => {

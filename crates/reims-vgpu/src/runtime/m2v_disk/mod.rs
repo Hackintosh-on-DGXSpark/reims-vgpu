@@ -45,8 +45,9 @@
 //!
 //! # On disk
 //!
-//! `$TMPDIR/reims-vgpu-m2v-cache/<translator>/` holds one `<identity>.m2v` per
-//! translation, and a `translator.txt` spelling out what `<translator>` stands
+//! `$TMPDIR/reims-vgpu-m2v-cache/<translator>/`, or the same under
+//! `REIMS_VGPU_CACHE_DIR` (see [`crate::env::CACHE_DIR`]), holds one
+//! `<identity>.m2v` per translation, and a `translator.txt` spelling out what `<translator>` stands
 //! for. A new translator starts an empty directory; the old one stays until an
 //! operator deletes it.
 //!
@@ -633,7 +634,7 @@ fn open_shared() -> Option<Arc<DiskCache>> {
         crate::observe::fail("linux_m2v_disk disabled reason=translator_source_unknown");
         return None;
     }
-    let root = std::env::temp_dir().join(ROOT);
+    let root = crate::env::cache_dir().join(ROOT);
     let started = Instant::now();
     let translator = translator_fingerprint();
     match DiskCache::open(&root, &translator) {

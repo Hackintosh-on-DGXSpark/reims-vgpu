@@ -123,6 +123,22 @@ pub const GUEST_IMPORT: &str = "REIMS_VGPU_GUEST_IMPORT";
 /// differs (command-buffer state versus an allocated set).
 pub const PUSH_DESCRIPTORS: &str = "REIMS_VGPU_PUSH_DESCRIPTORS";
 
+/// Where the Vulkan pipeline cache and the metal2vulkan translation cache live.
+/// Unset or empty, they sit in `$TMPDIR` beside this device's logs. A launcher
+/// that gives each virtual machine its own `$TMPDIR` can point this at a
+/// directory several machines share, so a new machine starts with the pipelines
+/// an earlier one compiled instead of compiling them again. Both caches publish
+/// by rename and check what they read, so processes may share one directory.
+pub const CACHE_DIR: &str = "REIMS_VGPU_CACHE_DIR";
+
+/// The directory [`CACHE_DIR`] names, or `$TMPDIR`.
+pub fn cache_dir() -> std::path::PathBuf {
+    std::env::var_os(CACHE_DIR)
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+}
+
 /// Verbose per-draw logging on top of the always-on fail sink.
 pub const DRAW_LOG: &str = "REIMS_VGPU_DRAW_LOG";
 
@@ -1537,6 +1553,21 @@ mod tests {
                 .to_ascii_lowercase();
             assert!(line.contains(&format!(" {short}=")), "{short} in {line}");
         }
+    }
+
+    /// The caches follow the variable when it names a directory and stay in
+    /// `$TMPDIR` when it is unset or empty.
+    #[test]
+    fn the_cache_directory_follows_its_variable() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: the lock serializes every mutation of this variable in this
+        // process; `cache_dir` below is the only reader.
+        unsafe { std::env::set_var(CACHE_DIR, "/var/cache/reims-test") };
+        assert_eq!(cache_dir(), std::path::PathBuf::from("/var/cache/reims-test"));
+        unsafe { std::env::set_var(CACHE_DIR, "") };
+        assert_eq!(cache_dir(), std::env::temp_dir());
+        unsafe { std::env::remove_var(CACHE_DIR) };
+        assert_eq!(cache_dir(), std::env::temp_dir());
     }
 
     /// A value the parse rejects reaches the line verbatim. An operator who
