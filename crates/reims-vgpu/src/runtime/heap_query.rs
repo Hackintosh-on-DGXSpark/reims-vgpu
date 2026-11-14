@@ -191,7 +191,7 @@ pub fn decode_serialized_texture_descriptor(body: &[u8]) -> Result<TextureDescri
         is_drawable: packed & (1 << 5) != 0,
         allow_gpu_optimized_contents: d.allow_gpu_optimized_contents(),
         usage: d.usage() as u32,
-        pixel_format: d.pixel_format(),
+        pixel_format: crate::contract::pixel_format::stored_format(d.pixel_format()),
         width: d.width.get(),
         height: d.height.get(),
         depth: d.depth.get(),
@@ -235,7 +235,7 @@ pub fn decode_wide_serialized_texture_descriptor(
         is_drawable: d.type_and_flags & (1 << 5) != 0,
         allow_gpu_optimized_contents: d.allow_gpu_optimized_contents(),
         usage: d.usage.get(),
-        pixel_format: d.pixel_format.get(),
+        pixel_format: crate::contract::pixel_format::stored_format(d.pixel_format.get()),
         width: d.width.get(),
         height: d.height.get(),
         depth: d.depth.get(),
@@ -318,11 +318,64 @@ pub fn query_size_and_align(desc: &TextureDescriptor) -> Result<SizeAndAlign, Qu
     })
 }
 
+/// Without a Metal device there is no requirement to ask for, and a guest left
+/// without an answer places every texture of a heap at the same offset. So this
+/// answers with a layout no smaller than any the guest then describes: rows
+/// padded to 256 bytes, every level page-rounded, every slice, face and sample
+/// counted, and the whole aligned to a 16 KiB page. That wastes heap space and
+/// never overlaps two textures.
 #[cfg(not(target_os = "macos"))]
-pub fn query_size_and_align(_desc: &TextureDescriptor) -> Result<SizeAndAlign, QueryError> {
-    // The Linux Vulkan pathway does not yet have a verified equivalence between
-    // VkImage memory requirements and Apple's guest heap placement contract.
-    Err(QueryError::NoMetalDevice)
+pub fn query_size_and_align(desc: &TextureDescriptor) -> Result<SizeAndAlign, QueryError> {
+    const ROW_ALIGN: u64 = 256;
+    const PAGE: u64 = 16 * 1024;
+    let faces: u64 = match desc.texture_type {
+        0..=4 | 7 | 8 => 1,
+        5 | 6 => 6,
+        _ => return Err(QueryError::UnknownTextureType),
+    };
+    if desc.protection_options != 0 {
+        return Err(QueryError::UnsupportedProtectionOptions);
+    }
+    let bpp = crate::contract::pixel_format::bytes_per_pixel(desc.pixel_format)
+        .ok_or(QueryError::UnknownPixelFormat)?;
+    let alpha_bpp = crate::contract::pixel_format::alpha_plane_bytes_per_pixel(desc.pixel_format);
+    let layers = u64::from(desc.array_length.max(1)) * faces * u64::from(desc.sample_count.max(1));
+    let mut size = 0u64;
+    for level in 0..u32::from(desc.mipmap_level_count.max(1)).min(32) {
+        let extent = |n: u32| u64::from((n >> level).max(1));
+        let depth = if desc.texture_type == 7 {
+            extent(desc.depth)
+        } else {
+            1
+        };
+        let row = (extent(desc.width) * u64::from(bpp)).div_ceil(ROW_ALIGN) * ROW_ALIGN;
+        let level_size = row
+            .checked_mul(extent(desc.height))
+            .and_then(|n| n.checked_mul(depth))
+            .and_then(|n| n.checked_mul(layers))
+            .map(|n| n.div_ceil(PAGE) * PAGE)
+            .ok_or(QueryError::ZeroRequirement)?;
+        size = size
+            .checked_add(level_size)
+            .ok_or(QueryError::ZeroRequirement)?;
+        if let Some(alpha_bpp) = alpha_bpp {
+            let alpha_row =
+                (extent(desc.width) * u64::from(alpha_bpp)).div_ceil(ROW_ALIGN) * ROW_ALIGN;
+            let alpha_level_size = alpha_row
+                .checked_mul(extent(desc.height))
+                .and_then(|n| n.checked_mul(depth))
+                .and_then(|n| n.checked_mul(layers))
+                .map(|n| n.div_ceil(PAGE) * PAGE)
+                .ok_or(QueryError::ZeroRequirement)?;
+            size = size
+                .checked_add(alpha_level_size)
+                .ok_or(QueryError::ZeroRequirement)?;
+        }
+    }
+    if size == 0 {
+        return Err(QueryError::ZeroRequirement);
+    }
+    Ok(SizeAndAlign { size, align: PAGE })
 }
 
 #[cfg(target_os = "macos")]
@@ -453,6 +506,40 @@ mod tests {
         .encode();
         assert_eq!(ld64(&reply[0..]), 0x78000);
         assert_eq!(ld64(&reply[8..]), 0x80);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn linux_query_covers_every_padded_level() {
+        let mut desc = decode_request(&live_request_fixture()).unwrap().descriptor;
+        desc.pixel_format = crate::contract::pixel_format::MTL_FORMAT_RGBA8_UNORM;
+        desc.texture_type = 2;
+        desc.width = 100;
+        desc.height = 10;
+        desc.depth = 1;
+        desc.mipmap_level_count = 2;
+        desc.sample_count = 1;
+        desc.array_length = 1;
+        desc.protection_options = 0;
+        let result = query_size_and_align(&desc).unwrap();
+        // 512-byte rows at level 0 and 256 at level 1, each level a page.
+        assert_eq!(
+            result,
+            SizeAndAlign {
+                size: 2 * 16384,
+                align: 16384
+            }
+        );
+        // Six faces: 30 720 bytes at level 0 and 7 680 at level 1.
+        desc.texture_type = 5;
+        assert_eq!(query_size_and_align(&desc).unwrap().size, 3 * 16384);
+        // Two-plane `RGB10A8_2P_XR10` (`550`) reserves a page-aligned Plane 1
+        // alpha allocation alongside Plane 0 so adjacent heap textures cannot
+        // overlap Plane 1.
+        desc.texture_type = 2;
+        desc.mipmap_level_count = 1;
+        desc.pixel_format = crate::contract::pixel_format::MTL_FORMAT_RGB10A8_2P_XR10;
+        assert_eq!(query_size_and_align(&desc).unwrap().size, 2 * 16384);
     }
 
     #[cfg(target_os = "macos")]

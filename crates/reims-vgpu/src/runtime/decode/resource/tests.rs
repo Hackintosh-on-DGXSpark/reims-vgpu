@@ -3155,3 +3155,193 @@ fn a_layout_table_past_u16_reports_its_real_length() {
         assert_eq!(icb_layout_table_len(tg_start, tg_start - 8, stride), 0);
     }
 }
+
+/// The type-9 descriptor macOS 15.6.1 attaches as colour 1 of its WindowServer
+/// passes, byte for byte.
+#[test]
+fn a_memoryless_texture_decodes_its_geometry_and_format() {
+    let hex = "010000002c0000000a00000042057300c0030000180000000100000001000100010030000000000000000000";
+    let bytes: Vec<u8> = (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+        .collect();
+    let tex = decode_memoryless_texture_descriptor(&bytes).expect("decodes");
+    assert_eq!(tex.pixel_format, 0x73);
+    assert_eq!((tex.width, tex.height, tex.depth), (960, 24, 1));
+    assert_eq!(tex.sample_count, 1);
+    assert!(decode_memoryless_texture_descriptor(&bytes[..20]).is_err());
+}
+
+#[test]
+fn a_declared_input_primitive_topology_does_not_refuse_the_pipeline() {
+    let decode_at = |topology: u32| {
+        let mut b = vec![0u8; 16 + 1 + 6 + 6];
+        let blen = b.len() as u32;
+        st32(&mut b[0..], TYPE7_OBJECT_RENDER_PIPELINE);
+        st32(&mut b[4..], blen);
+        st32(&mut b[8..], 9);
+        b[16] = 2;
+        b[17] = PIPELINE_TAG_VERTEX_FUNC;
+        b[18] = 4;
+        st32(&mut b[19..], 2);
+        b[23] = PIPELINE_TAG_INPUT_PRIMITIVE_TOPOLOGY;
+        b[24] = 4;
+        st32(&mut b[25..], topology);
+        decode_render_pipeline_descriptor(&b)
+    };
+
+    let triangle = decode_at(3).expect("a declared topology class is not a refusal");
+    let unspecified = decode_at(0).expect("nor is an unspecified one");
+    assert_eq!(
+        triangle, unspecified,
+        "the class must not reach the decoded pipeline: the topology a draw \
+         rasterizes at comes from its own primitive type"
+    );
+
+    assert!(RENDER_PIPELINE_TAGS_BENIGN.contains(&PIPELINE_TAG_INPUT_PRIMITIVE_TOPOLOGY));
+    assert!(!RENDER_PIPELINE_TAGS_BENIGN.contains(&0x6d));
+}
+
+#[test]
+fn sparse_secondary_color_attachment_does_not_alias_color0() {
+    use crate::contract::endian::st32;
+
+    let mut b = vec![0u8; 64];
+    st32(&mut b[0..], TYPE7_OBJECT_RENDER_PIPELINE);
+    st32(&mut b[8..], 21);
+    b[16] = 1;
+    b[17] = PIPELINE_TAG_COLOR_ATTACH_OFFSET;
+    b[18] = 4;
+    let color_rel = 8u32;
+    st32(&mut b[19..], color_rel);
+    let section = 16 + color_rel as usize;
+    st32(&mut b[section..], 1);
+    st32(&mut b[section + 4..], 8);
+    let entry = section + 8;
+    b[entry] = 3;
+    b[entry + 1] = COLOR_ATTACHMENT_TAG_INDEX;
+    b[entry + 2] = 4;
+    st32(&mut b[entry + 3..], 1);
+    b[entry + 7] = COLOR_ATTACHMENT_TAG_PIXEL_FORMAT;
+    b[entry + 8] = 4;
+    st32(&mut b[entry + 9..], 0x69);
+    b[entry + 13] = COLOR_ATTACHMENT_TAG_BLEND_ENABLE;
+    b[entry + 14] = 4;
+    st32(&mut b[entry + 15..], 1);
+    let end = (entry + 19 + 3) & !3;
+    b.truncate(end);
+    let payload_len = (end - 16) as u32;
+    st32(&mut b[4..], end as u32);
+    st32(&mut b[12..], payload_len);
+
+    let pd = decode_render_pipeline_descriptor(&b).expect("sparse secondary pipeline decodes");
+    assert_eq!(pd.color_attachments.len(), 1);
+    assert_eq!(pd.color_attachments[0].slot, 1);
+    assert!(pd.color_attachments[0].blending_enabled);
+    assert_eq!(pd.color0, PipelineColorAttachment::default());
+}
+
+fn from_hex(hex: &str) -> Vec<u8> {
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+        .collect()
+}
+
+/// A type-9 descriptor a 27.2 guest sent at protocol 237: a `0x34` record whose
+/// descriptor is `TextureDescriptor2`'s. Narrowed, the memoryless decoder reads
+/// the format and size it reads at protocol 62.
+#[test]
+fn a_wide_new_texture_record_is_read_as_the_narrow_one() {
+    let mut desc = from_hex(
+        "34000000340000000b00000042730005000000800700003c00000001000000\
+         010001000100300000000000000000000203040500",
+    );
+    assert_eq!(desc.len(), 52);
+    assert!(normalize_object_descriptor(
+        OBJECT_TYPE_MEMORYLESS_TEXTURE,
+        &mut desc
+    ));
+    assert_eq!(desc.len(), 44);
+    assert_eq!(ld32(&desc[0..]), 1);
+    assert_eq!(ld32(&desc[4..]), 44);
+    let tex = decode_memoryless_texture_descriptor(&desc).expect("decodes");
+    assert_eq!(tex.pixel_format, 0x73);
+    assert_eq!((tex.width, tex.height), (1920, 60));
+}
+
+/// A type-11 descriptor from the same boot: an eight-byte mapping prefix, then
+/// a `0x39` IOSurface-texture record with a four-byte plane.
+#[test]
+fn a_wide_iosurface_texture_record_keeps_its_mapping_and_geometry() {
+    let mut desc = from_hex(
+        "010000000000000039000000380000000a0000004250000500000080070000\
+         3c0000000100000001000100010010000000000000000000020304050000000000",
+    );
+    assert_eq!(desc.len(), 64);
+    assert!(normalize_object_descriptor(
+        OBJECT_TYPE_IOSURFACE,
+        &mut desc
+    ));
+    assert_eq!(desc.len(), 56);
+    let Descriptor::IOSurfaceTexture {
+        mapping_id,
+        object_ref,
+        pixel_format,
+        width,
+        height,
+    } = decode_iosurface_texture_descriptor(&desc).expect("decodes")
+    else {
+        panic!("not a type-11 descriptor");
+    };
+    assert_eq!((mapping_id, object_ref), (1, 0xa));
+    assert_eq!(pixel_format, 0x50);
+    assert_eq!((width, height), (1920, 60));
+}
+
+/// A linear texture's descriptor ends in the `0x34` record; only that tail is
+/// rewritten, and the format lands where the type-2 decoder reads it.
+#[test]
+fn a_linear_texture_descriptor_has_its_trailing_record_narrowed() {
+    let mut desc = vec![0u8; 72];
+    desc.extend(from_hex(
+        "34000000340000001000000042500005000100800700008000000001000000\
+         010001000100200000000000000000000203040500",
+    ));
+    assert!(normalize_object_descriptor(OBJECT_TYPE_TEXTURE, &mut desc));
+    assert_eq!(desc.len(), 72 + 44);
+    assert_eq!(ld32(&desc[72..]), 1);
+    assert_eq!(ld16(&desc[TEXTURE_DESC_PIXEL_FORMAT..]), 0x50);
+}
+
+/// A pool buffer is listed as a buffer and its descriptor padded to a buffer's.
+#[test]
+fn a_pool_buffer_is_read_as_a_buffer() {
+    let mut entry = vec![0u8; OBJECT_LIST_ENTRY_LEN];
+    st32(
+        &mut entry[OBJECT_LIST_ENTRY_HEADER..],
+        u32::from(OBJECT_TYPE_POOL_BUFFER) | (12 << OBJECT_DESC_LEN_SHIFT),
+    );
+    let entry = decode_list_object_entry(&entry).expect("decodes");
+    assert_eq!(entry.object_type, OBJECT_TYPE_BUFFER);
+    let mut desc = from_hex("0040000000000000d4000000");
+    assert!(normalize_object_descriptor(entry.object_type, &mut desc));
+    let buffer = decode_buffer_descriptor(&desc).expect("decodes");
+    assert_eq!(buffer.allocation_size, 0x4000);
+    assert_eq!(buffer.handle, 0xd4);
+}
+
+/// A protocol-62 descriptor is left alone.
+#[test]
+fn a_narrow_descriptor_is_not_rewritten() {
+    let mut desc = from_hex(
+        "01000000000000002f000000300000000a00000042055000800700003c00000001\
+         0000000100010001001000000000000000000000000000",
+    );
+    let before = desc.clone();
+    assert!(!normalize_object_descriptor(
+        OBJECT_TYPE_IOSURFACE,
+        &mut desc
+    ));
+    assert_eq!(desc, before);
+}

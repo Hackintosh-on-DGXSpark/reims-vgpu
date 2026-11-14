@@ -123,6 +123,22 @@ pub const GUEST_IMPORT: &str = "REIMS_VGPU_GUEST_IMPORT";
 /// differs (command-buffer state versus an allocated set).
 pub const PUSH_DESCRIPTORS: &str = "REIMS_VGPU_PUSH_DESCRIPTORS";
 
+/// Where the Vulkan pipeline cache and the metal2vulkan translation cache live.
+/// Unset or empty, they sit in `$TMPDIR` beside this device's logs. A launcher
+/// that gives each virtual machine its own `$TMPDIR` can point this at a
+/// directory several machines share, so a new machine starts with the pipelines
+/// an earlier one compiled instead of compiling them again. Both caches publish
+/// by rename and check what they read, so processes may share one directory.
+pub const CACHE_DIR: &str = "REIMS_VGPU_CACHE_DIR";
+
+/// The directory [`CACHE_DIR`] names, or `$TMPDIR`.
+pub fn cache_dir() -> std::path::PathBuf {
+    std::env::var_os(CACHE_DIR)
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+}
+
 /// Verbose per-draw logging on top of the always-on fail sink.
 pub const DRAW_LOG: &str = "REIMS_VGPU_DRAW_LOG";
 
@@ -188,6 +204,29 @@ pub const PAGE_GUARDS: &str = "REIMS_VGPU_PAGE_GUARDS";
 /// cost, so gating a latency probe behind it would guarantee the perturbation
 /// the probe is trying to measure.
 pub const RANGE_COVERAGE: &str = "REIMS_VGPU_RANGE_COVERAGE";
+
+/// What a thread without a vCPU does when a type-11 mapping's page list must be
+/// re-read: `strict` (the default) re-reads it through the runtime-validated
+/// software walk of [`crate::runtime::kernel_walk`] or refuses the write;
+/// `compat` writes through the cached page list as before that module, for a
+/// QEMU without the shim that answers EL1 translation state and for baselines.
+///
+/// Not an on/off switch, so it is read by value. Any value other than `compat`
+/// is `strict`, the side that never writes through an unwitnessed page list.
+pub const KVA_WALK: &str = "REIMS_VGPU_KVA_WALK";
+
+/// `on` samples the guest's wire count on every type-11 surface descriptor and
+/// logs its first wrong value beside the display, stamp and write events around
+/// it. A diagnostic: it reads guest kernel memory and changes nothing the guest
+/// sees. See [`crate::runtime::mapper::wire_watch`].
+pub const WIRE_WATCH: &str = "REIMS_VGPU_WIRE_WATCH";
+
+/// `on`, with [`WIRE_WATCH`] on, condemns a mapping incarnation at the first wire
+/// count anomaly the watch sees: its host writes are refused, its owed frame is
+/// dropped, and display presents naming it that were submitted before are
+/// completed without being shown. It only narrows: everything it stops is
+/// something this device would otherwise have done.
+pub const WIRE_GUARD: &str = "REIMS_VGPU_WIRE_GUARD";
 
 /// `off` stops narrowing a guest buffer bind to the extent the shader's
 /// reflection proved it can read, so the bind walks the rest of the allocation
@@ -318,6 +357,17 @@ pub const PRESENT_DEPTH: &str = "REIMS_VGPU_PRESENT_DEPTH";
 /// previous behavior has to stay reachable without a rebuild so the two can be
 /// A/B'd on one binary.
 pub const STAMP_COALESCE: &str = "REIMS_VGPU_STAMP_COALESCE";
+
+/// **Default on.** Setting this off builds a graphics pipeline inside the draw
+/// that first needs it — on the drain thread, under the device and engine
+/// locks — instead of on the pipeline compiler thread with the draw's packet
+/// waiting at its FIFO head. See `backend::vulkan::engine::pipeline_compiler`.
+///
+/// It exists so the two can be A/B'd on one binary: moving a compile off the
+/// draw changes when a packet runs relative to the others, and a regression in
+/// what the guest sees has to be attributable to that or ruled out without a
+/// rebuild. Off is the old behaviour exactly, long holds included.
+pub const PIPELINE_ASYNC: &str = "REIMS_VGPU_PIPELINE_ASYNC";
 
 /// **Probe, default off.** Setting this *on* cuts every guest-page scatter run
 /// into four contiguous sub-ranges that tile it exactly.
@@ -1089,6 +1139,15 @@ pub const FULLSCREEN: &str = "REIMS_VGPU_FULLSCREEN";
 /// flight instead of the last half millisecond of a batch.
 pub const BATCH_DRAWS: &str = "REIMS_VGPU_BATCH_DRAWS";
 
+/// **Default on.** metal2vulkan translations outlive the process: each one is
+/// published under `$TMPDIR/reims-vgpu-m2v-cache` and the next boot loads it
+/// instead of translating again — see [`crate::runtime::m2v_disk`].
+///
+/// `off` keeps translations in this process only, which is what every boot did
+/// before the disk cache existed. It is the other arm of the cache's A/B: the
+/// same binary, translating every shader cold.
+pub const M2V_DISK_CACHE: &str = "REIMS_VGPU_M2V_DISK_CACHE";
+
 /// What one variable says, including the two ways it says nothing usable.
 ///
 /// Four states rather than a `bool` because "unset", "explicitly on" and
@@ -1207,7 +1266,7 @@ pub fn switch(name: &str) -> Switch {
 /// Nothing enforces that a new `pub const` above is added to this list; the rule
 /// is stated and honestly unenforced. What keeps it small is that the list is
 /// next to the constants, and [`report_line`] is the only consumer.
-pub const ALL: [&str; 27] = [
+pub const ALL: [&str; 32] = [
     COLOR_GENERAL,
     LAZY_WRITEBACK,
     SLAB_RETAIN,
@@ -1226,12 +1285,16 @@ pub const ALL: [&str; 27] = [
     GPU_STAMP,
     PAGE_GUARDS,
     RANGE_COVERAGE,
+    KVA_WALK,
+    WIRE_WATCH,
+    WIRE_GUARD,
     BUFFER_EXTENT,
     BATCH_MIXED_TARGETS,
     BATCH_DEPTH,
     UNUSED_BINDS,
     PRESENT_DEPTH,
     STAMP_COALESCE,
+    PIPELINE_ASYNC,
     SCATTER_SPLIT,
     COMPUTE_SCATTER,
     // Absent from this list until 2026-08-11, which made the boot line silent
@@ -1245,6 +1308,7 @@ pub const ALL: [&str; 27] = [
     PASS_CHURN,
     SHARED_TARGET,
     FULLSCREEN,
+    M2V_DISK_CACHE,
 ];
 
 /// Every variable read as a [`count`] rather than as a [`Switch`].
@@ -1489,6 +1553,21 @@ mod tests {
                 .to_ascii_lowercase();
             assert!(line.contains(&format!(" {short}=")), "{short} in {line}");
         }
+    }
+
+    /// The caches follow the variable when it names a directory and stay in
+    /// `$TMPDIR` when it is unset or empty.
+    #[test]
+    fn the_cache_directory_follows_its_variable() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: the lock serializes every mutation of this variable in this
+        // process; `cache_dir` below is the only reader.
+        unsafe { std::env::set_var(CACHE_DIR, "/var/cache/reims-test") };
+        assert_eq!(cache_dir(), std::path::PathBuf::from("/var/cache/reims-test"));
+        unsafe { std::env::set_var(CACHE_DIR, "") };
+        assert_eq!(cache_dir(), std::env::temp_dir());
+        unsafe { std::env::remove_var(CACHE_DIR) };
+        assert_eq!(cache_dir(), std::env::temp_dir());
     }
 
     /// A value the parse rejects reaches the line verbatim. An operator who

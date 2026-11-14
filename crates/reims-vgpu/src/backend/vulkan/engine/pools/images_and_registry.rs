@@ -1054,14 +1054,10 @@ impl ResourcePools {
         // reclaims and retries on out-of-memory rather than trimming ahead of
         // one. See `recoverable_residents`.
         self.note_registry_reach();
-        let mut usage = vk::ImageUsageFlags::COLOR_ATTACHMENT
-            | vk::ImageUsageFlags::INPUT_ATTACHMENT
-            | vk::ImageUsageFlags::TRANSFER_SRC
-            | vk::ImageUsageFlags::TRANSFER_DST
-            | vk::ImageUsageFlags::SAMPLED;
-        if ctx.features.attachment_feedback_loop_layout {
-            usage |= vk::ImageUsageFlags::ATTACHMENT_FEEDBACK_LOOP_EXT;
-        }
+        let usage = super::super::registry_target_usage(
+            format.allocation(),
+            ctx.features.attachment_feedback_loop_layout,
+        );
         // Reuse a recycled image+memory+view of identical (geometry, format)
         // before allocating a fresh one — the usage set is identical across all
         // registry targets, so a recycled image of the same geometry/format is
@@ -1394,7 +1390,10 @@ impl ResourcePools {
         }
         // Census only, as in the primary `registry_ensure`.
         self.note_registry_reach();
-        let usage = super::super::registry_target_usage(format.allocation());
+        let usage = super::super::registry_target_usage(
+            format.allocation(),
+            ctx.features.attachment_feedback_loop_layout,
+        );
         // Reuse a recycled image+memory+view of identical (geometry, format)
         // before allocating — same recycle discipline as the primary
         // `registry_ensure`. Usage is a function of the format
@@ -1859,6 +1858,22 @@ impl ResourcePools {
         self.set_sole_copy(identity, !guest_backed);
     }
 
+    /// Record the GPU access left on a transient (`MTLStorageModeMemoryless`)
+    /// secondary colour attachment at encoder end without retaining rendered
+    /// contents across encoders or pinning the slot as sole-copy.
+    pub(crate) fn registry_discard_transient_color(
+        &mut self,
+        identity: &TargetIdentity,
+        access: ResidentAccess,
+    ) {
+        if let Some(slot) = self.registry.get_mut(identity) {
+            slot.content_ready = false;
+            slot.content_epoch = None;
+            slot.access = access;
+        }
+        self.set_sole_copy(identity, false);
+    }
+
     /// Mark a depth resident as holding rendered contents, after a pass that
     /// stored them.
     ///
@@ -2017,7 +2032,7 @@ impl ResourcePools {
         Some(
             self.registry
                 .get(identity)
-                .is_some_and(ResidentTargetSlot::released_and_collectable),
+                .is_some_and(|slot| slot.released_and_collectable(identity)),
         )
     }
 
@@ -2027,7 +2042,7 @@ impl ResourcePools {
             .filter(|identity| {
                 self.registry
                     .get(*identity)
-                    .is_some_and(ResidentTargetSlot::released_and_collectable)
+                    .is_some_and(|slot| slot.released_and_collectable(*identity))
             })
             .take(max)
             .cloned()
@@ -2332,7 +2347,8 @@ impl ResourcePools {
         self.registry_order
             .iter()
             .filter(|k| {
-                self.registry
+                !matches!(k, TargetIdentity::Heap { .. })
+                    && self.registry
                     .get(*k)
                     .is_some_and(|slot| slot.pin_count == 0 && !slot.gpu_only_content)
             })
@@ -2949,6 +2965,41 @@ pub(super) mod pin_count_tests {
             vec![id],
             "once the frame is in the guest's pages the slot is collectable"
         );
+    }
+
+    #[test]
+    fn released_private_residents_do_not_wait_for_a_guest_copy_out_that_cannot_happen() {
+        for id in [
+            TargetIdentity::Heap {
+                task_id: 3,
+                ref_: 9,
+                width: 64,
+                height: 64,
+                generation: 7,
+                format: translate::pixel::RESIDENT_RGBA_FORMAT,
+            },
+            TargetIdentity::Texture {
+                ref_: 11,
+                width: 64,
+                height: 64,
+                generation: 8,
+                stencil: false,
+            },
+        ] {
+            let mut pools = ResourcePools::new();
+            pools.registry.insert(id.clone(), dummy_slot(true));
+            pools.registry_order.push_back(id.clone());
+
+            assert_eq!(pools.retain_resident_target(&id), Some(false));
+            pools.registry_mark_ready(&id);
+            assert!(pools.registry[&id].gpu_only_content);
+            assert_eq!(
+                pools.release_resident_ownership(&id),
+                Some(true),
+                "private residents have no guest pages to copy out to: {id:?}"
+            );
+            assert_eq!(pools.released_resident_keys(1), vec![id]);
+        }
     }
 
     fn surf(id: u32) -> TargetIdentity {

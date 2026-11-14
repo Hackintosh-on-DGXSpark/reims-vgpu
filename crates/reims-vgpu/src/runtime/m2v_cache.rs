@@ -12,16 +12,20 @@
 //! hash narrows the bucket and `Slot::is` decides the hit; `ShaderId` carries
 //! the argument for why the digest is not allowed to.
 //! Measure-only hit/miss counters for fail-log census.
+//!
+//! Under it, [`crate::runtime::m2v_disk`] keeps what the translator returned
+//! across processes, so a miss here is a translation only once per translator.
 
 use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use metal2vulkan::passes::Stage;
+use metal2vulkan::passes::{Stage, TransformOptions};
 use metal2vulkan::reflect::ShaderReflection;
 
 use crate::observe::Decline;
+use crate::runtime::m2v_disk;
 
 type FragmentRelocationCache = HashMap<(bool, bool), Arc<ShaderVariant>>;
 type M2vResult<T> = Result<T, M2vCacheDecline>;
@@ -695,6 +699,9 @@ fn air_key_kernel(air: &[u8], local_size: [u32; 3]) -> u64 {
 }
 
 /// Process-local temp dir for m2v path-based translate (reused across draws).
+///
+/// Scratch only, despite the name: what outlives the process is
+/// [`crate::runtime::m2v_disk`]'s `reims-vgpu-m2v-cache/` beside it.
 fn tmp_dir() -> PathBuf {
     static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     DIR.get_or_init(|| {
@@ -710,7 +717,23 @@ fn translation_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
-fn translate_air(air: &[u8], stage: Stage) -> M2vResult<CachedShader> {
+/// Translate through [`crate::runtime::m2v_disk`], which answers from disk when
+/// an earlier process translated the same AIR with the same translator, and
+/// otherwise runs the translator and keeps its output for the next one. Either
+/// way the result goes through the same [`finish_translated`].
+fn translate_air(air: &[u8], stage: Stage, pipeline_ref: u32) -> M2vResult<CachedShader> {
+    let options = TransformOptions::default();
+    let key = m2v_disk::Key::new(stage, &options, air);
+    let translation =
+        m2v_disk::load_or_translate(&key, pipeline_ref, || run_translator(air, stage, options))?;
+    finish_translated(translation.spirv, translation.reflection, stage)
+}
+
+fn run_translator(
+    air: &[u8],
+    stage: Stage,
+    options: TransformOptions,
+) -> M2vResult<m2v_disk::Translation> {
     // metal2vulkan's tool boundary uses fixed scratch names inside `tmp_dir`.
     // Serialize sync and background calls so their AIR/LLVM/SPIR-V files never
     // alias one another.
@@ -726,23 +749,51 @@ fn translate_air(air: &[u8], stage: Stage) -> M2vResult<CachedShader> {
     // Reflected translate: byte-identical SPIR-V PLUS the stage-interface facade.
     // `reflection.datalayout` carries the source `target datalayout` the sanitizer
     // strips, so the post-emit ABI reconciliation below no longer re-reads `k.ll`.
-    let (spirv, reflection) =
-        metal2vulkan::translate_reflected(path.to_str().unwrap_or(name), stage, &tmp)
-            .map_err(|e| translate_decline(stage, e.to_string()))?;
-    finish_translated(spirv, reflection, stage)
+    // The options are passed rather than defaulted inside the translator, so
+    // the ones the disk key names are the ones it ran with.
+    let (spirv, reflection) = metal2vulkan::translate_reflected_with_options(
+        path.to_str().unwrap_or(name),
+        stage,
+        &tmp,
+        options,
+    )
+    .map_err(|e| {
+        // The next shader reuses the scratch name; keep this one for
+        // the translator.
+        let _ = std::fs::copy(&path, tmp.join(format!("failed-{}-{name}", air.len())));
+        translate_decline(stage, e.to_string())
+    })?;
+    Ok(m2v_disk::Translation { spirv, reflection })
 }
 
-fn translate_kernel_air(air: &[u8], local_size: [u32; 3]) -> M2vResult<CachedShader> {
+fn translate_kernel_air(
+    air: &[u8],
+    local_size: [u32; 3],
+    pipeline_ref: u32,
+) -> M2vResult<CachedShader> {
+    let opts = TransformOptions {
+        kernel_local_size: local_size,
+        ..Default::default()
+    };
+    let key = m2v_disk::Key::new(Stage::Kernel, &opts, air);
+    let m2v_disk::Translation { spirv, reflection } =
+        m2v_disk::load_or_translate(&key, pipeline_ref, || run_kernel_translator(air, opts))?;
+    if reflection.local_size != Some(local_size) {
+        return Err(M2vCacheDecline::KernelLocalSizeMismatch {
+            requested: local_size,
+            reflected: reflection.local_size,
+        });
+    }
+    finish_translated(spirv, reflection, Stage::Kernel)
+}
+
+fn run_kernel_translator(air: &[u8], opts: TransformOptions) -> M2vResult<m2v_disk::Translation> {
     let _guard = translation_lock().lock().unwrap_or_else(|e| e.into_inner());
     let tmp = tmp_dir();
     let path = tmp.join("k.air");
     std::fs::write(&path, air).map_err(|e| M2vCacheDecline::KernelScratchWrite {
         detail: e.to_string(),
     })?;
-    let opts = metal2vulkan::passes::TransformOptions {
-        kernel_local_size: local_size,
-        ..Default::default()
-    };
     let (spirv, reflection) = metal2vulkan::translate_reflected_with_options(
         path.to_str().unwrap_or("k.air"),
         Stage::Kernel,
@@ -752,13 +803,7 @@ fn translate_kernel_air(air: &[u8], local_size: [u32; 3]) -> M2vResult<CachedSha
     .map_err(|e| M2vCacheDecline::KernelTranslate {
         detail: e.to_string(),
     })?;
-    if reflection.local_size != Some(local_size) {
-        return Err(M2vCacheDecline::KernelLocalSizeMismatch {
-            requested: local_size,
-            reflected: reflection.local_size,
-        });
-    }
-    finish_translated(spirv, reflection, Stage::Kernel)
+    Ok(m2v_disk::Translation { spirv, reflection })
 }
 
 /// Post-emit ABI reconciliation + package the translated shader with its reflection.
@@ -910,13 +955,15 @@ fn async_worker() {
                 Some(task) => task,
                 None => {
                     c.async_worker_running = false;
+                    drop(c);
+                    m2v_disk::summarize();
                     return;
                 }
             }
         };
         let result = match task.kernel_local_size {
-            Some(local_size) => translate_kernel_air(&task.air, local_size),
-            None => translate_air(&task.air, task.stage),
+            Some(local_size) => translate_kernel_air(&task.air, local_size, task.pipeline_ref),
+            None => translate_air(&task.air, task.stage, task.pipeline_ref),
         };
         let (hits, misses, detail, failure) = {
             let mut c = global().lock().unwrap_or_else(|e| e.into_inner());
@@ -1070,7 +1117,7 @@ pub fn translate_cached_reflected(
         }
     }
 
-    let shader = Arc::new(translate_air(air, stage)?);
+    let shader = Arc::new(translate_air(air, stage, pipeline_ref)?);
 
     {
         let mut c = global().lock().unwrap_or_else(|e| e.into_inner());
@@ -1131,7 +1178,7 @@ pub fn translate_cached_kernel_reflected(
         }
     }
 
-    let shader = Arc::new(translate_kernel_air(air, local_size)?);
+    let shader = Arc::new(translate_kernel_air(air, local_size, pipeline_ref)?);
 
     {
         let mut c = global().lock().unwrap_or_else(|e| e.into_inner());
@@ -1800,6 +1847,58 @@ mod tests {
         assert!(!ensure_cached_kernel_async(air, [16, 16, 1], 20));
         assert!(global().lock().unwrap().async_queue.is_empty());
         assert!(ensure_cached_kernel_async(air, [0, 16, 1], 20));
+        reset_for_test();
+    }
+
+    /// A shader the next process loads from disk is the shader this process
+    /// translated: the same SPIR-V bytes and words and the same reflection,
+    /// through the same `finish_translated`. "The next process" is an emptied
+    /// memory cache over a newly opened disk cache on the same directory.
+    #[test]
+    fn a_shader_loaded_from_disk_is_the_shader_a_translation_makes() {
+        use crate::runtime::m2v_disk::tests::{Installed, TempRoot};
+        use crate::runtime::m2v_disk::{translator_fingerprint, DiskCache};
+
+        let _guard = test_lock();
+        if metal2vulkan::tools::run("llvm-dis", &["--version"]).is_err() {
+            eprintln!("skipped: no llvm-dis to translate with (QEMU gets /usr/lib/llvm-20/bin)");
+            return;
+        }
+        let air = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/air/render_frag_static_sampler.air"
+        ))
+        .expect("the fixture is checked in");
+        let root = TempRoot::new("translate");
+        let translator = translator_fingerprint();
+
+        reset_for_test();
+        let first = Arc::new(DiskCache::open(root.path(), &translator).expect("open"));
+        let installed = Installed::new(Arc::clone(&first));
+        let fresh = translate_cached_reflected(&air, Stage::Fragment, 22).expect("translates");
+        drop(installed);
+        assert_eq!((first.counts().misses, first.counts().stored), (1, 1));
+        assert!(
+            fresh
+                .reflection
+                .bindings
+                .iter()
+                .any(|binding| binding.static_sampler.is_some()),
+            "the fixture's static sampler reached the reflection"
+        );
+
+        reset_for_test();
+        let second = Arc::new(DiskCache::open(root.path(), &translator).expect("reopen"));
+        assert_eq!(second.entries_at_open(), 1);
+        let _installed = Installed::new(Arc::clone(&second));
+        let loaded = translate_cached_reflected(&air, Stage::Fragment, 22).expect("loads");
+        assert_eq!((second.counts().hits, second.counts().misses), (1, 0));
+        assert_eq!(loaded.spirv, fresh.spirv);
+        assert_eq!(*loaded.words, *fresh.words);
+        assert_eq!(
+            format!("{:?}", loaded.reflection),
+            format!("{:?}", fresh.reflection)
+        );
         reset_for_test();
     }
 

@@ -7,8 +7,8 @@ use std::collections::BTreeSet;
 use std::sync::atomic::Ordering;
 
 use super::caches::{
-    canonicalize_layout_bindings, AttrKey, BindingSig, LayoutKey, ObjectCaches, PassKey,
-    PipelineKey, SecondaryAttachKey, MAX_SECONDARY_ATTACH,
+    canonicalize_layout_bindings, AttrKey, BindingSig, GraphicsPipelineAsk, LayoutKey,
+    ObjectCaches, PassKey, PipelineKey, PipelineReady, SecondaryAttachKey, MAX_SECONDARY_ATTACH,
 };
 use super::context::ContextOwner;
 use super::counters::{CreateSite, EngineCounters};
@@ -20,7 +20,7 @@ use super::pools::{
 };
 use super::stage_phase;
 use super::types::{
-    BufferContent, ColorWriteMask, DrawError, DrawOutput, DrawRequest, ResidentReclaim,
+    BufferContent, ColorWriteMask, DrawAnswer, DrawError, DrawOutput, DrawRequest, ResidentReclaim,
     SampledSource, ScissorResource, SeedOrder, TargetIdentity, VertexStepFunction,
     ViewportResource, VisibilityResultMode,
 };
@@ -1509,24 +1509,21 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
         }
     }
     if let Some(target) = &req.target_rgba8 {
-        // The seed is one tightly-packed RGBA8 slice of the target, and the
-        // length is checked rather than taken. `w as usize * h as usize` widens
-        // its operands, which reads as safe and is — but only just: two u32
-        // maxima multiply to a hair under u64::MAX, so the bytes-per-texel is a
-        // third factor that overflows. A refusal rather than a clamp, because
-        // this length is what the next line compares the buffer against and a
-        // wrapped one would let a short buffer match.
+        let seed_bpp = match req.target_seed_order {
+            SeedOrder::Rgba8 | SeedOrder::Bgra8 => crate::contract::pixel_format::RGBA8_BPP,
+            SeedOrder::Native(layout) => layout.bytes_per_texel(),
+        };
         let Some(expected) = crate::contract::extent::tight_image_bytes(
             req.width,
             req.height,
-            crate::contract::pixel_format::RGBA8_BPP as usize,
+            seed_bpp as usize,
         ) else {
             return Err(DrawError::DrawValidation(
                 DrawValidationDecline::UnrepresentableImageBytes {
                     width: req.width,
                     height: req.height,
                     layers: 1,
-                    bytes_per_texel: crate::contract::pixel_format::RGBA8_BPP,
+                    bytes_per_texel: seed_bpp,
                 },
             ));
         };
@@ -2059,11 +2056,13 @@ unsafe fn upload_buffer_to_sampled_image(
     array_layers: u32,
     extent_depth: u32,
     row_length_texels: u32,
+    mip_levels: u32,
 ) {
+    let mip_levels = mip_levels.max(1);
     let range = vk::ImageSubresourceRange {
         aspect_mask: vk::ImageAspectFlags::COLOR,
         base_mip_level: 0,
-        level_count: 1,
+        level_count: mip_levels,
         base_array_layer: 0,
         layer_count: array_layers,
     };
@@ -2104,13 +2103,76 @@ unsafe fn upload_buffer_to_sampled_image(
         vk::ImageLayout::TRANSFER_DST_OPTIMAL,
         &copy,
     );
-    let to_shader = [vk::ImageMemoryBarrier::default()
+    // Each level above 0 is the one below it halved with a linear blit. The
+    // source level moves to TRANSFER_SRC before its blit; the last level
+    // stays TRANSFER_DST, so the two groups leave for the shader separately.
+    let level = |base_mip_level, level_count| vk::ImageSubresourceRange {
+        base_mip_level,
+        level_count,
+        ..range
+    };
+    for dst in 1..mip_levels {
+        let to_source = [vk::ImageMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+            .image(image)
+            .subresource_range(level(dst - 1, 1))];
+        ctx.device.cmd_pipeline_barrier(
+            cb,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &to_source,
+        );
+        let corner = |mip: u32| vk::Offset3D {
+            x: (width >> mip).max(1) as i32,
+            y: (height >> mip).max(1) as i32,
+            z: 1,
+        };
+        let layers = |mip_level| vk::ImageSubresourceLayers {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            mip_level,
+            base_array_layer: 0,
+            layer_count: array_layers,
+        };
+        let blit = [vk::ImageBlit::default()
+            .src_subresource(layers(dst - 1))
+            .src_offsets([vk::Offset3D::default(), corner(dst - 1)])
+            .dst_subresource(layers(dst))
+            .dst_offsets([vk::Offset3D::default(), corner(dst)])];
+        ctx.device.cmd_blit_image(
+            cb,
+            image,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &blit,
+            vk::Filter::LINEAR,
+        );
+    }
+    let last = mip_levels - 1;
+    let mut to_shader = vec![vk::ImageMemoryBarrier::default()
         .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
         .dst_access_mask(vk::AccessFlags::SHADER_READ)
         .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
         .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
         .image(image)
-        .subresource_range(range)];
+        .subresource_range(level(last, 1))];
+    if last > 0 {
+        to_shader.push(
+            vk::ImageMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_READ)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .image(image)
+                .subresource_range(level(0, last)),
+        );
+    }
     ctx.device.cmd_pipeline_barrier(
         cb,
         vk::PipelineStageFlags::TRANSFER,
@@ -2591,7 +2653,7 @@ pub(crate) unsafe fn execute_draw_inner(
     pools: &mut ResourcePools,
     counters: &EngineCounters,
     req: &DrawRequest,
-) -> Result<DrawOutput, DrawError> {
+) -> Result<DrawAnswer, DrawError> {
     // Charges this draw's wall clock to one phase at a time; commits from
     // `Drop`, so the `?` returns below keep their time.
     let mut phase = super::draw_phase::DrawTimer::start();
@@ -2671,6 +2733,360 @@ pub(crate) unsafe fn execute_draw_inner(
         height: req.height,
         bgra: output_bgra,
     });
+    phase.enter(super::draw_phase::Phase::Pipeline);
+
+    // Build layout key from storage / sampled / sampler bindings. Sized up
+    // front: this grew from empty on every draw, so a draw with the eight or so
+    // descriptors a Maps chain binds paid three reallocations to reach a width
+    // its inputs already state.
+    let mut layout_bindings = Vec::with_capacity(
+        req.storage_buffers.len()
+            + req.sampled_images.len()
+            + req.samplers.len()
+            + req.color_inputs.count_ones() as usize,
+    );
+    for b in &req.storage_buffers {
+        layout_bindings.push(BindingSig {
+            binding: b.binding,
+            ty: vk::DescriptorType::STORAGE_BUFFER.as_raw() as u32,
+            stages: (vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT).as_raw(),
+            count: 1,
+        });
+    }
+    for b in &req.sampled_images {
+        layout_bindings.push(BindingSig {
+            binding: b.binding,
+            ty: vk::DescriptorType::SAMPLED_IMAGE.as_raw() as u32,
+            stages: (vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT).as_raw(),
+            count: b.descriptor_count,
+        });
+    }
+    for b in &req.samplers {
+        layout_bindings.push(BindingSig {
+            binding: b.binding,
+            ty: vk::DescriptorType::SAMPLER.as_raw() as u32,
+            stages: (vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT).as_raw(),
+            count: 1,
+        });
+    }
+    for image in &req.scratch_storage_images {
+        layout_bindings.push(BindingSig {
+            binding: image.binding,
+            ty: vk::DescriptorType::STORAGE_IMAGE.as_raw() as u32,
+            stages: vk::ShaderStageFlags::FRAGMENT.as_raw(),
+            count: 1,
+        });
+    }
+    for index in (0..8u32).filter(|index| req.color_inputs & (1 << index) != 0) {
+        layout_bindings.push(BindingSig {
+            binding: super::types::COLOR_INPUT_BINDING + index,
+            ty: vk::DescriptorType::INPUT_ATTACHMENT.as_raw() as u32,
+            stages: vk::ShaderStageFlags::FRAGMENT.as_raw(),
+            count: 1,
+        });
+    }
+    let layout_bindings = canonicalize_layout_bindings(layout_bindings)?;
+    if let Some(binding) = layout_bindings.iter().find(|binding| binding.count > 1) {
+        let dynamic_indexing = ctx.features.sampled_image_array_dynamic_indexing;
+        let required_descriptors = layout_bindings
+            .iter()
+            .filter(|candidate| {
+                vk::DescriptorType::from_raw(candidate.ty as i32)
+                    == vk::DescriptorType::SAMPLED_IMAGE
+            })
+            .fold(0u32, |total, candidate| {
+                total.saturating_add(candidate.count)
+            });
+        let descriptor_limit = ctx.features.sampled_image_descriptor_limit;
+        if !ctx.features.sampled_descriptor_arrays(required_descriptors) {
+            return Err(DrawError::Unsupported(
+                super::reason::DrawReason::DescriptorArrayUnsupported {
+                    binding: binding.binding,
+                    count: binding.count,
+                    required_descriptors,
+                    descriptor_limit,
+                    partially_bound: ctx.features.descriptor_binding_partially_bound,
+                    dynamic_indexing,
+                },
+            ));
+        }
+    }
+    // The backstop the compute path has carried since `25051457` and this one
+    // did not. Both of a draw's modules are checked, because either can name a
+    // binding the layout above omits and the divide-by-zero is in the driver's
+    // shared layout scoring rather than in anything stage-specific.
+    if let Some((binding, fragment)) =
+        used_binding_absent_from_layout(&req.vert_spirv, &req.frag_spirv, &layout_bindings)
+    {
+        return Err(DrawError::Unsupported(
+            super::reason::DrawReason::UsedBindingAbsentFromLayout { binding, fragment },
+        ));
+    }
+    let layout_key = LayoutKey {
+        bindings: layout_bindings,
+    };
+    // Resolve load action: resident > guest/host seed > Clear black.
+    let mut load_uses_gpu_content = req.load_from_target;
+    // output_bgra (computed with the batch decision above): BGRA output only
+    // on the resident path (pooled targets stay RGBA); the whole
+    // pass/pipeline/image chain then agrees on B8G8R8A8 so a raw image→buffer
+    // copy lands guest scanout order with no CPU swizzle.
+    // The seed is borrowed from `req`, never copied to the heap. It is a whole
+    // frame, and `engine_delta` measures ~430 MB/s of seed uploads under a
+    // browser workload — so a `Vec` here is ~430 MB/s of memcpy plus ~240
+    // multi-MiB allocations a second on the drain worker that `drain_duty`
+    // shows pinned at duty 0.9+. The only thing that copy bought was a buffer
+    // the `output_bgra` arm could swizzle in place; that swizzle now happens
+    // during the single copy into the mapped staging span, so the pixels are
+    // touched once either way.
+    let seed_bytes: Option<&[u8]> = if load_uses_gpu_content {
+        None
+    } else {
+        req.target_rgba8.as_ref().map(|v| v.as_slice())
+    };
+    let mut pass_key = PassKey::single(
+        load_uses_gpu_content
+            || seed_bytes.is_some()
+            || req.target_guest_seed.is_some()
+            || req.seed_from_target.is_some(),
+        color0_format,
+    );
+    pass_key.host_accessible_color0 = req.guest_target_memory.is_some();
+    for (i, sec) in req.secondary_targets.iter().enumerate() {
+        if i >= MAX_SECONDARY_ATTACH {
+            return Err(DrawError::Unsupported(
+                super::reason::DrawReason::SecondaryAttachmentCap {
+                    requested: req.secondary_targets.len(),
+                    cap: MAX_SECONDARY_ATTACH,
+                },
+            ));
+        }
+        pass_key.secondary[i] = SecondaryAttachKey {
+            format: sec.format,
+            load: sec.load,
+        };
+    }
+    pass_key.secondary_count = req.secondary_targets.len() as u8;
+    pass_key.color_inputs = req.color_inputs;
+    for resource in &req.sampled_images {
+        if let Some(index) =
+            feedback_color_index(req, resource, ctx.features.attachment_feedback_loop_layout)
+        {
+            pass_key.feedback_colors |= 1u8 << index;
+        }
+    }
+    // Whether this draw has a depth attachment, and whether it carries stencil,
+    // is part of the pipeline's pass compatibility; how it loads is not, and
+    // the attachment itself is acquired after the pipeline exists (below).
+    pass_key.depth = req.depth.as_ref().map(|d| super::caches::DepthAttachKey {
+        load: false,
+        stencil: d.stencil.is_some(),
+    });
+    let raster_sample_count = req.raster_sample_count.max(1);
+    let color_sample_count = req.color_sample_count.max(1);
+    if color_sample_count != raster_sample_count {
+        return Err(DrawError::Unsupported(
+            super::reason::DrawReason::MultisampleAttachmentSampleCountMismatch {
+                attachment: color_sample_count,
+                raster: raster_sample_count,
+            },
+        ));
+    }
+    if req.multisample_resolve && raster_sample_count == 1 {
+        return Err(DrawError::Unsupported(
+            super::reason::DrawReason::MultisampleSampleCountUnsupported {
+                requested: raster_sample_count,
+                limit: ctx.features.max_sample_count,
+            },
+        ));
+    }
+    if raster_sample_count > 1 {
+        if !raster_sample_count.is_power_of_two()
+            || raster_sample_count > ctx.features.max_sample_count
+        {
+            return Err(DrawError::Unsupported(
+                super::reason::DrawReason::MultisampleSampleCountUnsupported {
+                    requested: raster_sample_count,
+                    limit: ctx.features.max_sample_count,
+                },
+            ));
+        }
+        if !req.secondary_targets.is_empty() || req.color_inputs != 0 {
+            return Err(DrawError::Unsupported(
+                super::reason::DrawReason::MultisampleResolveShapeUnsupported {
+                    color_targets: 1u32.saturating_add(req.secondary_targets.len() as u32),
+                    depth: req.depth.is_some(),
+                    color_input: req.color_inputs != 0,
+                },
+            ));
+        }
+        if !req.multisample_resolve {
+            if req.target_identity.is_none() {
+                return Err(DrawError::Unsupported(
+                    super::reason::DrawReason::MultisampleResidentTargetMissing {
+                        sample_count: raster_sample_count,
+                    },
+                ));
+            }
+            if !req.skip_readback
+                || req.target_rgba8.is_some()
+                || req.target_guest_seed.is_some()
+                || req.load_guest_target_backing
+            {
+                return Err(DrawError::Unsupported(
+                    super::reason::DrawReason::MultisampleLinearTransferUnsupported {
+                        sample_count: raster_sample_count,
+                    },
+                ));
+            }
+        }
+    }
+    pass_key.sample_count = raster_sample_count;
+    pass_key.multisample_resolve = req.multisample_resolve;
+    let attr_keys: Vec<AttrKey> = req
+        .vertex_attributes
+        .iter()
+        .map(|a| AttrKey {
+            location: a.location,
+            binding: a.binding,
+            format: a.format,
+            offset: a.offset,
+            stride: a.stride,
+            step_function: a.step_function,
+            step_rate: a.step_rate,
+        })
+        .collect();
+
+    phase.enter(super::draw_phase::Phase::PipelineShader);
+    let shader_caps = super::caches::SpirvStorageCaps::of(ctx);
+    let vert_digest = caches.graphics_shader_digest(shader_caps, &req.vert_spirv, counters)?;
+    let frag_digest = caches.graphics_shader_digest(shader_caps, &req.frag_spirv, counters)?;
+    phase.enter(super::draw_phase::Phase::PipelineLayoutPass);
+    let (dsl, pipeline_layout) = caches.get_or_create_layout(ctx, &layout_key, counters, pools)?;
+    // The pipeline is built against a pass with only this draw's
+    // compatibility state in it. The pass the draw records into also says how
+    // each attachment loads, and the depth half of that is known only once the
+    // depth attachment is acquired, which waits until the pipeline exists.
+    let compatible_pass =
+        caches.get_or_create_pass(ctx, pass_key.compatibility().pass_key(), counters, pools)?;
+    phase.enter(super::draw_phase::Phase::Pipeline);
+    // How many viewport slots this draw rasterizes into, checked against the
+    // host before it is baked into a pipeline. Refused rather than clamped:
+    // clamping would silently drop the viewports past the host's limit, which
+    // is the loss this list was widened to stop, and a `viewportCount` above
+    // `maxViewports` — or above 1 without `multiViewport` — makes the pipeline
+    // invalid rather than merely unsupported.
+    let slot_count = super::viewport_slot_count(req);
+    let slot_count_u32 = u32::try_from(slot_count).unwrap_or(u32::MAX);
+    let max_slots = if ctx.features.multi_viewport {
+        ctx.features.max_viewports
+    } else {
+        1
+    };
+    if slot_count_u32 > max_slots {
+        return Err(DrawError::Unsupported(
+            super::reason::DrawReason::ViewportSlotsUnsupported {
+                requested: slot_count_u32,
+                limit: max_slots,
+                multi_viewport: ctx.features.multi_viewport,
+            },
+        ));
+    }
+    // Resolve the occlusion query before anything is recorded, so a host that
+    // cannot count refuses the draw rather than recording one it must throw
+    // away. `Boolean` needs nothing: an imprecise Vulkan occlusion query is
+    // that mode exactly.
+    let occlusion_flags = match req.occlusion_query {
+        None => None,
+        Some(VisibilityResultMode::Counting) if !ctx.features.occlusion_query_precise => {
+            return Err(DrawError::Unsupported(
+                super::reason::DrawReason::VisibilityCountingUnsupported {
+                    occlusion_query_precise: ctx.features.occlusion_query_precise,
+                },
+            ));
+        }
+        Some(mode) => Some(crate::backend::vulkan::translate::raster::vk_query_control_flags(mode)),
+    };
+    let pipeline_key =
+        PipelineKey {
+            vert: vert_digest,
+            frag: frag_digest,
+            attrs: attr_keys,
+            topology: req.primitive_topology,
+            blend: req.blend.map(|b| b.key()),
+            secondary_blend: {
+                let mut per_slot = [None; MAX_SECONDARY_ATTACH];
+                for (slot, target) in req
+                    .secondary_targets
+                    .iter()
+                    .take(MAX_SECONDARY_ATTACH)
+                    .enumerate()
+                {
+                    per_slot[slot] = target.blend.map(|b| b.key());
+                }
+                per_slot
+            },
+            color_write_mask: {
+                let mut per_slot = [ColorWriteMask::default(); 1 + MAX_SECONDARY_ATTACH];
+                per_slot[0] = req.color_write_mask;
+                for (slot, target) in req
+                    .secondary_targets
+                    .iter()
+                    .take(MAX_SECONDARY_ATTACH)
+                    .enumerate()
+                {
+                    per_slot[slot + 1] = target.color_write_mask;
+                }
+                per_slot
+            },
+            pass: pass_key.compatibility(),
+            // Taken from the pass key this draw built, not from `pass`, which
+            // erases it once feedback stops changing the render pass.
+            feedback_colors: pass_key.feedback_colors,
+            cull_mode: req.cull_mode,
+            front_face_ccw: req.front_face_ccw,
+            fill_mode: req.fill_mode,
+            depth_clip: req.depth_clip,
+            depth_test: req.depth.as_ref().map(|d| d.test_enable).unwrap_or(false),
+            depth_write: req.depth.as_ref().map(|d| d.write_enable).unwrap_or(false),
+            depth_compare: req
+                .depth
+                .as_ref()
+                .map(|d| d.compare)
+                .unwrap_or(super::types::SamplerCompareFunction::Always),
+            stencil: req.depth.as_ref().and_then(|d| d.stencil).map(|s| {
+                super::caches::StencilKey {
+                    front: s.front,
+                    back: s.back,
+                }
+            }),
+            viewport_slots: slot_count_u32,
+            layout: layout_key.clone(),
+        };
+    // One cache, consulted once, and before anything is claimed, acquired or
+    // recorded for this draw: a pipeline that is not built yet is handed to the
+    // compiler and the draw returns `PipelinePending` having changed nothing,
+    // so the runtime can run it again from the top once the ticket is
+    // answered. See `super::pipeline_compiler`.
+    phase.enter(super::draw_phase::Phase::PipelineCompile);
+    let ask = GraphicsPipelineAsk {
+        key: &pipeline_key,
+        pipeline_object: req.pipeline_object.as_ref(),
+        wait: req.pipeline_wait.as_ref(),
+        vert: &req.vert_spirv,
+        frag: &req.frag_spirv,
+        pipeline_layout,
+        render_pass: compatible_pass,
+    };
+    let pipeline = match caches.resolve_graphics_pipeline(ctx, pools, counters, ask)? {
+        PipelineReady::Built(pipeline) => pipeline,
+        PipelineReady::Pending(ticket) => {
+            counters.pipeline_pending.fetch_add(1, Ordering::Relaxed);
+            super::draw_phase::note_pending();
+            return Ok(DrawAnswer::PipelinePending(ticket));
+        }
+    };
+    phase.enter(super::draw_phase::Phase::Prep);
     // Why this draw does not append to the open batch, named by its first
     // refusing term.
     //
@@ -2789,7 +3205,8 @@ pub(crate) unsafe fn execute_draw_inner(
         batch_full: matches!(fit, BatchFit::Full),
         target_switch: matches!(fit, BatchFit::OtherTarget),
     };
-    let batch_eligible = terms.batch_eligible();
+    let batch_eligible = terms.batch_eligible()
+        && !req.scratch_storage_images.iter().any(|image| image.read_back);
     let no_join = terms.refusal();
     // The join arm splits by self-alias, and the two must sum to the joins.
     // `nojoin_samples_own_target` was 29.7 % of all draws and is the population
@@ -2840,140 +3257,6 @@ pub(crate) unsafe fn execute_draw_inner(
         // been submitted, so nothing may free one out from under it.
         _ => pools.begin_entry(ctx, counters)?,
     };
-    phase.enter(super::draw_phase::Phase::Pipeline);
-
-    // Build layout key from storage / sampled / sampler bindings. Sized up
-    // front: this grew from empty on every draw, so a draw with the eight or so
-    // descriptors a Maps chain binds paid three reallocations to reach a width
-    // its inputs already state.
-    let mut layout_bindings = Vec::with_capacity(
-        req.storage_buffers.len()
-            + req.sampled_images.len()
-            + req.samplers.len()
-            + req.color_input as usize,
-    );
-    for b in &req.storage_buffers {
-        layout_bindings.push(BindingSig {
-            binding: b.binding,
-            ty: vk::DescriptorType::STORAGE_BUFFER.as_raw() as u32,
-            stages: (vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT).as_raw(),
-            count: 1,
-        });
-    }
-    for b in &req.sampled_images {
-        layout_bindings.push(BindingSig {
-            binding: b.binding,
-            ty: vk::DescriptorType::SAMPLED_IMAGE.as_raw() as u32,
-            stages: (vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT).as_raw(),
-            count: b.descriptor_count,
-        });
-    }
-    for b in &req.samplers {
-        layout_bindings.push(BindingSig {
-            binding: b.binding,
-            ty: vk::DescriptorType::SAMPLER.as_raw() as u32,
-            stages: (vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT).as_raw(),
-            count: 1,
-        });
-    }
-    if req.color_input {
-        layout_bindings.push(BindingSig {
-            binding: super::types::COLOR_INPUT_BINDING,
-            ty: vk::DescriptorType::INPUT_ATTACHMENT.as_raw() as u32,
-            stages: vk::ShaderStageFlags::FRAGMENT.as_raw(),
-            count: 1,
-        });
-    }
-    let layout_bindings = canonicalize_layout_bindings(layout_bindings)?;
-    if let Some(binding) = layout_bindings.iter().find(|binding| binding.count > 1) {
-        let dynamic_indexing = ctx.features.sampled_image_array_dynamic_indexing;
-        let required_descriptors = layout_bindings
-            .iter()
-            .filter(|candidate| {
-                vk::DescriptorType::from_raw(candidate.ty as i32)
-                    == vk::DescriptorType::SAMPLED_IMAGE
-            })
-            .fold(0u32, |total, candidate| {
-                total.saturating_add(candidate.count)
-            });
-        let descriptor_limit = ctx.features.sampled_image_descriptor_limit;
-        if !ctx.features.sampled_descriptor_arrays(required_descriptors) {
-            return Err(DrawError::Unsupported(
-                super::reason::DrawReason::DescriptorArrayUnsupported {
-                    binding: binding.binding,
-                    count: binding.count,
-                    required_descriptors,
-                    descriptor_limit,
-                    partially_bound: ctx.features.descriptor_binding_partially_bound,
-                    dynamic_indexing,
-                },
-            ));
-        }
-    }
-    // The backstop the compute path has carried since `25051457` and this one
-    // did not. Both of a draw's modules are checked, because either can name a
-    // binding the layout above omits and the divide-by-zero is in the driver's
-    // shared layout scoring rather than in anything stage-specific.
-    if let Some((binding, fragment)) =
-        used_binding_absent_from_layout(&req.vert_spirv, &req.frag_spirv, &layout_bindings)
-    {
-        return Err(DrawError::Unsupported(
-            super::reason::DrawReason::UsedBindingAbsentFromLayout { binding, fragment },
-        ));
-    }
-    let layout_key = LayoutKey {
-        bindings: layout_bindings,
-    };
-    // Resolve load action: resident > guest/host seed > Clear black.
-    let mut load_uses_gpu_content = req.load_from_target;
-    // output_bgra (computed with the batch decision above): BGRA output only
-    // on the resident path (pooled targets stay RGBA); the whole
-    // pass/pipeline/image chain then agrees on B8G8R8A8 so a raw image→buffer
-    // copy lands guest scanout order with no CPU swizzle.
-    // The seed is borrowed from `req`, never copied to the heap. It is a whole
-    // frame, and `engine_delta` measures ~430 MB/s of seed uploads under a
-    // browser workload — so a `Vec` here is ~430 MB/s of memcpy plus ~240
-    // multi-MiB allocations a second on the drain worker that `drain_duty`
-    // shows pinned at duty 0.9+. The only thing that copy bought was a buffer
-    // the `output_bgra` arm could swizzle in place; that swizzle now happens
-    // during the single copy into the mapped staging span, so the pixels are
-    // touched once either way.
-    let seed_bytes: Option<&[u8]> = if load_uses_gpu_content {
-        None
-    } else {
-        req.target_rgba8.as_ref().map(|v| v.as_slice())
-    };
-    let mut pass_key = PassKey::single(
-        load_uses_gpu_content
-            || seed_bytes.is_some()
-            || req.target_guest_seed.is_some()
-            || req.seed_from_target.is_some(),
-        color0_format,
-    );
-    pass_key.host_accessible_color0 = req.guest_target_memory.is_some();
-    for (i, sec) in req.secondary_targets.iter().enumerate() {
-        if i >= MAX_SECONDARY_ATTACH {
-            return Err(DrawError::Unsupported(
-                super::reason::DrawReason::SecondaryAttachmentCap {
-                    requested: req.secondary_targets.len(),
-                    cap: MAX_SECONDARY_ATTACH,
-                },
-            ));
-        }
-        pass_key.secondary[i] = SecondaryAttachKey {
-            format: sec.format,
-            load: sec.load,
-        };
-    }
-    pass_key.secondary_count = req.secondary_targets.len() as u8;
-    pass_key.color_input = req.color_input;
-    for resource in &req.sampled_images {
-        if let Some(index) =
-            feedback_color_index(req, resource, ctx.features.attachment_feedback_loop_layout)
-        {
-            pass_key.feedback_colors |= 1u8 << index;
-        }
-    }
     // Depth is opt-in per draw (only a non-trivial MTLDepthStencilState reaches
     // here) and composes with MRT: the pass appends its attachment after the
     // secondaries, `clear_values` appends its clear after theirs, and the ad-hoc
@@ -3009,199 +3292,8 @@ pub(crate) unsafe fn execute_draw_inner(
             stencil: d.stencil.is_some(),
         });
     }
-    let raster_sample_count = req.raster_sample_count.max(1);
-    let color_sample_count = req.color_sample_count.max(1);
-    if color_sample_count != raster_sample_count {
-        return Err(DrawError::Unsupported(
-            super::reason::DrawReason::MultisampleAttachmentSampleCountMismatch {
-                attachment: color_sample_count,
-                raster: raster_sample_count,
-            },
-        ));
-    }
-    if req.multisample_resolve && raster_sample_count == 1 {
-        return Err(DrawError::Unsupported(
-            super::reason::DrawReason::MultisampleSampleCountUnsupported {
-                requested: raster_sample_count,
-                limit: ctx.features.max_sample_count,
-            },
-        ));
-    }
-    if raster_sample_count > 1 {
-        if !raster_sample_count.is_power_of_two()
-            || raster_sample_count > ctx.features.max_sample_count
-        {
-            return Err(DrawError::Unsupported(
-                super::reason::DrawReason::MultisampleSampleCountUnsupported {
-                    requested: raster_sample_count,
-                    limit: ctx.features.max_sample_count,
-                },
-            ));
-        }
-        if !req.secondary_targets.is_empty() || req.color_input {
-            return Err(DrawError::Unsupported(
-                super::reason::DrawReason::MultisampleResolveShapeUnsupported {
-                    color_targets: 1u32.saturating_add(req.secondary_targets.len() as u32),
-                    depth: req.depth.is_some(),
-                    color_input: req.color_input,
-                },
-            ));
-        }
-        if !req.multisample_resolve {
-            if req.target_identity.is_none() {
-                return Err(DrawError::Unsupported(
-                    super::reason::DrawReason::MultisampleResidentTargetMissing {
-                        sample_count: raster_sample_count,
-                    },
-                ));
-            }
-            if !req.skip_readback
-                || req.target_rgba8.is_some()
-                || req.target_guest_seed.is_some()
-                || req.load_guest_target_backing
-            {
-                return Err(DrawError::Unsupported(
-                    super::reason::DrawReason::MultisampleLinearTransferUnsupported {
-                        sample_count: raster_sample_count,
-                    },
-                ));
-            }
-        }
-    }
-    pass_key.sample_count = raster_sample_count;
-    pass_key.multisample_resolve = req.multisample_resolve;
-    let attr_keys: Vec<AttrKey> = req
-        .vertex_attributes
-        .iter()
-        .map(|a| AttrKey {
-            location: a.location,
-            binding: a.binding,
-            format: a.format,
-            offset: a.offset,
-            stride: a.stride,
-            step_function: a.step_function,
-            step_rate: a.step_rate,
-        })
-        .collect();
-
-    phase.enter(super::draw_phase::Phase::PipelineShader);
-    let (vert_digest, vert_module) =
-        caches.get_or_create_shader_memoized(ctx, &req.vert_spirv, counters, pools)?;
-    let (frag_digest, frag_module) =
-        caches.get_or_create_shader_memoized(ctx, &req.frag_spirv, counters, pools)?;
     phase.enter(super::draw_phase::Phase::PipelineLayoutPass);
-    let (dsl, pipeline_layout) = caches.get_or_create_layout(ctx, &layout_key, counters, pools)?;
     let render_pass = caches.get_or_create_pass(ctx, pass_key, counters, pools)?;
-    phase.enter(super::draw_phase::Phase::Pipeline);
-    // How many viewport slots this draw rasterizes into, checked against the
-    // host before it is baked into a pipeline. Refused rather than clamped:
-    // clamping would silently drop the viewports past the host's limit, which
-    // is the loss this list was widened to stop, and a `viewportCount` above
-    // `maxViewports` — or above 1 without `multiViewport` — makes the pipeline
-    // invalid rather than merely unsupported.
-    let slot_count = super::viewport_slot_count(req);
-    let slot_count_u32 = u32::try_from(slot_count).unwrap_or(u32::MAX);
-    let max_slots = if ctx.features.multi_viewport {
-        ctx.features.max_viewports
-    } else {
-        1
-    };
-    if slot_count_u32 > max_slots {
-        return Err(DrawError::Unsupported(
-            super::reason::DrawReason::ViewportSlotsUnsupported {
-                requested: slot_count_u32,
-                limit: max_slots,
-                multi_viewport: ctx.features.multi_viewport,
-            },
-        ));
-    }
-    // Resolve the occlusion query before anything is recorded, so a host that
-    // cannot count refuses the draw rather than recording one it must throw
-    // away. `Boolean` needs nothing: an imprecise Vulkan occlusion query is
-    // that mode exactly.
-    let occlusion_flags = match req.occlusion_query {
-        None => None,
-        Some(VisibilityResultMode::Counting) if !ctx.features.occlusion_query_precise => {
-            return Err(DrawError::Unsupported(
-                super::reason::DrawReason::VisibilityCountingUnsupported {
-                    occlusion_query_precise: ctx.features.occlusion_query_precise,
-                },
-            ));
-        }
-        Some(mode) => Some(crate::backend::vulkan::translate::raster::vk_query_control_flags(mode)),
-    };
-    let pipeline_key =
-        PipelineKey {
-            vert: vert_digest,
-            frag: frag_digest,
-            attrs: attr_keys,
-            topology: req.primitive_topology,
-            blend: req.blend.map(|b| b.key()),
-            secondary_blend: {
-                let mut per_slot = [None; MAX_SECONDARY_ATTACH];
-                for (slot, target) in req
-                    .secondary_targets
-                    .iter()
-                    .take(MAX_SECONDARY_ATTACH)
-                    .enumerate()
-                {
-                    per_slot[slot] = target.blend.map(|b| b.key());
-                }
-                per_slot
-            },
-            color_write_mask: {
-                let mut per_slot = [ColorWriteMask::default(); 1 + MAX_SECONDARY_ATTACH];
-                per_slot[0] = req.color_write_mask;
-                for (slot, target) in req
-                    .secondary_targets
-                    .iter()
-                    .take(MAX_SECONDARY_ATTACH)
-                    .enumerate()
-                {
-                    per_slot[slot + 1] = target.color_write_mask;
-                }
-                per_slot
-            },
-            pass: pass_key.compatibility(),
-            // Taken from the pass key this draw built, not from `pass`, which
-            // erases it once feedback stops changing the render pass.
-            feedback_colors: pass_key.feedback_colors,
-            cull_mode: req.cull_mode,
-            front_face_ccw: req.front_face_ccw,
-            fill_mode: req.fill_mode,
-            depth_clip: req.depth_clip,
-            depth_test: req.depth.as_ref().map(|d| d.test_enable).unwrap_or(false),
-            depth_write: req.depth.as_ref().map(|d| d.write_enable).unwrap_or(false),
-            depth_compare: req
-                .depth
-                .as_ref()
-                .map(|d| d.compare)
-                .unwrap_or(super::types::SamplerCompareFunction::Always),
-            stencil: req.depth.as_ref().and_then(|d| d.stencil).map(|s| {
-                super::caches::StencilKey {
-                    front: s.front,
-                    back: s.back,
-                }
-            }),
-            viewport_slots: slot_count_u32,
-            layout: layout_key.clone(),
-        };
-    // One cache, consulted once. `get_or_create_pipeline` already counts the hit
-    // and already checks the negative entry for a key that failed to compile.
-    phase.enter(super::draw_phase::Phase::PipelineCompile);
-    let pipeline = caches.get_or_create_pipeline(
-        ctx,
-        &pipeline_key,
-        req.pipeline_object.as_ref(),
-        vert_module,
-        &req.vert_spirv,
-        frag_module,
-        &req.frag_spirv,
-        pipeline_layout,
-        render_pass,
-        counters,
-        pools,
-    )?;
 
     // Samplers
     phase.enter(super::draw_phase::Phase::PipelineSampler);
@@ -3344,18 +3436,50 @@ pub(crate) unsafe fn execute_draw_inner(
     // buffer→image copy converts nothing and reads the *image's* texel width
     // per pixel, so staging an RGBA8 seed under a wider attachment would read
     // past the slot and seed the frame with whatever followed it. The wide arm
-    // below restates the seed as the attachment's texels first; the four-byte
+    // below restates the seed as the attachment's texels first; the eight-bit
     // arm is unchanged, which is every attachment this device had until render
-    // targets began following the guest's declared format.
+    // targets began following the guest's declared format. Four bytes is not
+    // eight bits: a packed ten-bit or two-channel half-float attachment is as
+    // wide as RGBA8 and still needs its seed restated.
     phase.enter(super::draw_phase::Phase::StageSeed);
     let seed_wide = seed_bytes.and_then(|rgba8| {
+        if matches!(req.target_seed_order, SeedOrder::Native(_)) {
+            return None;
+        }
         let layout = crate::backend::vulkan::translate::pixel::texel_layout_of(color0_format)?;
-        if layout.bytes_per_texel() == crate::contract::pixel_format::RGBA8_BPP {
+        if layout.is_four_byte_color() {
             return None;
         }
         Some((rgba8, layout))
     });
-    let seed_slot = if let Some((rgba8, layout)) = seed_wide {
+    let seed_slot = if let (Some(native), SeedOrder::Native(seed_layout)) =
+        (seed_bytes, req.target_seed_order)
+    {
+        if crate::backend::vulkan::translate::pixel::texel_layout_of(color0_format)
+            != Some(seed_layout)
+        {
+            return Err(DrawError::DrawExecution(
+                DrawExecutionDecline::SeedFormatUnwritable {
+                    format: color0_format,
+                },
+            ));
+        }
+        let slot = {
+            let _s = stage_phase::Span::open(stage_phase::Part::Acquire);
+            pools.acquire_staging(
+                ctx,
+                native.len() as u64,
+                vk::BufferUsageFlags::TRANSFER_SRC,
+                counters,
+            )?
+        };
+        {
+            let _s = stage_phase::Span::moving(stage_phase::Part::Bytes, native.len() as u64);
+            pools.write_staging(ctx, &slot, native)?;
+        }
+        counters.note_seed_upload(native.len() as u64);
+        Some(slot)
+    } else if let Some((rgba8, layout)) = seed_wide {
         // The seed's own order first, because `expand_rgba8_to_texel` reads
         // semantic RGBA8 — the same normalization the four-byte arm folds into
         // its copy, done here as a step because a widening pass cannot also
@@ -3440,7 +3564,7 @@ pub(crate) unsafe fn execute_draw_inner(
     // slot's cached framebuffer was built against. One predicate, because the
     // two answers it feeds have to agree: which pass the slot is ensured under,
     // and whether the draw builds (and later disposes) a framebuffer of its own.
-    let ordinary_ad_hoc_framebuffer = is_mrt || req.depth.is_some() || req.color_input;
+    let ordinary_ad_hoc_framebuffer = is_mrt || req.depth.is_some() || req.color_inputs != 0;
     let ad_hoc_framebuffer = ordinary_ad_hoc_framebuffer || req.multisample_resolve;
     let (primary_pass, primary_pass_compatibility) = if ad_hoc_framebuffer {
         let mut color_only = PassKey::single(pass_key.load_seed, pass_key.color0_format);
@@ -3460,6 +3584,9 @@ pub(crate) unsafe fn execute_draw_inner(
         vk::Image,
         super::pools::ResidentAccess,
     )> = Vec::new();
+    // The ad-hoc framebuffer's views in attachment order, which is what a
+    // fetched secondary's input descriptor points at.
+    let mut ad_hoc_views: Vec<vk::ImageView> = Vec::new();
     // This draw's depth attachment, when it has one. The framebuffer is always
     // this draw's own and is always disposed after submit; the image behind it
     // is only owned here when the pass named no guest depth texture to key a
@@ -3546,6 +3673,7 @@ pub(crate) unsafe fn execute_draw_inner(
                 if let Some(d) = depth_attachment.as_ref() {
                     transient_depth = Some((d.owned, fb));
                 }
+                ad_hoc_views = views;
                 (primary_image, fb, primary_access, primary_view)
             } else {
                 (primary_image, primary_slot_fb, primary_access, primary_view)
@@ -3582,6 +3710,7 @@ pub(crate) unsafe fn execute_draw_inner(
                 if let Some(d) = depth_attachment.as_ref() {
                     transient_depth = Some((d.owned, fb));
                 }
+                ad_hoc_views = views;
                 (
                     pool_image,
                     fb,
@@ -3934,7 +4063,14 @@ pub(crate) unsafe fn execute_draw_inner(
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             SampledSource::GuestRuns(src, vouch) => {
-                if let Some(direct) = src.direct_image.as_ref() {
+                // An image over guest memory has the guest's one level; a bind that
+                // asks for more is gathered into an image whose levels are
+                // generated after the copy.
+                if let Some(direct) = src
+                    .direct_image
+                    .as_ref()
+                    .filter(|_| resource.mip_levels <= 1)
+                {
                     if let Some(bound) = unsafe {
                         pools.acquire_guest_sampled(
                             ctx,
@@ -4122,12 +4258,44 @@ pub(crate) unsafe fn execute_draw_inner(
         .iter()
         .map(|(_, s)| vk::DescriptorImageInfo::default().sampler(*s))
         .collect();
+    let mut scratch_images = Vec::with_capacity(req.scratch_storage_images.len());
+    for image in &req.scratch_storage_images {
+        let key = super::pools::StorageImageKey {
+            width: image.width,
+            height: image.height,
+            format: image.format,
+            sampled_only: false,
+        };
+        scratch_images.push((image.binding, pools.acquire_storage_image(ctx, key, counters)?));
+    }
+    let scratch_infos: Vec<_> = scratch_images
+        .iter()
+        .map(|(_, slot)| {
+            vk::DescriptorImageInfo::default()
+                .image_view(slot.view)
+                .image_layout(vk::ImageLayout::GENERAL)
+        })
+        .collect();
     // Framebuffer fetch: the input attachment IS the color target's view;
     // derive the same layout as the subpass reference. A draw that also
     // samples the target upgrades both from GENERAL to the feedback layout.
-    let color_input_info = vk::DescriptorImageInfo::default()
-        .image_view(target_view)
-        .image_layout(pass_key.color_layout(0));
+    // A fetched secondary reads its own view out of the ad-hoc framebuffer.
+    let color_input_infos: Vec<(u32, vk::DescriptorImageInfo)> = (0..8usize)
+        .filter(|&index| pass_key.color_fetched(index))
+        .map(|index| {
+            let view = if index == 0 {
+                target_view
+            } else {
+                ad_hoc_views.get(index).copied().unwrap_or(target_view)
+            };
+            (
+                super::types::COLOR_INPUT_BINDING + index as u32,
+                vk::DescriptorImageInfo::default()
+                    .image_view(view)
+                    .image_layout(pass_key.color_layout(index)),
+            )
+        })
+        .collect();
     let dst_set = dset.unwrap_or_default();
     let mut descriptor_writes = Vec::new();
     for (i, (binding, _, _)) in storage_slots.iter().enumerate() {
@@ -4158,13 +4326,22 @@ pub(crate) unsafe fn execute_draw_inner(
                 .image_info(std::slice::from_ref(&sampler_infos[i])),
         );
     }
-    if req.color_input {
+    for (i, (binding, _)) in scratch_images.iter().enumerate() {
         descriptor_writes.push(
             vk::WriteDescriptorSet::default()
                 .dst_set(dst_set)
-                .dst_binding(super::types::COLOR_INPUT_BINDING)
+                .dst_binding(*binding)
+                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                .image_info(std::slice::from_ref(&scratch_infos[i])),
+        );
+    }
+    for (binding, info) in &color_input_infos {
+        descriptor_writes.push(
+            vk::WriteDescriptorSet::default()
+                .dst_set(dst_set)
+                .dst_binding(*binding)
                 .descriptor_type(vk::DescriptorType::INPUT_ATTACHMENT)
-                .image_info(std::slice::from_ref(&color_input_info)),
+                .image_info(std::slice::from_ref(info)),
         );
     }
     if dset.is_some() {
@@ -4215,10 +4392,13 @@ pub(crate) unsafe fn execute_draw_inner(
         area: (req.width, req.height),
     };
     let target_feedback = pass_key.color_feedback(0);
-    let target_pass_layout = pass_key.color_layout(0);
+    let target_fetched = pass_key.color_fetched(0);
+    let target_pass_layout = pass_key.color_final_layout(0);
     let target_dst_stage = vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
         | if target_feedback {
             vk::PipelineStageFlags::VERTEX_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER
+        } else if target_fetched {
+            vk::PipelineStageFlags::FRAGMENT_SHADER
         } else {
             vk::PipelineStageFlags::empty()
         };
@@ -4226,6 +4406,11 @@ pub(crate) unsafe fn execute_draw_inner(
         | vk::AccessFlags::COLOR_ATTACHMENT_WRITE
         | if target_feedback {
             vk::AccessFlags::SHADER_READ
+        } else {
+            vk::AccessFlags::empty()
+        }
+        | if target_fetched {
+            vk::AccessFlags::INPUT_ATTACHMENT_READ
         } else {
             vk::AccessFlags::empty()
         };
@@ -4460,11 +4645,14 @@ pub(crate) unsafe fn execute_draw_inner(
         );
     } else if load_uses_gpu_content
         && !(target_feedback && req.continues_render_pass && pools.open_pass_echoes(&echo))
-        && !pass_exit_needs_no_barrier(target_prior_access(
-            target_snapshotted,
-            target_access,
-            target_guest_backed,
-        ))
+        && !pass_exit_needs_no_barrier(
+            target_prior_access(
+                target_snapshotted,
+                target_access,
+                target_guest_backed,
+            ),
+            target_pass_layout,
+        )
     {
         unsafe { outside_pass.before_record(PassObstacle::TargetLayout, pools, &ctx.device, cb) };
         // A prior direct sample may have left this target shader-readable, or a
@@ -4650,6 +4838,7 @@ pub(crate) unsafe fn execute_draw_inner(
             if *volume { 1 } else { *layers },
             if *volume { *layers } else { 1 },
             0,
+            img.mip_levels,
         );
     }
 
@@ -4847,6 +5036,7 @@ pub(crate) unsafe fn execute_draw_inner(
             if *volume { 1 } else { *layers },
             if *volume { *layers } else { 1 },
             *row_length_texels,
+            img.mip_levels,
         );
     }
 
@@ -4860,44 +5050,77 @@ pub(crate) unsafe fn execute_draw_inner(
         }
         let attachment_index = secondary_index + 1;
         let feedback = pass_key.color_feedback(attachment_index);
-        if feedback && req.continues_render_pass && pools.open_pass_echoes(&echo) {
+        let fetched = pass_key.color_fetched(attachment_index);
+        let sec_load = pass_key.secondary[secondary_index].load;
+        let initial_layout = pass_key.color_final_layout(attachment_index);
+        if (feedback || access.layout() == initial_layout)
+            && req.continues_render_pass
+            && pools.open_pass_echoes(&echo)
+        {
             continue;
         }
-        let dst_stage = vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
-            | if feedback {
-                vk::PipelineStageFlags::VERTEX_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER
-            } else {
-                vk::PipelineStageFlags::empty()
-            };
-        let dst_access = vk::AccessFlags::COLOR_ATTACHMENT_READ
-            | vk::AccessFlags::COLOR_ATTACHMENT_WRITE
-            | if feedback {
-                vk::AccessFlags::SHADER_READ
-            } else {
-                vk::AccessFlags::empty()
-            };
-        unsafe { outside_pass.before_record(PassObstacle::MrtLayout, pools, &ctx.device, cb) };
-        let (src_stage, src_access) = access.source_scope();
-        let barrier = [vk::ImageMemoryBarrier::default()
-            .src_access_mask(src_access)
-            .dst_access_mask(dst_access)
-            .old_layout(access.layout())
-            .new_layout(pass_key.color_layout(attachment_index))
-            .image(*image)
-            .subresource_range(super::color_subresource_range())];
-        ctx.device.cmd_pipeline_barrier(
-            cb,
-            src_stage,
-            dst_stage,
-            if feedback {
-                vk::DependencyFlags::FEEDBACK_LOOP_EXT
-            } else {
-                vk::DependencyFlags::empty()
-            },
-            &[],
-            &[],
-            &barrier,
-        );
+        if sec_load {
+            if pass_exit_needs_no_barrier(*access, initial_layout) {
+                continue;
+            }
+            let dst_stage = vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+                | if feedback {
+                    vk::PipelineStageFlags::VERTEX_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER
+                } else if fetched {
+                    vk::PipelineStageFlags::FRAGMENT_SHADER
+                } else {
+                    vk::PipelineStageFlags::empty()
+                };
+            let dst_access = vk::AccessFlags::COLOR_ATTACHMENT_READ
+                | vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+                | if feedback {
+                    vk::AccessFlags::SHADER_READ
+                } else {
+                    vk::AccessFlags::empty()
+                }
+                | if fetched {
+                    vk::AccessFlags::INPUT_ATTACHMENT_READ
+                } else {
+                    vk::AccessFlags::empty()
+                };
+            unsafe { outside_pass.before_record(PassObstacle::MrtLayout, pools, &ctx.device, cb) };
+            let (src_stage, src_access) = access.source_scope();
+            let barrier = [vk::ImageMemoryBarrier::default()
+                .src_access_mask(src_access)
+                .dst_access_mask(dst_access)
+                .old_layout(access.layout())
+                .new_layout(initial_layout)
+                .image(*image)
+                .subresource_range(super::color_subresource_range())];
+            ctx.device.cmd_pipeline_barrier(
+                cb,
+                src_stage,
+                dst_stage,
+                if feedback {
+                    vk::DependencyFlags::FEEDBACK_LOOP_EXT
+                } else {
+                    super::feedback_transition_dependency(access.layout())
+                },
+                &[],
+                &[],
+                &barrier,
+            );
+        } else {
+            unsafe { outside_pass.before_record(PassObstacle::ClearWait, pools, &ctx.device, cb) };
+            let (src_stage, src_access) = access.source_scope();
+            let barrier = [vk::MemoryBarrier::default()
+                .src_access_mask(src_access)
+                .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)];
+            ctx.device.cmd_pipeline_barrier(
+                cb,
+                src_stage,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::DependencyFlags::empty(),
+                &barrier,
+                &[],
+                &[],
+            );
+        }
     }
 
     let clear = clear_values(req);
@@ -4965,8 +5188,9 @@ pub(crate) unsafe fn execute_draw_inner(
     // query reset Vulkan forbids inside it; this ladder therefore remains an
     // instrument for the continuation opportunities those commands consume.
     let continues = joins && pools.pass_echoes(&echo);
-    let continues_open =
-        continues_open_render_pass(req.continues_render_pass, pools.open_pass_echoes(&echo));
+    // A scratch storage image needs its layout set outside the pass.
+    let continues_open = req.scratch_storage_images.is_empty()
+        && continues_open_render_pass(req.continues_render_pass, pools.open_pass_echoes(&echo));
     // `passmerge_pass_differs` is one bucket over four independent causes with
     // four different repairs, and on a driven Maps leg it is the bucket that
     // holds 82 % of the draws. Split it where it is charged, so the two stay a
@@ -5010,6 +5234,78 @@ pub(crate) unsafe fn execute_draw_inner(
         // An encoder boundary, a different pass instance, or an intervening
         // outside-pass command closes whatever the predecessor left open.
         unsafe { pools.close_open_pass(&ctx.device, cb) };
+        for ((_, slot), image) in scratch_images.iter().zip(&req.scratch_storage_images) {
+            let seeded = match image.seed.as_ref() {
+                Some(seed) => {
+                    let staging = pools.acquire_staging(
+                        ctx,
+                        seed.len() as u64,
+                        vk::BufferUsageFlags::TRANSFER_SRC,
+                        counters,
+                    )?;
+                    pools.write_staging(ctx, &staging, seed)?;
+                    let to_dst = [vk::ImageMemoryBarrier::default()
+                        .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                        .old_layout(vk::ImageLayout::UNDEFINED)
+                        .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                        .image(slot.image)
+                        .subresource_range(super::color_subresource_range())];
+                    ctx.device.cmd_pipeline_barrier(
+                        cb,
+                        vk::PipelineStageFlags::TOP_OF_PIPE,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[],
+                        &to_dst,
+                    );
+                    let region = [vk::BufferImageCopy::default()
+                        .image_subresource(super::color_subresource_layers())
+                        .image_extent(vk::Extent3D {
+                            width: image.width,
+                            height: image.height,
+                            depth: 1,
+                        })];
+                    ctx.device.cmd_copy_buffer_to_image(
+                        cb,
+                        staging.buffer,
+                        slot.image,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        &region,
+                    );
+                    true
+                }
+                None => false,
+            };
+            let to_general = [vk::ImageMemoryBarrier::default()
+                .src_access_mask(if seeded {
+                    vk::AccessFlags::TRANSFER_WRITE
+                } else {
+                    vk::AccessFlags::empty()
+                })
+                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
+                .old_layout(if seeded {
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL
+                } else {
+                    vk::ImageLayout::UNDEFINED
+                })
+                .new_layout(vk::ImageLayout::GENERAL)
+                .image(slot.image)
+                .subresource_range(super::color_subresource_range())];
+            ctx.device.cmd_pipeline_barrier(
+                cb,
+                if seeded {
+                    vk::PipelineStageFlags::TRANSFER
+                } else {
+                    vk::PipelineStageFlags::TOP_OF_PIPE
+                },
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &to_general,
+            );
+        }
         crate::runtime::drain::note_store_route(pass_begin_area_band(req.width, req.height));
         crate::runtime::drain::note_store_route(if pass_key.load_seed {
             "passbegin_load"
@@ -5056,7 +5352,24 @@ pub(crate) unsafe fn execute_draw_inner(
             src_stage,
             dst_stage,
             vk::DependencyFlags::BY_REGION
-                | super::feedback_transition_dependency(pass_key.color_layout(0)),
+                | super::feedback_transition_dependency(super::caches::color_feedback_layout()),
+            &barrier,
+            &[],
+            &[],
+        );
+    }
+    if pass_key.color_inputs != 0 {
+        // Order programmable-blending (`SubpassData` `OpImageRead`) reads after
+        // preceding colour-attachment writes in the same subpass, matching
+        // `fetch_dep` in `caches::get_or_create_render_pass`.
+        let barrier = [vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+            .dst_access_mask(vk::AccessFlags::INPUT_ATTACHMENT_READ)];
+        ctx.device.cmd_pipeline_barrier(
+            cb,
+            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+            vk::PipelineStageFlags::FRAGMENT_SHADER,
+            vk::DependencyFlags::BY_REGION,
             &barrier,
             &[],
             &[],
@@ -5181,14 +5494,14 @@ pub(crate) unsafe fn execute_draw_inner(
                 layout: info.image_layout,
             },
         ));
-        if req.color_input {
+        for (binding, info) in &color_input_infos {
             push_state.push(super::pools::PushDescriptorBinding::Image {
-                binding: super::types::COLOR_INPUT_BINDING,
+                binding: *binding,
                 array_element: 0,
                 ty: vk::DescriptorType::INPUT_ATTACHMENT,
-                sampler: color_input_info.sampler,
-                view: color_input_info.image_view,
-                layout: color_input_info.image_layout,
+                sampler: info.sampler,
+                view: info.image_view,
+                layout: info.image_layout,
             });
         }
         if pools.push_descriptors_changed(pipeline_layout, counters) {
@@ -5247,6 +5560,7 @@ pub(crate) unsafe fn execute_draw_inner(
         ctx.device.cmd_end_query(cb, pool, 0);
     }
     let keep_pass_open = req.render_pass_continues
+        && req.scratch_storage_images.is_empty()
         && batch_eligible
         && !pass_churn_probe_enabled()
         && !layout_churn_probe_enabled();
@@ -5254,6 +5568,49 @@ pub(crate) unsafe fn execute_draw_inner(
         crate::runtime::drain::note_store_route("pass_left_open");
     } else {
         unsafe { pools.close_open_pass(&ctx.device, cb) };
+    }
+    // Copy each scratch storage image the caller wants back into a readback
+    // buffer, behind the pass that wrote it.
+    let mut storage_readbacks = Vec::new();
+    for ((_, slot), image) in scratch_images.iter().zip(&req.scratch_storage_images) {
+        if !image.read_back {
+            continue;
+        }
+        let size = u64::from(image.width)
+            * u64::from(image.height)
+            * image.format.bytes_per_texel() as u64;
+        let buffer = pools.acquire_readback(ctx, size, counters)?;
+        let to_src = [vk::ImageMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+            .old_layout(vk::ImageLayout::GENERAL)
+            .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+            .image(slot.image)
+            .subresource_range(super::color_subresource_range())];
+        ctx.device.cmd_pipeline_barrier(
+            cb,
+            vk::PipelineStageFlags::FRAGMENT_SHADER,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &to_src,
+        );
+        let region = [vk::BufferImageCopy::default()
+            .image_subresource(super::color_subresource_layers())
+            .image_extent(vk::Extent3D {
+                width: image.width,
+                height: image.height,
+                depth: 1,
+            })];
+        ctx.device.cmd_copy_image_to_buffer(
+            cb,
+            slot.image,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            buffer.buffer,
+            &region,
+        );
+        storage_readbacks.push((buffer, size));
     }
     if pass_churn_probe_enabled() && load_uses_gpu_content && !target_feedback {
         // PROBE — `REIMS_VGPU_PASS_CHURN=on`. One extra render pass instance on
@@ -5540,22 +5897,16 @@ pub(crate) unsafe fn execute_draw_inner(
     if is_mrt {
         for (secondary_index, (identity, _image, _old)) in mrt_secondaries.iter().enumerate() {
             let attachment_index = secondary_index + 1;
-            if pass_key.color_feedback(attachment_index) {
-                pools.registry_mark_ready_with_access(
-                    identity,
-                    super::pools::ResidentAccess::ColorFeedback(
-                        pass_key.color_final_layout(attachment_index),
-                    ),
-                );
+            let final_layout = pass_key.color_final_layout(attachment_index);
+            let access = if pass_key.color_feedback(attachment_index) {
+                super::pools::ResidentAccess::ColorFeedback(final_layout)
             } else {
-                // The pass's own `finalLayout` for this slot, asked of the key
-                // rather than respelled. The feedback arm beside it already
-                // derives; this one carried a hand-written
-                // `COLOR_ATTACHMENT_OPTIMAL`, which is the second spelling
-                // `color0_pass_exit_layout` exists to remove — a registry record
-                // naming a layout the pass did not leave the image in is a later
-                // barrier's wrong `oldLayout`.
-                pools.registry_mark_ready_at(identity, pass_key.color_final_layout(attachment_index));
+                super::pools::ResidentAccess::ColorWrite(final_layout)
+            };
+            if !req.render_pass_continues && matches!(identity, TargetIdentity::Texture { .. }) {
+                pools.registry_discard_transient_color(identity, access);
+            } else {
+                pools.registry_mark_ready_with_access(identity, access);
             }
         }
     }
@@ -5666,8 +6017,10 @@ pub(crate) unsafe fn execute_draw_inner(
         counters
             .render_post_wait_skips
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        return Ok(DrawOutput {
+        return Ok(DrawAnswer::Drawn(DrawOutput {
+            native_pixels: None,
             pixels: Vec::new(),
+            storage_pixels: Vec::new(),
             target_guest_backed,
             guest_store_recorded,
             guest_store_footprint: guest_store_footprint.clone(),
@@ -5678,7 +6031,7 @@ pub(crate) unsafe fn execute_draw_inner(
             // that exclusion is ever relaxed — a deferred draw genuinely has no
             // count yet.
             occlusion_samples: None,
-        });
+        }));
     }
 
     // Park the owed cleanup (descriptor set, transient pool slots, cache
@@ -5728,6 +6081,34 @@ pub(crate) unsafe fn execute_draw_inner(
     // `gva_store_defer_eligible` and keeps its readback. Delete this and that
     // Store loses its frame silently, which is the one outcome the ground rules
     // forbid outright. What the equality licenses is not re-measuring it.
+    let read_storage = |ctx: &super::context::DeviceContext| -> Result<Vec<Vec<u8>>, DrawError> {
+        storage_readbacks
+            .iter()
+            .map(|(buffer, size)| {
+                super::pools::read_back_slot(
+                    ctx,
+                    buffer,
+                    *size,
+                    VkOp::ExecMapReadback,
+                    VkOp::ExecInvalidateReadback,
+                )
+            })
+            .collect()
+    };
+    if readback.is_none() && !storage_readbacks.is_empty() {
+        phase.enter(super::draw_phase::Phase::Wait);
+        pools.wait_entry_fence(ctx, counters, fence)?;
+        return Ok(DrawAnswer::Drawn(DrawOutput {
+            native_pixels: None,
+            pixels: Vec::new(),
+            storage_pixels: read_storage(ctx)?,
+            target_guest_backed,
+            guest_store_recorded,
+            guest_store_footprint: guest_store_footprint.clone(),
+            pixels_bgra: output_bgra,
+            occlusion_samples: read_occlusion_samples(ctx, occlusion)?,
+        }));
+    }
     let Some(ref rb) = readback else {
         // A queried draw has no pixels to read back and still cannot take this
         // return: the sample count *is* its result, and it is not readable
@@ -5738,26 +6119,30 @@ pub(crate) unsafe fn execute_draw_inner(
         if occlusion.is_some() {
             phase.enter(super::draw_phase::Phase::Wait);
             pools.wait_entry_fence(ctx, counters, fence)?;
-            return Ok(DrawOutput {
+            return Ok(DrawAnswer::Drawn(DrawOutput {
+                native_pixels: None,
                 pixels: Vec::new(),
+                storage_pixels: Vec::new(),
                 target_guest_backed,
                 guest_store_recorded,
                 guest_store_footprint: guest_store_footprint.clone(),
                 pixels_bgra: output_bgra,
                 occlusion_samples: read_occlusion_samples(ctx, occlusion)?,
-            });
+            }));
         }
         counters
             .render_post_wait_skips
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        return Ok(DrawOutput {
+        return Ok(DrawAnswer::Drawn(DrawOutput {
+            native_pixels: None,
             pixels: Vec::new(),
+            storage_pixels: Vec::new(),
             target_guest_backed,
             guest_store_recorded,
             guest_store_footprint: guest_store_footprint.clone(),
             pixels_bgra: output_bgra,
             occlusion_samples: None,
-        });
+        }));
     };
 
     // Wait ONLY this draw's fence, not the whole ring. The readback copy is the
@@ -5790,6 +6175,7 @@ pub(crate) unsafe fn execute_draw_inner(
             format: color0_format,
         }),
     )?;
+    let native_pixels = (!layout.is_four_byte_color()).then(|| (out.clone(), layout));
     let (pixels, pixels_bgra) = super::narrow_readback_to_rgba8(
         out,
         layout,
@@ -5798,14 +6184,16 @@ pub(crate) unsafe fn execute_draw_inner(
         output_bgra,
     )?;
 
-    Ok(DrawOutput {
+    Ok(DrawAnswer::Drawn(DrawOutput {
         pixels,
+        native_pixels,
+        storage_pixels: read_storage(ctx)?,
         target_guest_backed,
         guest_store_recorded,
         guest_store_footprint,
         pixels_bgra,
         occlusion_samples: read_occlusion_samples(ctx, occlusion)?,
-    })
+    }))
 }
 
 /// Read the sample count a queried draw produced, and destroy its pool.
@@ -6060,8 +6448,12 @@ fn target_source_scope(
 /// removes the `vkCmdPipelineBarrier` that was left recording nothing. The
 /// counter follows honestly — a draw that records no barrier is not charged an
 /// obstacle, so `passmerge_reachable` can be non-zero for the first time.
-fn pass_exit_needs_no_barrier(prior: super::pools::ResidentAccess) -> bool {
-    prior == super::pools::ResidentAccess::ColorWrite(super::caches::color0_pass_exit_layout())
+fn pass_exit_needs_no_barrier(
+    prior: super::pools::ResidentAccess,
+    initial_layout: vk::ImageLayout,
+) -> bool {
+    initial_layout == super::caches::color0_pass_exit_layout()
+        && prior == super::pools::ResidentAccess::ColorWrite(initial_layout)
 }
 
 /// Record the barrier that makes a registry-resident image readable as a
@@ -6904,6 +7296,7 @@ mod tests {
                 width: w,
                 height: h,
                 layers: 1,
+                mip_levels: 1,
                 arrayed: false,
                 volume: false,
                 cube: false,
@@ -7007,6 +7400,7 @@ mod tests {
             width: 16,
             height: 16,
             layers: 1,
+            mip_levels: 1,
             arrayed: false,
             volume: false,
             cube: false,
@@ -7366,18 +7760,25 @@ mod tests {
     /// transition, which is undefined behaviour and not an error.
     #[test]
     fn only_a_target_left_where_the_next_pass_wants_it_may_skip_its_barrier() {
+        let exit = super::super::caches::color0_pass_exit_layout();
         for tracked in every_access() {
-            let skippable = tracked
-                == ResidentAccess::ColorWrite(super::super::caches::color0_pass_exit_layout());
+            let skippable = tracked == ResidentAccess::ColorWrite(exit);
             assert_eq!(
-                pass_exit_needs_no_barrier(tracked),
+                pass_exit_needs_no_barrier(tracked, exit),
                 skippable,
                 "{tracked:?}"
+            );
+            assert!(
+                !pass_exit_needs_no_barrier(
+                    tracked,
+                    vk::ImageLayout::ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT,
+                ),
+                "a pass entering feedback layout needs an explicit transition from {tracked:?}"
             );
             // A snapshot is this draw's own transfer read and always needs the
             // transition back, whatever the registry was tracking.
             assert!(
-                !pass_exit_needs_no_barrier(target_prior_access(true, tracked, false)),
+                !pass_exit_needs_no_barrier(target_prior_access(true, tracked, false), exit),
                 "a snapshotted {tracked:?} target still has to come back from TRANSFER_SRC"
             );
         }

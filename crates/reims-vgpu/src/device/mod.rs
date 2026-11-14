@@ -15,6 +15,11 @@
 //! this shape: a private `mod`, with the names `crate::qemu::abi` reaches re-exported
 //! at the root.
 
+/// How long each holder keeps the device lock, how long a vCPU waited, and
+/// the order blocked threads get it in.
+pub(crate) mod lock_hold;
+use lock_hold::{try_hold, Held, Holder};
+
 /// The device side of that window: its link, its four QEMU entry points, and
 /// the two publish paths the drain and the poll call. Unconditional, because
 /// the entry points keep a stub arm without the feature and the QEMU ABI
@@ -102,6 +107,17 @@ struct BoundDevice {
     /// `writeFifo` producer spin must observe drain progress live, not a
     /// cached snapshot from before the tranche.
     fifo_read_live: Arc<AtomicU32>,
+    /// Lock-free clone of the negotiated protocol version (0x1034); see
+    /// [`crate::model::GfxRegs::version_live`].
+    version_live: Arc<AtomicU32>,
+    /// Lock-free clone of the root page (0x101c), the guest page size, and the
+    /// child rings the doorbell path has read; see [`wait_for_replies`].
+    root_page_live: Arc<AtomicU32>,
+    page_shift: u32,
+    reply_rings: Mutex<HashMap<u32, crate::runtime::reply_fence::RingPages>>,
+    /// The IOSurface mapper registers, read by a vCPU with no lock; published
+    /// by whoever changes them under the device lock.
+    iosfc_live: Arc<crate::model::IosfcLive>,
     /// An accepted present is waiting for QEMU to consume its scanout action.
     /// Kept outside `inner` so new worker wakeups can yield without racing the
     /// main-loop copy for the same device lock.
@@ -172,6 +188,79 @@ fn publish_present_boundary(slot: &BoundDevice, frame_flush_seen: bool) {
     }
 }
 
+/// How long a doorbell waits to answer a reply command. The vCPU holds the BQL
+/// here, so the wait is bounded: past it the guest reads zeros, as it did for
+/// every such command before.
+const REPLY_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Answer the reply commands a child ring holds before its doorbell returns;
+/// see [`crate::runtime::reply_fence`]. A ring without one, nearly every
+/// doorbell, costs three register reads and returns.
+///
+/// This is the one place a vCPU waits for the device lock. It waits for the
+/// drain's tranche to end, not for the channel: the answer is written from
+/// here, so a channel held behind a shader translation does not hold it up.
+/// Only a command this cannot answer, its reply address not mapped yet, waits
+/// for the drain to reach it.
+fn wait_for_replies(slot: &BoundDevice, channel: u32) {
+    let Some(ops) = slot.ops else {
+        return;
+    };
+    let root_page = slot.root_page_live.load(Ordering::Acquire);
+    let mut scratch = VecDeque::new();
+    let peek = QemuHost::new(&ops, &mut scratch, &slot.prompt_actions);
+    let pending = {
+        let mut rings = slot.reply_rings.lock();
+        crate::runtime::reply_fence::find(
+            &peek,
+            root_page,
+            slot.page_shift,
+            channel,
+            rings.entry(channel).or_default(),
+        )
+    };
+    let Some(pending) = pending else {
+        return;
+    };
+    let started = std::time::Instant::now();
+    let pause = || {
+        if started.elapsed() < std::time::Duration::from_micros(200) {
+            std::hint::spin_loop();
+        } else {
+            std::thread::sleep(std::time::Duration::from_micros(50));
+        }
+    };
+    let mut answered = None;
+    while answered.is_none() && started.elapsed() < REPLY_WAIT {
+        match try_hold(&slot.inner, Holder::VcpuGfxWrite) {
+            Some(mut inner) => {
+                let DeviceInner { device, actions } = &mut *inner;
+                let mut host = QemuHost::new(&ops, actions, &slot.prompt_actions);
+                answered = Some(crate::runtime::drain::answer_heap_queries(
+                    &mut device.state,
+                    &mut host,
+                    channel,
+                    &pending.queries,
+                ));
+            }
+            None => pause(),
+        }
+    }
+    if answered == Some(true) {
+        return;
+    }
+    while !pending.drained(&peek) {
+        if started.elapsed() >= REPLY_WAIT {
+            crate::observe::fail(format!(
+                "reply_wait_timeout ch={channel} queries={} answered_here={answered:?}",
+                pending.queries.len()
+            ));
+            return;
+        }
+        pause();
+    }
+}
+
 fn apply_gfx_write(inner: &mut DeviceInner, slot: &BoundDevice, write: QueuedGfxWrite) {
     match write.queued_at {
         Some(at) => crate::runtime::drain::note_doorbell_queued(
@@ -196,9 +285,9 @@ fn apply_gfx_write(inner: &mut DeviceInner, slot: &BoundDevice, write: QueuedGfx
 /// Apply queued MMIO writes in publication order. Lock order is ingress then
 /// inner everywhere; producers use `try_lock` for inner and therefore never
 /// wait behind shader translation/GPU work.
-fn lock_for_drain(slot: &BoundDevice) -> parking_lot::MutexGuard<'_, DeviceInner> {
+fn lock_for_drain(slot: &BoundDevice, holder: Holder) -> Held<'_, DeviceInner> {
     let mut ingress = slot.gfx_ingress.lock();
-    let mut inner = slot.inner.lock();
+    let mut inner = lock_hold::hold_for_drain(&slot.inner, holder);
     while let Some(write) = ingress.pop_front() {
         apply_gfx_write(&mut inner, slot, write);
     }
@@ -243,6 +332,9 @@ pub fn device_create(ops: Option<ReimsVgpuHostOps>, page_shift: u32) -> Option<u
     let child_doorbell_rung = Arc::clone(&dev.state.gfx.child_doorbell_rung);
     let intr_fault = Arc::clone(&dev.state.gfx.interrupt_fault);
     let fifo_read_live = Arc::clone(&dev.state.gfx.fifo_read);
+    let version_live = Arc::clone(&dev.state.gfx.version_live);
+    let root_page_live = Arc::clone(&dev.state.gfx.root_page_live);
+    let iosfc_live = Arc::clone(&dev.state.iosfc.live);
     DEVICES.lock().insert(
         id,
         Arc::new(BoundDevice {
@@ -259,6 +351,11 @@ pub fn device_create(ops: Option<ReimsVgpuHostOps>, page_shift: u32) -> Option<u
             child_doorbell_rung,
             intr_fault,
             fifo_read_live,
+            version_live,
+            root_page_live,
+            page_shift,
+            reply_rings: Mutex::new(HashMap::new()),
+            iosfc_live,
             present_action_pending: AtomicBool::new(false),
             present_boundary_seen: AtomicBool::new(false),
             reset_count: AtomicU64::new(0),
@@ -319,8 +416,10 @@ fn announce_stamp_interrupt(id: u64, index: u32) {
 }
 
 pub fn device_reset(id: u64) -> bool {
+    // The boot that is ending: its lock holds and vCPU waits, in one line.
+    lock_hold::report_boot();
     if let Some(slot) = device_slot(id) {
-        let mut d = lock_for_drain(&slot);
+        let mut d = lock_for_drain(&slot, Holder::Reset);
         let seq = slot.reset_count.fetch_add(1, Ordering::Relaxed) + 1;
         let state = &d.device.state;
         let mappings = state.mappings.len();
@@ -358,6 +457,7 @@ pub fn device_reset(id: u64) -> bool {
 }
 
 pub fn device_destroy(id: u64) -> bool {
+    lock_hold::report_boot();
     DEVICES.lock().remove(&id).is_some()
 }
 
@@ -383,13 +483,29 @@ pub fn device_gfx_read(id: u64, offset: u64, size: u32) -> Option<u64> {
         if offset == GFX_REG_INTR_FAULT {
             return Some(slot.intr_fault.load(Ordering::Acquire) as u64);
         }
+        // The guest reads it straight after writing it, while that write may
+        // still be queued; see `crate::model::GfxRegs::version_live`.
+        if offset == crate::model::GFX_REG_VERSION {
+            return Some(slot.version_live.load(Ordering::Acquire) as u64);
+        }
     }
-    if let Some(mut d) = slot.inner.try_lock() {
+    // A read must not overtake a write the guest made before it. Writes that
+    // could not take the lock wait in the ingress queue for the drain, so a
+    // read that can take the lock applies them first, in order, as the drain
+    // would have. Lock order is ingress then inner, as everywhere.
+    let mut ingress = slot.gfx_ingress.lock();
+    if let Some(mut d) = try_hold(&slot.inner, Holder::VcpuGfxRead) {
+        while let Some(write) = ingress.pop_front() {
+            apply_gfx_write(&mut d, &slot, write);
+        }
+        drop(ingress);
         let value = d.device.gfx_read(offset, size);
         slot.gfx_read_cache.lock().insert((offset, size), value);
         slot.gfx_read_busy_logged.store(false, Ordering::Relaxed);
         return Some(value);
     }
+    let queued = ingress.len();
+    drop(ingress);
     let value = slot
         .gfx_read_cache
         .lock()
@@ -398,7 +514,8 @@ pub fn device_gfx_read(id: u64, offset: u64, size: u32) -> Option<u64> {
         .unwrap_or(0);
     if !slot.gfx_read_busy_logged.swap(true, Ordering::Relaxed) {
         crate::observe::fail(format!(
-            "device_lock_busy reason=gfx_read_deferred offset={offset:#x} size={size} cached={value:#x}"
+            "device_lock_busy reason=gfx_read_deferred offset={offset:#x} size={size} \
+             cached={value:#x} queued_writes={queued}"
         ));
     }
     Some(value)
@@ -447,9 +564,18 @@ pub fn device_gfx_write(id: u64, offset: u64, data: u64, size: u32) -> bool {
                     .fetch_or(1u32 << channel, Ordering::AcqRel);
                 crate::runtime::drain::note_doorbell_lock_free();
                 schedule_device(&slot);
+                wait_for_replies(&slot, channel);
             }
             return true;
         }
+    }
+    // Before the write can wait: the guest reads the negotiated version back at
+    // once. The write itself still runs below, queued or not.
+    if offset == crate::model::GFX_REG_VERSION && (size == 4 || size == 8) {
+        slot.version_live.store(
+            crate::model::negotiate_protocol_version(data as u32),
+            Ordering::Release,
+        );
     }
     let mut write = QueuedGfxWrite {
         offset,
@@ -459,7 +585,7 @@ pub fn device_gfx_write(id: u64, offset: u64, data: u64, size: u32) -> bool {
     };
     let mut ingress = slot.gfx_ingress.lock();
     if ingress.is_empty() {
-        if let Some(mut inner) = slot.inner.try_lock() {
+        if let Some(mut inner) = try_hold(&slot.inner, Holder::VcpuGfxWrite) {
             apply_gfx_write(&mut inner, &slot, write);
             return true;
         }
@@ -481,38 +607,48 @@ pub fn device_gfx_write(id: u64, offset: u64, data: u64, size: u32) -> bool {
 /// the step to "the guest missed a frame" an inference; this measures it where
 /// it is actually paid.
 ///
-/// The uncontended path takes `try_lock` and never reads the clock, so a fast
-/// access pays nothing for the instrument.
-fn lock_device_for_vcpu(slot: &BoundDevice) -> impl std::ops::DerefMut<Target = DeviceInner> + '_ {
-    if let Some(guard) = slot.inner.try_lock() {
-        crate::runtime::drain::note_vcpu_lock_free();
-        return guard;
+/// A vCPU that has to block is registered as a waiter until it has the lock,
+/// and is served in the order it blocked; see `lock_hold`. The uncontended
+/// path takes `try_lock` and registers nothing.
+fn lock_device_for_vcpu(slot: &BoundDevice, holder: Holder) -> Held<'_, DeviceInner> {
+    let (held, wait) = lock_hold::hold_for_vcpu(&slot.inner, holder);
+    match wait {
+        None => crate::runtime::drain::note_vcpu_lock_free(),
+        Some(wait) => crate::runtime::drain::note_vcpu_lock_wait(wait.wait_us),
     }
-    let waited = std::time::Instant::now();
-    let guard = slot.inner.lock();
-    crate::runtime::drain::note_vcpu_lock_wait(waited.elapsed().as_micros() as u64);
-    guard
+    held
 }
 
+/// Serve a mapper register read with no lock: see [`crate::model::IosfcLive`].
 pub fn device_iosfc_read(id: u64, offset: u64, size: u32) -> Option<u64> {
+    let started = std::time::Instant::now();
     let slot = device_slot(id)?;
-    let d = lock_device_for_vcpu(&slot);
-    Some(d.device.iosfc_read(offset, size))
+    let value = crate::runtime::mmio::iosfc_read(&slot.iosfc_live, offset, size);
+    lock_hold::note_iosfc_call(lock_hold::IosfcCall::Read, started);
+    Some(value)
 }
 
+/// Apply a mapper register write on the vCPU that made it, synchronously: a
+/// producer write captures that vCPU's registers and walks guest kernel
+/// memory through its MMU (`read_xreg`, `read_kva`), and the guest finds the
+/// request done when the write returns.
 pub fn device_iosfc_write(id: u64, offset: u64, data: u64, size: u32) -> bool {
+    let started = std::time::Instant::now();
     let Some(slot) = device_slot(id) else {
         return false;
     };
-    let mut d = lock_device_for_vcpu(&slot);
-    if let Some(ops) = slot.ops {
-        let DeviceInner { device, actions } = &mut *d;
-        let mut host = QemuHost::new(&ops, actions, &slot.prompt_actions);
-        device.iosfc_write(&mut host, offset, data, size);
-    } else {
-        let mut host = NullHost;
-        d.device.iosfc_write(&mut host, offset, data, size);
+    {
+        let mut d = lock_device_for_vcpu(&slot, Holder::VcpuIosfcWrite);
+        if let Some(ops) = slot.ops {
+            let DeviceInner { device, actions } = &mut *d;
+            let mut host = QemuHost::new(&ops, actions, &slot.prompt_actions);
+            device.iosfc_write(&mut host, offset, data, size);
+        } else {
+            let mut host = NullHost;
+            d.device.iosfc_write(&mut host, offset, data, size);
+        }
     }
+    lock_hold::note_iosfc_call(lock_hold::IosfcCall::Write, started);
     true
 }
 
@@ -534,7 +670,7 @@ pub fn device_drain(id: u64) -> bool {
         crate::runtime::drain::note_drain_exit(entry_us, true);
         return true;
     }
-    let mut d = lock_for_drain(&slot);
+    let mut d = lock_for_drain(&slot, Holder::Drain);
     crate::runtime::drain::note_drain_lock_wait(
         crate::observe::elapsed_us().saturating_sub(entry_us),
     );
@@ -678,7 +814,7 @@ pub fn device_poll(id: u64) -> bool {
     let Some(slot) = device_slot(id) else {
         return false;
     };
-    let Some(mut d) = slot.inner.try_lock() else {
+    let Some(mut d) = try_hold(&slot.inner, Holder::Poll) else {
         // Contended: the drain worker owns `inner` doing present/GPU-encode.
         // The full poll below would early-return and drop the VBL — under load
         // that starves the guest's only display time base (present-complete is
@@ -803,7 +939,7 @@ pub fn device_pop_action(id: u64) -> Option<HostAction> {
             return Some(a);
         }
     }
-    let mut d = slot.inner.try_lock()?;
+    let mut d = try_hold(&slot.inner, Holder::PopAction)?;
     d.actions.pop_front()
 }
 

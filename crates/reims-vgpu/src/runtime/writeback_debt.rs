@@ -297,6 +297,11 @@ impl PendingWritebacks {
         self.debts.remove(&mapping_id)
     }
 
+    /// Put back a debt that was taken and could not be paid, keeping its age.
+    pub fn restore(&mut self, mapping_id: u32, debt: WritebackDebt) {
+        self.debts.insert(mapping_id, debt);
+    }
+
     /// Every mapping owed a frame, oldest arm first.
     pub fn mappings_by_age(&self) -> Vec<u32> {
         let mut all: Vec<(u64, u32)> = self.debts.iter().map(|(id, d)| (d.seq, *id)).collect();
@@ -1370,10 +1375,42 @@ pub fn supersede_for_mapping(
     mapping_id: u32,
     site: crate::runtime::render_writeback::SettleSite,
 ) {
-    if state.pending_writebacks.take(mapping_id).is_some() {
+    if let Some(debt) = state.pending_writebacks.take(mapping_id) {
         crate::runtime::drain::note_store_route("wbdebt_superseded_by_skipping_write");
+        #[cfg(feature = "backend-vulkan")]
+        crate::backend::vulkan::engine::note_resident_content_copied_out(&debt.identity);
+        #[cfg(not(feature = "backend-vulkan"))]
+        let _ = debt;
     }
     crate::runtime::render_writeback::settle_guest_writes(site);
+}
+
+/// Drop an unpaid GVA plane debt and invalidate host-side copies before a
+/// synchronous CPU write replaces the plane directly in guest memory.
+pub fn supersede_gva_plane(
+    state: &mut DeviceState,
+    task_id: u32,
+    texture_ref: u32,
+    gva: u64,
+) {
+    if texture_ref != 0 {
+        let key = GvaResourceKey {
+            task_id,
+            texture_ref,
+        };
+        if let Some(debt) = state.pending_writebacks.take_gva_plane(key.plane(gva)) {
+            crate::runtime::drain::note_store_route("gvadebt_superseded");
+            #[cfg(feature = "backend-vulkan")]
+            release_gva(debt);
+            #[cfg(not(feature = "backend-vulkan"))]
+            let _ = debt;
+        }
+        state.invalidate_object_host_copies(task_id, texture_ref);
+        crate::runtime::surface_cache::evict_texture(state, task_id, texture_ref);
+    }
+    if gva != 0 {
+        crate::runtime::surface_cache::evict_gva(state, gva);
+    }
 }
 
 /// [`settle_for_mapping`] for a caller that cannot name the mapping it is about
@@ -1436,6 +1473,20 @@ fn pay<M: HostMemory + HostOps>(
     debt: WritebackDebt,
     route: &'static str,
 ) {
+    // A quarantined mapping's frame is neither written nor dropped: the
+    // collision does not say whose it is, and a release or rebind will. One
+    // that withdrew its claims is the exception: the guest let it go, so its
+    // frame never lands. See `runtime::surface_quarantine::withdraw`.
+    if crate::runtime::surface_quarantine::is_withdrawn(state, mapping_id) {
+        crate::runtime::drain::note_store_route("wbdebt_dropped_withdrawn");
+        crate::runtime::surface_quarantine::note_refused(mapping_id, "debt_withdrawn");
+        return;
+    }
+    if crate::runtime::surface_quarantine::is_quarantined(state, mapping_id) {
+        state.pending_writebacks.restore(mapping_id, debt);
+        crate::runtime::surface_quarantine::note_refused(mapping_id, "debt");
+        return;
+    }
     let Some(entry) = state.mappings.get(&mapping_id) else {
         crate::runtime::drain::note_store_route("wbdebt_generation_moved");
         return;
@@ -1447,12 +1498,25 @@ fn pay<M: HostMemory + HostOps>(
     }
     // The resident the draw registered, not the one a fresh derivation would
     // name today. See `WritebackDebt::identity`.
-    let identity = debt.identity;
+    let identity = debt.identity.clone();
     if crate::runtime::resource_validity::licence_of(validity)
         == crate::runtime::resource_validity::WritebackLicence::Superseded
     {
         crate::runtime::drain::note_store_route("wbdebt_abandoned_guest_wrote");
         crate::backend::vulkan::engine::note_resident_content_copied_out(&identity);
+        return;
+    }
+    // Asked before the readback the Store would start with. A refusal is the
+    // wire guard's diagnostic: the guest let this incarnation go, so its frame
+    // is dropped, and the resident is kept for the display.
+    if !crate::runtime::mapper::wire_watch::before_write(
+        state,
+        &*host,
+        mapping_id,
+        "wbdebt_pay",
+        crate::runtime::mapper::wire_watch::WriteKind::Cpu,
+    ) {
+        crate::runtime::drain::note_store_route("wbdebt_dropped_condemned");
         return;
     }
     crate::runtime::drain::note_store_route(route);
@@ -1464,6 +1528,16 @@ fn pay<M: HostMemory + HostOps>(
         debt.width,
         debt.height,
     ) {
+        // The store may have found the collision itself, in the resolve its
+        // write runs: then the frame is deferred at its generation — back in the
+        // ledger, its resident still the only copy, and nothing stamped as
+        // written. See `runtime::surface_quarantine`.
+        let debt = match crate::runtime::surface_quarantine::after_refused_store(
+            state, mapping_id, debt,
+        ) {
+            crate::runtime::surface_quarantine::RefusedStore::Deferred => return,
+            crate::runtime::surface_quarantine::RefusedStore::Lost(debt) => debt,
+        };
         // `store_render_frame` reports its own loss on the failure channel; this
         // names the rail that owed it, because a debt paid late and refused is a
         // different investigation from a Store refused where it was issued.

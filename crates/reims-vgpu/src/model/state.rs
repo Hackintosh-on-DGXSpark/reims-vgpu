@@ -7,7 +7,7 @@ use crate::runtime::decode::resource::{
 #[cfg(feature = "backend-vulkan")]
 use std::collections::HashMap;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 /// Opaque device instance id (QEMU handle).
@@ -394,6 +394,25 @@ pub struct GfxRegs {
     /// The `Arc` is shared with the device registry slot and survives reset,
     /// like the three above.
     pub child_doorbell_rung: Arc<AtomicU32>,
+    /// The negotiated protocol version (0x1034), as the guest reads it back.
+    ///
+    /// The guest driver writes the version it speaks and reads the register
+    /// straight back; what it reads selects its whole feature set, and 0 makes
+    /// it give the device up. `device_gfx_write` queues a write it cannot
+    /// apply at once, so a read could find the lock free and the write still
+    /// waiting, and answer 0: the 14.6.1 warm boot of 2026-11-09 stopped there,
+    /// with the GPU never started. So the vCPU that writes the register
+    /// publishes the negotiated value here before its write can wait, and the
+    /// read takes it from here with no lock.
+    ///
+    /// The `Arc` is shared with the device registry slot and survives reset,
+    /// like the four above.
+    pub version_live: Arc<AtomicU32>,
+    /// Lock-free clone of [`Self::root_page`], for the vCPU that rings a child
+    /// doorbell and must find that channel's ring with no device lock; see
+    /// [`crate::runtime::reply_fence`]. Shared with the registry slot, kept
+    /// across reset and cleared by it, like the five above.
+    pub root_page_live: Arc<AtomicU32>,
     pub efi_display: u32,
     pub efi_mode_select: u32,
     pub efi_fb_start: u64,
@@ -420,6 +439,8 @@ impl Default for GfxRegs {
             interrupt_status_gpu: Arc::new(AtomicU32::new(0)),
             interrupt_fault: Arc::new(AtomicU32::new(0)),
             child_doorbell_rung: Arc::new(AtomicU32::new(0)),
+            version_live: Arc::new(AtomicU32::new(0)),
+            root_page_live: Arc::new(AtomicU32::new(0)),
             efi_display: 0,
             efi_mode_select: 0,
             efi_fb_start: 0,
@@ -452,6 +473,57 @@ pub struct IosfcRegs {
     pub desc_table: u64,
     pub producer: u32,
     pub consumer: u32,
+    /// The five registers as a vCPU reads them, shared with the registry slot.
+    /// Every writer of the fields above publishes them here, under the device
+    /// lock, with [`IosfcRegs::publish`].
+    pub live: Arc<IosfcLive>,
+}
+
+impl IosfcRegs {
+    /// Make the registers' current values what a vCPU reads. Called by every
+    /// writer once its change is complete, and before anything the change
+    /// raises — the mapper interrupt above all — can reach the guest.
+    pub fn publish(&self) {
+        let live = &self.live;
+        live.ring_base.store(self.ring_base, Ordering::Release);
+        live.capacity.store(self.capacity, Ordering::Release);
+        live.desc_table.store(self.desc_table, Ordering::Release);
+        live.producer.store(self.producer, Ordering::Release);
+        live.consumer.store(self.consumer, Ordering::Release);
+    }
+}
+
+/// The IOSurface mapper registers, readable with no lock.
+///
+/// A vCPU reading one of them used to take the device lock, and so waited for
+/// a whole drain tranche, seconds when that tranche compiles a pipeline, while
+/// holding QEMU's BQL. All five reads are plain state queries with no side
+/// effect, so they are served from here instead.
+#[derive(Debug, Default)]
+pub struct IosfcLive {
+    ring_base: AtomicU64,
+    capacity: AtomicU32,
+    desc_table: AtomicU64,
+    producer: AtomicU32,
+    consumer: AtomicU32,
+}
+
+impl IosfcLive {
+    /// The register at `offset`, or 0 for an offset that names none.
+    pub fn register(&self, offset: u64) -> u64 {
+        use crate::model::{
+            IOSFC_REG_CAPACITY, IOSFC_REG_CONSUMER, IOSFC_REG_DESC_TABLE, IOSFC_REG_PRODUCER,
+            IOSFC_REG_RING_BASE,
+        };
+        match offset {
+            IOSFC_REG_RING_BASE => self.ring_base.load(Ordering::Acquire),
+            IOSFC_REG_CAPACITY => self.capacity.load(Ordering::Acquire) as u64,
+            IOSFC_REG_DESC_TABLE => self.desc_table.load(Ordering::Acquire),
+            IOSFC_REG_PRODUCER => self.producer.load(Ordering::Acquire) as u64,
+            IOSFC_REG_CONSUMER => self.consumer.load(Ordering::Acquire) as u64,
+            _ => 0,
+        }
+    }
 }
 
 /// Per-channel child ring cache (page list decoded from base_pfn).
@@ -1455,6 +1527,14 @@ pub struct MappingEntry {
     /// (bump + drop condemned windows). Cleared by every explicit lifecycle
     /// event (fresh MAP, unmap, MappingInternal reattach, ReplacePhysical).
     pub condemned_entries: Option<Vec<u32>>,
+    /// Set while another live mapping claims one of this mapping's pages; no
+    /// write goes through it. See [`crate::runtime::surface_quarantine`].
+    pub quarantine: Option<crate::runtime::surface_quarantine::Quarantine>,
+    /// `observe::elapsed_ms` when a resolve last adopted this page list.
+    pub validated_ms: u64,
+    /// Bumped whenever this mapping's write authority is revoked; a page proof
+    /// carries the epoch it was minted in and covers no other.
+    pub write_epoch: u64,
     /// Guest KVA of MappingInternal (from capture or recover).
     pub mapping_internal: u64,
     pub page_table_kva: u64,
@@ -2306,6 +2386,14 @@ impl NamedMappings {
 }
 
 /// Full device model state (backend-independent).
+/// Resolved base heap-texture identity metadata for an attachment slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeapTargetRef {
+    pub base_ref: u32,
+    pub generation: u64,
+    pub base_format: u16,
+}
+
 #[derive(Debug)]
 pub struct DeviceState {
     pub id: DeviceId,
@@ -2315,10 +2403,16 @@ pub struct DeviceState {
     pub iosfc: IosfcRegs,
     pub active_child_mask: u32,
     /// Child channels whose head `EXEC_INDIRECT2` packet is held while an
-    /// immutable AIR translation is still loading. The packet head and stamp
-    /// remain untouched until retry, so this is scheduler state rather than a
+    /// immutable AIR translation is still loading, or while a pipeline one of
+    /// its draws needs is being compiled (that channel then also has an entry
+    /// in [`Self::exec_continuations`]). The packet head and stamp remain
+    /// untouched until retry, so this is scheduler state rather than a
     /// submitted async GPU job.
     pub translation_deferred_mask: u32,
+    /// Head packets that stopped at a draw waiting for its pipeline, by
+    /// channel, with what they need to continue from that draw. See
+    /// `runtime::exec::continuation`.
+    pub exec_continuations: crate::runtime::exec::ExecContinuations,
     /// FIFO timelines whose head packet is held on an unmet stamp wait. Bit 0
     /// is the root FIFO and child channel N uses bit N, the same convention as
     /// [`Self::translation_order_hold_mask`].
@@ -2397,6 +2491,13 @@ pub struct DeviceState {
     /// disarms it. For the same reason it is not dropped on task teardown: the
     /// page stays released whatever happens to the task that let it go.
     pub released_pages: crate::runtime::released_pages::ReleasedPages,
+    /// The kernel translation root captured on a vCPU, and whether the software
+    /// walk over it has passed runtime validation. See
+    /// [`crate::runtime::kernel_walk`].
+    pub kernel_walk: crate::runtime::kernel_walk::KernelWalkState,
+    /// The guest's wire counts on type-11 surfaces, when that diagnostic is on.
+    /// See [`crate::runtime::mapper::wire_watch`].
+    pub wire_watch: crate::runtime::mapper::wire_watch::WireWatch,
     /// Live object refs per task, as `(task_id, ref)`.
     ///
     /// This is membership for host-copy teardown. [`Self::task_resources`]
@@ -2474,6 +2575,12 @@ pub struct DeviceState {
     /// Raw compute encode for type-2/3 textures. Retained across GVA unmap;
     /// evicted on task/object lifetime end or descriptor mismatch.
     pub host_linear_textures: BTreeMap<(u32, u32), HostLinearTexture>,
+    /// What a storage write last left in a heap texture, keyed by task, texture
+    /// reference and lifetime generation, as tight rows in the texture's own
+    /// format. A heap texture has no guest bytes, and macOS 27 writes some only
+    /// this way, `inplace_copy_lph` among them. A pass that renders into the
+    /// texture again drops its entry.
+    pub heap_snapshots: BTreeMap<(u32, u32, u64), Arc<Vec<u8>>>,
     /// Perf memo for guest-CPU-produced linear textures (no host cache entry,
     /// so no producer generation exists). Coherence is re-established on
     /// every lookup by re-reading the native guest rows and comparing them
@@ -2563,6 +2670,10 @@ pub struct DeviceState {
     /// serial drain worker (dock-hover freeze). Keyed by (mapping_id, w, h).
     /// Byte-bounded LRU ([`GUEST_LINEAR_MEMO_BYTE_CAP`]).
     pub type11_memo: LruBytesMemo<(u32, u32, u32), GuestLinearMemo>,
+    /// `(task, attachment ref)` of every heap-placed texture a pass has
+    /// rendered into, naming the heap texture's own ref. Such a texture has no
+    /// guest storage this device can reach; it lives in an engine resident.
+    pub heap_texture_targets: std::collections::HashMap<(u32, u32), HeapTargetRef>,
     /// Reusable native BGRA read buffer for the type-11 memo re-read.
     pub type11_memo_scratch: Vec<u8>,
     /// Last guest-visible generation produced by a compute storage-image
@@ -2713,6 +2824,18 @@ pub struct DeviceState {
     /// unmet waits are honest. Feeds no verdict — see
     /// [`crate::runtime::drain::StampLedger`].
     pub stamp_ledger: crate::runtime::drain::StampLedger,
+    /// The `CmdHeapTextureSizeAndAlign` packets a vCPU answered from its
+    /// doorbell, as (channel, packet head), until the drain reaches each and
+    /// leaves it alone. The guest may have reused the reply's bytes by then,
+    /// so the drain must not write them a second time. See
+    /// [`crate::runtime::reply_fence`].
+    pub heap_queries_answered: std::collections::HashSet<(u32, u32)>,
+    /// Surface mappings this device has itself read, sampled in a draw or
+    /// presented, as mapping id to the map generation it was read at. A render
+    /// Store into one of these may stay in the host image; into any other it
+    /// is copied to the guest's pages at once. See
+    /// [`Self::surface_read_by_host`].
+    pub surfaces_read_by_host: HashMap<u32, u32>,
     /// Total stale views the reuse verify caught (fail-logged as
     /// `gva_view_stale`; the view self-heals via retire + rebuild).
     pub view_stale_reads: u64,
@@ -2753,6 +2876,7 @@ impl DeviceState {
             gva_store_witness: Default::default(),
             active_child_mask: 0,
             translation_deferred_mask: 0,
+            exec_continuations: Default::default(),
             stamp_deferred_mask: 0,
             translation_order_hold_mask: 0,
             translation_order_holds: 0,
@@ -2767,6 +2891,8 @@ impl DeviceState {
             map_audit: std::collections::BTreeMap::new(),
             node_guard: std::collections::BTreeMap::new(),
             released_pages: crate::runtime::released_pages::ReleasedPages::default(),
+            kernel_walk: crate::runtime::kernel_walk::KernelWalkState::default(),
+            wire_watch: crate::runtime::mapper::wire_watch::WireWatch::default(),
             objects: std::collections::BTreeSet::new(),
             task_resources: TaskResources::default(),
             task_sampler_states: TaskSamplerStates::default(),
@@ -2785,6 +2911,7 @@ impl DeviceState {
             gva_cache_byte_cap: GVA_ENCODE_CACHE_BYTE_CAP,
             gva_eviction_witness: GvaEvictionWitness::default(),
             host_linear_textures: BTreeMap::new(),
+            heap_snapshots: BTreeMap::new(),
             compute_storage_residency: BTreeMap::new(),
             fence_flushed_mappings: std::collections::BTreeSet::new(),
             surface_write_kind: BTreeMap::new(),
@@ -2808,6 +2935,8 @@ impl DeviceState {
             pending_writebacks: crate::runtime::writeback_debt::PendingWritebacks::default(),
             completion_stamp_seq: 0,
             stamp_ledger: Default::default(),
+            heap_queries_answered: Default::default(),
+            surfaces_read_by_host: Default::default(),
             gva_resident_backing: std::collections::BTreeMap::new(),
             guest_linear_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),
             #[cfg(feature = "backend-vulkan")]
@@ -2820,6 +2949,7 @@ impl DeviceState {
             guest_linear_scratch: Vec::new(),
             type5_view_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),
             type11_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),
+            heap_texture_targets: std::collections::HashMap::new(),
             type11_memo_scratch: Vec::new(),
             gva_host_views: Vec::new(),
             view_stale_reads: 0,
@@ -3118,10 +3248,12 @@ impl DeviceState {
         if self.translation_order_hold_mask != 0 || self.translation_deferred_mask != 0 {
             crate::observe::fail(format!(
                 "translation_hold_unreleased held_mask={:#x} producer_mask={:#x} episodes={} \
-                 (device reset with guest packets still parked behind an AIR load)",
+                 pipeline_waits={} (device reset with guest packets still parked behind an AIR \
+                 load or a pipeline compile)",
                 self.translation_order_hold_mask,
                 self.translation_deferred_mask,
-                self.translation_order_holds
+                self.translation_order_holds,
+                self.exec_continuations.len()
             ));
         }
         let id = self.id;
@@ -3133,19 +3265,38 @@ impl DeviceState {
         let intr_fault = Arc::clone(&self.gfx.interrupt_fault);
         let fifo_read = Arc::clone(&self.gfx.fifo_read);
         let child_rung = Arc::clone(&self.gfx.child_doorbell_rung);
+        let version_live = Arc::clone(&self.gfx.version_live);
+        let root_page_live = Arc::clone(&self.gfx.root_page_live);
         intr_disp.store(0, Ordering::Release);
         intr_gpu.store(0, Ordering::Release);
         intr_fault.store(0, Ordering::Release);
         fifo_read.store(0, Ordering::Release);
+        // A reset forgets the negotiation; the guest negotiates again.
+        version_live.store(0, Ordering::Release);
+        root_page_live.store(0, Ordering::Release);
         // Cleared as well as kept: a reset drops every channel, so a bit rung
         // before it names a channel that no longer exists.
         child_rung.store(0, Ordering::Release);
+        // What the wire watch cost this boot; its state goes with the boot.
+        crate::runtime::mapper::wire_watch::on_reset(self);
+        // The mapper registers' read rail, kept the same way and published
+        // as the reset leaves them.
+        let iosfc_live = Arc::clone(&self.iosfc.live);
+        // The kernel root and its validation belong to the boot that is ending;
+        // only the count of boots survives, so a root names its own.
+        let mut kernel_walk = std::mem::take(&mut self.kernel_walk);
+        kernel_walk.reset();
         *self = Self::new(id, page_shift);
+        self.iosfc.live = iosfc_live;
+        self.iosfc.publish();
+        self.kernel_walk = kernel_walk;
         self.gfx.interrupt_status_disp = intr_disp;
         self.gfx.interrupt_status_gpu = intr_gpu;
         self.gfx.interrupt_fault = intr_fault;
         self.gfx.fifo_read = fifo_read;
         self.gfx.child_doorbell_rung = child_rung;
+        self.gfx.version_live = version_live;
+        self.gfx.root_page_live = root_page_live;
     }
 
     /// Queue the engine-unpin for a dying linear cache entry that still owns a
@@ -3237,6 +3388,7 @@ impl DeviceState {
         self.node_guard.remove(&task_id);
         self.retire_task_linear_residents(task_id);
         self.host_linear_textures.retain(|&(t, _), _| t != task_id);
+        self.heap_snapshots.retain(|&(t, _, _), _| t != task_id);
         // New directory ⇒ old GVA HostOps views alias the wrong PT — retire.
         self.retire_task_gva_views(task_id);
         self.tasks
@@ -3288,6 +3440,7 @@ impl DeviceState {
         );
         self.retire_task_linear_residents(task_id);
         self.host_linear_textures.retain(|&(t, _), _| t != task_id);
+        self.heap_snapshots.retain(|&(t, _, _), _| t != task_id);
         self.host_texture_surfaces
             .retain(|&(t, _), _| t != task_id);
         // Clear texture→mapping latches for this task.
@@ -3554,6 +3707,10 @@ impl DeviceState {
             StateMutationDecline::MapSurfaceIdSentinel { mapping_id }.emit(u64::from(mapping_id));
             return false;
         }
+        // A MAP notification alone is not a new backing: it can trail the
+        // resolve that already adopted this table. It only arms the lift
+        // that a resolve adopting a different table confirms.
+        crate::runtime::surface_quarantine::note_rebind(self, mapping_id, "map");
         let e = self.mappings.entry(mapping_id).or_default();
         e.mapped = true;
         // Fresh MAP invalidates any previous page table / geom for this slot.
@@ -3608,6 +3765,7 @@ impl DeviceState {
             StateMutationDecline::UnmapSurfaceIdSentinel { mapping_id }.emit(u64::from(mapping_id));
             return false;
         }
+        crate::runtime::surface_quarantine::lift(self, mapping_id, "unmap");
         self.forget_compositor_mapping(mapping_id);
         if let Some(e) = self.mappings.get_mut(&mapping_id) {
             e.mapped = false;
@@ -3651,6 +3809,9 @@ impl DeviceState {
             StateMutationDecline::AttachMappingInternalZero { mapping_id }
                 .emit(u64::from(mapping_id));
             return false;
+        }
+        if self.mappings.get(&mapping_id).map(|m| m.mapping_internal) != Some(mapping_internal) {
+            crate::runtime::surface_quarantine::note_rebind(self, mapping_id, "new_internal");
         }
         let e = self.mappings.entry(mapping_id).or_default();
         // A re-statement of the SAME MappingInternal (notify trailing our
@@ -3891,6 +4052,37 @@ impl DeviceState {
     /// Also advances [`MappingEntry::surface_content_epoch`], so every one of
     /// this crate's guest-page writers keeps that epoch closed for free — the
     /// completeness property the type-11 `LoadFromTarget` gate rests on.
+    /// Record that this device read `mapping_id` itself: a draw sampled it or
+    /// the display presented it.
+    pub fn note_surface_read_by_host(&mut self, mapping_id: u32) {
+        let Some(generation) = self.mappings.get(&mapping_id).map(|m| m.map_generation) else {
+            return;
+        };
+        if self.surfaces_read_by_host.insert(mapping_id, generation) != Some(generation)
+            && self.surfaces_read_by_host.len() > 4096
+        {
+            let mappings = &self.mappings;
+            self.surfaces_read_by_host
+                .retain(|id, at| mappings.get(id).is_some_and(|m| m.map_generation == *at));
+        }
+    }
+
+    /// Whether this device has read `mapping_id` since the guest mapped it.
+    ///
+    /// The guest reads an IOSurface it rendered into with no command at all:
+    /// on Apple's host the attachment is the surface's own memory. So a Store
+    /// may only stay in the host image for a surface whose reader is this
+    /// device, a window backing the compositor samples or a framebuffer the
+    /// display presents. macOS 27.2's iconservicesagent draws each icon into
+    /// a surface and reads it back; left in the host image, every icon read as
+    /// transparent and the Dock showed placeholders.
+    pub fn surface_read_by_host(&self, mapping_id: u32) -> bool {
+        self.surfaces_read_by_host
+            .get(&mapping_id)
+            .zip(self.mappings.get(&mapping_id))
+            .is_some_and(|(at, m)| *at == m.map_generation)
+    }
+
     pub fn mark_mapping_written(&mut self, mapping_id: u32) -> u32 {
         let seq = self.next_validity_seq();
         let Some(m) = self.mappings.get_mut(&mapping_id) else {

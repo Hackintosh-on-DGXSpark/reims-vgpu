@@ -5,7 +5,7 @@
 use ash::vk;
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use super::counters::EngineCounters;
@@ -74,12 +74,55 @@ const PIPELINE_CACHE_HEADER_ONE_LEN: usize = 32;
 /// Why a large blob costs more per compile is the driver's business and is not
 /// measured here. Size is the observable, so size is what this bounds.
 ///
-/// 16 MiB is four times the ~3.9 MB a boot of this workload settles at, so a
-/// workload several times richer still warms fully, and it is half the 30.8 MB
-/// at which the penalty was measured. Growth at steady state is ~0.1 MB a boot
-/// (3.85 -> 3.95 across two boots), so this is ~120 boots of headroom before the
-/// bound is reached and the blob is rebuilt from one boot.
-const PIPELINE_CACHE_MAX_WARM_BYTES: usize = 16 * 1024 * 1024;
+/// Six interleaved driven macos-15 Maps boots repeated the shape on a second
+/// rail and a second host GPU, and moved the bound. Arms differ only in the blob
+/// the boot starts from; `misses` is `pipeline_misses + compute_pipeline_misses`:
+///
+/// ```text
+/// loaded    settled   misses   pl_compile_us   per compile
+/// 14.4 MB   14.4 MB     285        0.601 s       2.11 ms
+/// 14.4 MB   14.4 MB     285        0.603 s       2.12 ms
+///  0.00 MB   3.3 MB     278        0.158 s       0.57 ms
+///  0.00 MB   3.4 MB     301        0.153 s       0.51 ms
+///  3.3 MB    3.4 MB     275        0.156 s       0.57 ms
+///  3.3 MB    3.4 MB     283        0.148 s       0.52 ms
+/// ```
+///
+/// Two readings, and the arms are disjoint by 3.9x with the miss counts within
+/// 2.5 % of each other, so both are about what a compile costs and not about how
+/// many happen:
+///
+/// - **14.4 MB is already deep in the penalty region.** It is under the 16 MiB
+///   this constant used to be, so the old bound never fired, and the blob parked
+///   there and stayed — 0.45 s of extra drain CPU on every boot, forever, on the
+///   thread that holds the device lock.
+/// - **A right-sized blob and no blob at all are indistinguishable here** (0.545
+///   against 0.540 ms). The warm start pays on macos-13 and does not pay on
+///   macos-15, so it stays; what cannot stay is a size at which it charges 3.9x
+///   for a benefit that is, on at least one rail, zero.
+///
+/// So the bound is set from the two measured working sets rather than from
+/// headroom above them: 8 MiB is twice the larger (3.85 MB on macos-13, 3.4 MB
+/// on macos-15) and comfortably under the smallest size at which a penalty has
+/// ever been measured here (14.4 MB). A workload whose genuine working set
+/// exceeds it rebuilds every boot and says so by name, which costs a cold start
+/// and is what the arms above price at 0.5-1.4 ms a compile — the parked blob
+/// costs more than that and reports nothing.
+const PIPELINE_CACHE_MAX_WARM_BYTES: usize = 8 * 1024 * 1024;
+
+/// The largest blob a single boot has been measured to settle at: 3.85 MB on
+/// macos-13, 3.4 MB on macos-15, rounded up to a whole MiB.
+///
+/// Declared separately because it is a different kind of number from the bound —
+/// an observation about the guest's workload rather than a policy — and because
+/// the relation between the two is the one that must hold. A bound at or below
+/// one boot's working set makes *every* boot overflow and discard, so the warm
+/// start could never happen and the rail would silently become cold-only.
+const PIPELINE_CACHE_WORKING_SET_BYTES: usize = 4 * 1024 * 1024;
+
+/// The bound has to leave room for a boot's own working set, or the rebuild path
+/// below fires on every boot and the warm cache is dead code with a cost.
+const _: () = assert!(PIPELINE_CACHE_MAX_WARM_BYTES >= 2 * PIPELINE_CACHE_WORKING_SET_BYTES);
 
 /// On-disk pipeline-cache blob location for a device, keyed by its
 /// pipelineCacheUUID (hex) so blobs from other GPUs/driver versions land in
@@ -90,7 +133,7 @@ fn pipeline_cache_disk_path(uuid: &[u8; 16]) -> std::path::PathBuf {
     for b in uuid {
         let _ = write!(hex, "{b:02x}");
     }
-    std::env::temp_dir().join(format!("reims-vgpu-vk-pipeline-cache-{hex}.bin"))
+    crate::env::cache_dir().join(format!("reims-vgpu-vk-pipeline-cache-{hex}.bin"))
 }
 
 /// Outcome of one atomic pipeline-cache blob save.
@@ -135,6 +178,14 @@ enum PipelineCacheDecline {
         errno: Option<i32>,
         kind: std::io::ErrorKind,
     },
+    /// The blob was past [`PIPELINE_CACHE_MAX_WARM_BYTES`] and could not be
+    /// removed, so the next boot will load the oversized file again and pay the
+    /// per-compile penalty for it. Separate from [`Self::TooLarge`], which says
+    /// the rebuild was *decided*: only this one says it did not happen.
+    Discard {
+        errno: Option<i32>,
+        kind: std::io::ErrorKind,
+    },
 }
 
 impl PipelineCacheDecline {
@@ -158,6 +209,13 @@ impl PipelineCacheDecline {
             kind: error.kind(),
         }
     }
+
+    fn discard(error: &std::io::Error) -> Self {
+        Self::Discard {
+            errno: error.raw_os_error(),
+            kind: error.kind(),
+        }
+    }
 }
 
 impl crate::observe::Decline for PipelineCacheDecline {
@@ -169,6 +227,7 @@ impl crate::observe::Decline for PipelineCacheDecline {
             Self::WarmCreate { .. } => "vk_pipeline_cache_warm_create",
             Self::Write { .. } => "vk_pipeline_cache_write",
             Self::Rename { .. } => "vk_pipeline_cache_rename",
+            Self::Discard { .. } => "vk_pipeline_cache_discard",
         }
     }
 
@@ -176,7 +235,8 @@ impl crate::observe::Decline for PipelineCacheDecline {
         match self {
             Self::Read { errno, kind }
             | Self::Write { errno, kind }
-            | Self::Rename { errno, kind } => vec![
+            | Self::Rename { errno, kind }
+            | Self::Discard { errno, kind } => vec![
                 (
                     "errno",
                     errno.map_or_else(|| "none".to_string(), |value| value.to_string()),
@@ -221,6 +281,30 @@ fn write_cache_atomic(
             let _ = std::fs::remove_file(tmp);
             Err(PipelineCacheDecline::rename(&e))
         }
+    }
+}
+
+/// Remove the on-disk blob and reset the newest-wins guard, so the next boot
+/// starts cold and the boot after it warms from a blob this workload's own
+/// working set produced.
+///
+/// Resetting `persisted_len` is load-bearing, not tidiness. It holds the largest
+/// length that has landed, and [`write_cache_atomic`] drops any save that is not
+/// larger. Leaving it at the discarded blob's length would supersede every save
+/// that follows — the file would never come back and the rail would be cold for
+/// the life of the process rather than for one boot.
+///
+/// A blob that is already gone is the outcome this wanted, so `NotFound` is
+/// success. Pure w.r.t. Vulkan (fs + atomic only) → unit-testable.
+fn discard_cache_blob(
+    path: &std::path::Path,
+    persisted_len: &AtomicUsize,
+) -> Result<(), PipelineCacheDecline> {
+    persisted_len.store(0, Ordering::Relaxed);
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(PipelineCacheDecline::discard(&error)),
     }
 }
 
@@ -564,12 +648,10 @@ pub(crate) struct DeviceContext {
     /// and queue-idle waits pass through its FIFO so an asynchronous batch tail
     /// cannot race a later synchronous consumer.
     pub queue_owner: Option<super::queue_owner::QueueOwner>,
-    /// On-disk VkPipelineCache blob for this device (keyed by
-    /// pipelineCacheUUID), or None when persistence is unavailable.
-    pub pipeline_cache_path: Option<std::path::PathBuf>,
-    /// Byte length of the last persisted cache blob — the growth debounce
-    /// for [`Self::persist_pipeline_cache`].
-    pub pipeline_cache_saved_len: AtomicUsize,
+    /// Owns the `VkDevice`, its instance and its pipeline cache. Shared with
+    /// every graphics compile in flight, so [`Self::destroy`] hands their
+    /// destruction to whichever holder lets go last; see [`DeviceLife`].
+    pub life: std::sync::Arc<DeviceLife>,
     /// `VK_KHR_swapchain` was enabled for the engine-owned host window.
     #[cfg(feature = "host-window")]
     pub swapchain: bool,
@@ -1182,6 +1264,9 @@ impl DeviceContext {
         // (passing a blob not produced by vkGetPipelineCacheData for this
         // device is a Vulkan valid-usage violation, not a soft fallback).
         let pipeline_cache_path = pipeline_cache_disk_path(&props.pipeline_cache_uuid);
+        if let Some(parent) = pipeline_cache_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
         let initial_blob = match read_pipeline_cache_blob(&pipeline_cache_path, &props) {
             Ok(blob) => blob,
             Err(decline) => {
@@ -1216,6 +1301,18 @@ impl DeviceContext {
             "vk_pipeline_cache_load bytes={initial_len} path={}",
             pipeline_cache_path.display()
         ));
+        let life = std::sync::Arc::new(DeviceLife {
+            _entry: entry.clone(),
+            device: device.clone(),
+            instance: instance.clone(),
+            pipeline_cache,
+            pipeline_cache_path: Some(pipeline_cache_path),
+            pipeline_cache_saved_len: AtomicUsize::new(initial_len),
+            retired: AtomicBool::new(false),
+            stale: AtomicBool::new(false),
+            late: Mutex::new(Vec::new()),
+            modules: Mutex::new(HashMap::new()),
+        });
         Ok(Self {
             _entry: entry,
             instance,
@@ -1246,93 +1343,10 @@ impl DeviceContext {
             draw_spans,
             stamp_completion,
             queue_owner,
-            pipeline_cache_path: Some(pipeline_cache_path),
-            pipeline_cache_saved_len: AtomicUsize::new(initial_len),
+            life,
             #[cfg(feature = "host-window")]
             swapchain,
         })
-    }
-
-    /// Persist the pipeline cache to disk when it has grown since the last
-    /// save. Called after each actual pipeline creation (cache misses only —
-    /// warm hits never reach this). The serialize under the engine lock is a
-    /// memcpy; the file write runs on a detached thread so nothing on the
-    /// draw path blocks on disk. Saving on creation rather than at context
-    /// destroy is deliberate: the testing boot SIGKILLs QEMU, so destroy
-    /// never runs there. The tmp-then-rename keeps a concurrent reader (or a
-    /// second QEMU process) from ever seeing a torn blob.
-    pub(crate) fn persist_pipeline_cache(&self) {
-        let Some(path) = self.pipeline_cache_path.clone() else {
-            return;
-        };
-        let data = match unsafe { self.device.get_pipeline_cache_data(self.pipeline_cache) } {
-            Ok(d) => d,
-            Err(e) => {
-                let decline = VkCall::new(VkOp::ContextPipelineCacheGetData, e);
-                crate::observe::Emit::decline("vk_pipeline_cache_save", &decline).fail_once(0);
-                return;
-            }
-        };
-        // Never write back a blob the next boot would refuse to load. Without
-        // this the bound above still self-heals — one cold boot rebuilds a small
-        // blob — but every boot in between pays a 30 MB write to produce a file
-        // whose only use is to be declined.
-        if data.len() > PIPELINE_CACHE_MAX_WARM_BYTES {
-            crate::observe::Emit::decline(
-                "vk_pipeline_cache_save",
-                &PipelineCacheDecline::TooLarge {
-                    bytes: data.len(),
-                    cap: PIPELINE_CACHE_MAX_WARM_BYTES,
-                },
-            )
-            .fail_once(0);
-            return;
-        }
-        // Growth debounce: byte length is the proxy for "a new pipeline
-        // landed" (equal-length different-content saves are lost, which only
-        // costs a warm-start miss on that one pipeline next boot).
-        if data.len()
-            == self
-                .pipeline_cache_saved_len
-                .swap(data.len(), Ordering::Relaxed)
-        {
-            return;
-        }
-        // Unique tmp name PER SAVE. Keying only on the (constant) pid meant two
-        // concurrent saves — spawned when two calls with different data lengths
-        // both clear the growth debounce — wrote the SAME tmp file, so the first
-        // thread's rename(tmp→path) moved it out from under the second thread's
-        // rename, which then failed ENOENT (the intermittent
-        // `vk_pipeline_cache_save reason=vk_pipeline_cache_rename errno=2 ...`).
-        // A per-save sequence number makes each thread's tmp file private, so the
-        // write→rename is race-free and the newest save always lands.
-        static SAVE_SEQ: AtomicU64 = AtomicU64::new(0);
-        // Largest cache length already landed on disk. The VkPipelineCache only
-        // grows, so `data.len()` orders the snapshots. Best-effort newest-wins:
-        // if a strictly larger snapshot already landed by the time this thread is
-        // about to rename, drop this smaller one rather than regress the on-disk
-        // cache to a stale subset. This narrows (does not fully serialize) the
-        // concurrent-save window — a residual reorder only costs one pipeline a
-        // warm-start miss next boot and self-heals on the next compile, so a lock
-        // is not warranted for a best-effort cache. Keyed per physical device via
-        // the UUID-derived path (a DEVICE_LOST recreate reuses the same file), so
-        // a process-wide static is correct.
-        static PERSISTED_LEN: AtomicUsize = AtomicUsize::new(0);
-        let seq = SAVE_SEQ.fetch_add(1, Ordering::Relaxed);
-        std::thread::spawn(move || {
-            let tmp = path.with_extension(format!("tmp.{}.{}", std::process::id(), seq));
-            match write_cache_atomic(&path, &tmp, &data, &PERSISTED_LEN) {
-                Ok(CacheSaveOutcome::Landed) => crate::observe::off(format!(
-                    "vk_pipeline_cache_save bytes={} path={}",
-                    data.len(),
-                    path.display()
-                )),
-                Ok(CacheSaveOutcome::Superseded) => {}
-                Err(decline) => {
-                    crate::observe::Emit::decline("vk_pipeline_cache_save", &decline).fail_once(0)
-                }
-            }
-        });
     }
 
     pub(crate) unsafe fn destroy(&mut self) {
@@ -1354,10 +1368,15 @@ impl DeviceContext {
         if let Some(probe) = self.draw_spans.take() {
             self.device.destroy_query_pool(probe.pool, None);
         }
-        self.device
-            .destroy_pipeline_cache(self.pipeline_cache, None);
-        self.device.destroy_device(None);
-        self.instance.destroy_instance(None);
+        // The pipeline cache, the device and the instance go when the last
+        // holder of `life` lets go: this context now, or a graphics compile
+        // that is still inside the driver with them.
+        self.life.retire();
+    }
+
+    /// See [`DeviceLife::persist_pipeline_cache`].
+    pub(crate) fn persist_pipeline_cache(&self) {
+        self.life.persist_pipeline_cache();
     }
 
     /// Pick a memory type for `class` on this device.
@@ -1751,6 +1770,184 @@ fn dedicated_transfer_family(families: &[vk::QueueFamilyProperties]) -> Option<u
                     .intersects(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE)
         })
         .map(|i| i as u32)
+}
+
+/// The `VkDevice`, its instance and its pipeline cache, destroyed by whoever
+/// holds them last.
+///
+/// # Why the device outlives its context
+///
+/// A graphics pipeline compiles on the pipeline compiler thread with no lock
+/// held (see [`super::pipeline_compiler`]), and that call can still be inside
+/// the driver when a device loss tears the context down. The compile cannot be
+/// cancelled and the engine lock must not wait for it, so the job holds this
+/// `Arc` instead: [`DeviceContext::destroy`] retires the device, and the
+/// objects the compile names — the device, the pipeline cache, and the cache's
+/// layouts and render passes parked in [`Self::defer`] — are destroyed when
+/// the job lets go.
+///
+/// A context dropped without [`DeviceContext::destroy`] never retires its
+/// life, and nothing is destroyed: the same leak as before this type, and the
+/// safe one, because the context's own helper threads may still be using the
+/// device.
+pub(crate) struct DeviceLife {
+    pub(crate) device: ash::Device,
+    instance: ash::Instance,
+    pub(crate) pipeline_cache: vk::PipelineCache,
+    /// On-disk VkPipelineCache blob for this device (keyed by
+    /// pipelineCacheUUID), or None when persistence is unavailable.
+    pipeline_cache_path: Option<std::path::PathBuf>,
+    /// Byte length of the last persisted cache blob — the growth debounce
+    /// for [`Self::persist_pipeline_cache`].
+    pipeline_cache_saved_len: AtomicUsize,
+    retired: AtomicBool,
+    /// Set when the device is being replaced. Nothing compiled against it may
+    /// be published any more, and a job that has not started is not compiled.
+    stale: AtomicBool,
+    /// Cache-owned objects whose destruction waited for a compile in flight.
+    late: Mutex<Vec<super::caches::CacheHandles>>,
+    /// Shader modules the pipeline compiler built, by digest, with the refusal
+    /// for a module that failed validation or creation. Only the compiler
+    /// thread reads or writes it; it lives here because its modules die with
+    /// this device.
+    pub(crate) modules: Mutex<HashMap<super::digest::Digest128, Result<vk::ShaderModule, DrawError>>>,
+    /// The loaded Vulkan loader. Held so the library outlives the last call
+    /// through `device` and `instance`, whichever holder makes it: a context
+    /// drops its own `Entry` before its `Arc` of this.
+    _entry: ash::Entry,
+}
+
+impl DeviceLife {
+    /// The context gave the device up. It is destroyed when the last holder
+    /// drops.
+    pub(crate) fn retire(&self) {
+        self.stale.store(true, Ordering::Release);
+        self.retired.store(true, Ordering::Release);
+    }
+
+    /// The device is being replaced: stop publishing what was compiled on it.
+    pub(crate) fn mark_stale(&self) {
+        self.stale.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn is_stale(&self) -> bool {
+        self.stale.load(Ordering::Acquire)
+    }
+
+    /// Destroy `handles` when the last holder of this device drops, rather than
+    /// now. Used while a compile may still be using them.
+    pub(crate) fn defer(&self, handles: super::caches::CacheHandles) {
+        self.late
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(handles);
+    }
+
+    /// Persist the pipeline cache to disk when it has grown since the last
+    /// save. Called after each actual pipeline creation (cache misses only —
+    /// warm hits never reach this). A graphics pipeline persists from the
+    /// pipeline compiler thread, outside every lock; a compute pipeline still
+    /// persists under the engine lock, where the serialize is a memcpy. The file
+    /// write runs on a detached thread so nothing on the draw path blocks on disk. Saving on creation rather than at context
+    /// destroy is deliberate: the testing boot SIGKILLs QEMU, so destroy
+    /// never runs there. The tmp-then-rename keeps a concurrent reader (or a
+    /// second QEMU process) from ever seeing a torn blob.
+    pub(crate) fn persist_pipeline_cache(&self) {
+        let Some(path) = self.pipeline_cache_path.clone() else {
+            return;
+        };
+        static PERSISTED_LEN: AtomicUsize = AtomicUsize::new(0);
+        let data = match unsafe { self.device.get_pipeline_cache_data(self.pipeline_cache) } {
+            Ok(d) => d,
+            Err(e) => {
+                let decline = VkCall::new(VkOp::ContextPipelineCacheGetData, e);
+                crate::observe::Emit::decline("vk_pipeline_cache_save", &decline).fail_once(0);
+                return;
+            }
+        };
+        // Never write back a blob the next boot would refuse to load. Without
+        // this the bound above still self-heals — one cold boot rebuilds a small
+        // blob — but every boot in between pays a 30 MB write to produce a file
+        // whose only use is to be declined.
+        if data.len() > PIPELINE_CACHE_MAX_WARM_BYTES {
+            crate::observe::Emit::decline(
+                "vk_pipeline_cache_save",
+                &PipelineCacheDecline::TooLarge {
+                    bytes: data.len(),
+                    cap: PIPELINE_CACHE_MAX_WARM_BYTES,
+                },
+            )
+            .fail_once(0);
+            if let Err(decline) = discard_cache_blob(&path, &PERSISTED_LEN) {
+                crate::observe::Emit::decline("vk_pipeline_cache_save", &decline).fail_once(0);
+            }
+            return;
+        }
+        // Growth debounce: byte length is the proxy for "a new pipeline
+        // landed" (equal-length different-content saves are lost, which only
+        // costs a warm-start miss on that one pipeline next boot).
+        if data.len()
+            == self
+                .pipeline_cache_saved_len
+                .swap(data.len(), Ordering::Relaxed)
+        {
+            return;
+        }
+        // Unique tmp name PER SAVE. Keying only on the (constant) pid meant two
+        // concurrent saves — spawned when two calls with different data lengths
+        // both clear the growth debounce — wrote the SAME tmp file, so the first
+        // thread's rename(tmp→path) moved it out from under the second thread's
+        // rename, which then failed ENOENT (the intermittent
+        // `vk_pipeline_cache_save reason=vk_pipeline_cache_rename errno=2 ...`).
+        // A per-save sequence number makes each thread's tmp file private, so the
+        // write→rename is race-free and the newest save always lands.
+        static SAVE_SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SAVE_SEQ.fetch_add(1, Ordering::Relaxed);
+        std::thread::spawn(move || {
+            let tmp = path.with_extension(format!("tmp.{}.{}", std::process::id(), seq));
+            match write_cache_atomic(&path, &tmp, &data, &PERSISTED_LEN) {
+                Ok(CacheSaveOutcome::Landed) => crate::observe::off(format!(
+                    "vk_pipeline_cache_save bytes={} path={}",
+                    data.len(),
+                    path.display()
+                )),
+                Ok(CacheSaveOutcome::Superseded) => {}
+                Err(decline) => {
+                    crate::observe::Emit::decline("vk_pipeline_cache_save", &decline).fail_once(0)
+                }
+            }
+        });
+    }
+
+}
+
+impl Drop for DeviceLife {
+    fn drop(&mut self) {
+        if !*self.retired.get_mut() {
+            return;
+        }
+        // SAFETY: the last `Arc` is gone, so no compile and no context can
+        // still be using the device or anything made from it.
+        unsafe {
+            for handles in self.late.get_mut().unwrap_or_else(|e| e.into_inner()).drain(..) {
+                handles.destroy(&self.device);
+            }
+            for (_, module) in self
+                .modules
+                .get_mut()
+                .unwrap_or_else(|e| e.into_inner())
+                .drain()
+            {
+                if let Ok(module) = module {
+                    self.device.destroy_shader_module(module, None);
+                }
+            }
+            self.device
+                .destroy_pipeline_cache(self.pipeline_cache, None);
+            self.device.destroy_device(None);
+            self.instance.destroy_instance(None);
+        }
+    }
 }
 
 /// Process-global engine state ownership (device + recreate policy + init fail cache).
@@ -2198,6 +2395,57 @@ mod pipeline_cache_blob_tests {
             big,
             "larger snapshot upgraded the cache"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An oversized blob is discarded, and the newest-wins guard reopens so the
+    /// rebuilt (smaller) blob can land.
+    ///
+    /// The reset is the half that fails silently without this test. Leaving
+    /// `persisted_len` at the discarded blob's length makes every later save
+    /// `Superseded`, so the file never comes back and the rail is cold for the
+    /// life of the process — which reads in a log exactly like a machine that
+    /// simply never warmed.
+    #[test]
+    fn discard_reopens_the_guard_so_a_rebuilt_blob_lands() {
+        let dir =
+            std::env::temp_dir().join(format!("reims-vgpu-cache-test4-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cache.bin");
+        let persisted = AtomicUsize::new(0);
+        let oversized = vec![0x7Eu8; 8192];
+        assert_eq!(
+            write_cache_atomic(&path, &dir.join("t.0"), &oversized, &persisted).unwrap(),
+            CacheSaveOutcome::Landed
+        );
+        assert_eq!(persisted.load(Ordering::Relaxed), 8192);
+
+        discard_cache_blob(&path, &persisted).unwrap();
+        assert!(!path.exists(), "oversized blob discarded");
+        assert_eq!(persisted.load(Ordering::Relaxed), 0, "guard reopened");
+
+        // The rebuild is smaller than what was discarded, which is the whole
+        // point, so it must not be read as a regression of the on-disk cache.
+        let rebuilt = vec![0x2Au8; 1024];
+        assert_eq!(
+            write_cache_atomic(&path, &dir.join("t.1"), &rebuilt, &persisted).unwrap(),
+            CacheSaveOutcome::Landed
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), rebuilt);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Discarding a blob that is already gone is the outcome asked for, not a
+    /// failure — every save after the first overflow in one process takes this
+    /// path, and each one would otherwise report an error it cannot act on.
+    #[test]
+    fn discarding_an_absent_blob_is_success() {
+        let dir =
+            std::env::temp_dir().join(format!("reims-vgpu-cache-test5-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let persisted = AtomicUsize::new(4096);
+        discard_cache_blob(&dir.join("never-written.bin"), &persisted).unwrap();
+        assert_eq!(persisted.load(Ordering::Relaxed), 0);
         std::fs::remove_dir_all(&dir).ok();
     }
 

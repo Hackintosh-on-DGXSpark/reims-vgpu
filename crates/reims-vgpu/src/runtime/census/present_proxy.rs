@@ -64,7 +64,8 @@ pub enum MrtDrop {
     NonContiguousSlot,
     /// A secondary attachment's geometry differs from the primary's.
     GeometryMismatch,
-    /// The secondary's pixel format has no known engine mapping.
+    /// The secondary's pixel format has no known engine mapping, or has one this
+    /// host published no colour-attachment support for.
     UnknownFormat,
     /// The secondary target has no resident identity to render into.
     NoIdentity,

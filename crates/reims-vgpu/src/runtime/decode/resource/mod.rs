@@ -3,12 +3,13 @@
 use crate::contract::endian::{ld16, ld32, ld64}; // ld64: texture-view level base/count
 #[cfg(test)]
 use crate::contract::endian::{st16, st32};
+use crate::contract::pixel_format::stored_format;
 use crate::runtime::heap_query; // ICB layout fixture encoder only
 
 use core::mem::{offset_of, size_of};
 use reims_vgpu_wire::ops::{
     backed_texture as w_backed, depth_stencil as w_ds, heap_texture as w_heap, icb as w_icb,
-    sampler as w_smp, texture_view as w_view,
+    sampler as w_smp, texture as w_tex, texture_view as w_view,
 };
 use reims_vgpu_wire::OP_HEADER_LEN as OP_HDR;
 
@@ -76,10 +77,29 @@ impl crate::observe::Decline for DecodeStatus {
 pub const OBJECT_TYPE_BUFFER: u8 = 1;
 pub const OBJECT_TYPE_TEXTURE: u8 = 2;
 pub const OBJECT_TYPE_TEXTURE_VARIANT: u8 = 3;
+/// macOS 27's tag for a texture whose descriptor carries its level-0 layout
+/// twice. [`decode_list_object_entry`] reports it as
+/// [`OBJECT_TYPE_TEXTURE_VARIANT`] and [`reshape_twin_layout_descriptor`] gives
+/// its descriptor type 2's shape, so every texture rail serves it unchanged.
+pub const OBJECT_TYPE_TWIN_LAYOUT_TEXTURE: u8 = 12;
+/// Where the second copy of the level-0 layout sits in a type-12 descriptor.
+const TWIN_LAYOUT_COPY: std::ops::Range<usize> = 0x48..0x84;
 pub const OBJECT_TYPE_FUNCTION: u8 = 6;
 pub const OBJECT_TYPE_TYPE7: u8 = 7;
 pub const OBJECT_TYPE_TEXTURE_VIEW: u8 = 8;
+/// A texture with no backing at all, `MTLStorageModeMemoryless`. Its
+/// descriptor is the 44-byte record a type-2 descriptor carries after its
+/// level records, and nothing else. macOS 14 and later attach one as colour 1
+/// of nearly every WindowServer pass.
+pub const OBJECT_TYPE_MEMORYLESS_TEXTURE: u8 = 9;
 pub const OBJECT_TYPE_IOSURFACE: u8 = 11;
+/// A buffer carved from one of the guest's resource pools, from protocol 200.
+/// Its descriptor is a type-1 descriptor without the trailing four zero bytes,
+/// `{u64 size, u32 handle}`, and every buffer rail reads it as one:
+/// [`decode_list_object_entry`] reports it as [`OBJECT_TYPE_BUFFER`] and the
+/// descriptor read pads it. A 27.2 guest hands these to the info encoder as
+/// reply buffers.
+pub const OBJECT_TYPE_POOL_BUFFER: u8 = 19;
 
 /// Type-7 first dword subtypes.
 pub const TYPE7_OBJECT_SAMPLER: u32 = w_smp::OPCODE_NEW_SAMPLER;
@@ -415,6 +435,8 @@ pub struct TextureDescriptor {
     pub pixel_format: u16,
     /// Per-mip layouts (index 0 = L0). Empty if geometry incomplete.
     pub levels: Vec<TextureLevelLayout>,
+    /// Optional Plane 1 (alpha) layout decoded from [`OBJECT_TYPE_TWIN_LAYOUT_TEXTURE`].
+    pub alpha_plane: Option<TextureLevelLayout>,
 }
 
 impl TextureDescriptor {
@@ -492,6 +514,23 @@ impl TextureDescriptor {
             return None;
         }
         // Offset must leave room for at least one row within the allocation.
+        if self.allocation_size != 0
+            && (layout.offset >= self.allocation_size
+                || self.allocation_size - layout.offset < layout.row_stride)
+        {
+            return None;
+        }
+        Some((base.checked_add(layout.offset)?, layout))
+    }
+
+    /// Guest VA and layout of Plane 1 (8-bit alpha) on a two-plane type-12
+    /// texture, when the descriptor carried one.
+    pub fn alpha_plane_gva(&self, page_shift: u32) -> Option<(u64, &TextureLevelLayout)> {
+        let base = self.allocation_base_gva(page_shift)?;
+        let layout = self.alpha_plane.as_ref()?;
+        if layout.width == 0 || layout.height == 0 || layout.row_stride == 0 {
+            return None;
+        }
         if self.allocation_size != 0
             && (layout.offset >= self.allocation_size
                 || self.allocation_size - layout.offset < layout.row_stride)
@@ -619,6 +658,9 @@ impl Default for ColorWriteMask {
 }
 
 impl ColorWriteMask {
+    pub const NONE: Self = Self { bits: 0 };
+    pub const ALL: Self = Self { bits: MTL_COLOR_WRITE_MASK_ALL };
+
     /// `None` for a value outside `MTLColorWriteMask`'s four bits — see
     /// [`ColorWriteMaskOutOfRange`], which is what the decoder reports for it.
     pub fn new(bits: u32) -> Option<Self> {
@@ -1248,6 +1290,32 @@ pub const PIPELINE_TAG_DEPTH_ATTACH_FORMAT: u8 = 0x09;
 /// `MTLPixelFormat`. The stencil half of [`PIPELINE_TAG_DEPTH_ATTACH_FORMAT`],
 /// and benign for the same reason.
 pub const PIPELINE_TAG_STENCIL_ATTACH_FORMAT: u8 = 0x0a;
+/// `MTLRenderPipelineDescriptor.inputPrimitiveTopology`, an
+/// `MTLPrimitiveTopologyClass`.
+///
+/// The *class* of primitive the pipeline is compiled for — `Unspecified`,
+/// `Point`, `Line` or `Triangle` — and not a primitive type. See
+/// [`RENDER_PIPELINE_TAGS_BENIGN`] for why this device does not apply it.
+///
+/// # How it was placed
+///
+/// Three independent readings agree, which is worth recording because the tag
+/// numbering is the serializer's own and not a straight enumeration of the
+/// descriptor's properties:
+///
+/// * **Position.** It sits between [`PIPELINE_TAG_STENCIL_ATTACH_FORMAT`] and
+///   [`PIPELINE_TAG_MAX_TESSELLATION_FACTOR`], and `inputPrimitiveTopology` is
+///   the property the header declares between those two.
+/// * **Value.** The only value observed is `3`, which is
+///   `MTLPrimitiveTopologyClassTriangle`. Every other candidate property in that
+///   span is a `BOOL` or a sample count, and neither can be three.
+/// * **Company.** It appears on exactly one descriptor shape, the one that also
+///   carries [`PIPELINE_TAG_MAX_TESSELLATION_FACTOR`],
+///   [`PIPELINE_TAG_TESSELLATION_FACTOR_STEP_FUNCTION`] and
+///   [`PIPELINE_TAG_TESSELLATION_OUTPUT_WINDING_ORDER`] — and Metal requires a
+///   tessellated pipeline to declare a topology class rather than leave it
+///   `Unspecified`, which is why a tessellation pipeline is where it shows up.
+pub const PIPELINE_TAG_INPUT_PRIMITIVE_TOPOLOGY: u8 = 0x0b;
 /// `MTLRenderPipelineDescriptor.maxTessellationFactor`.
 pub const PIPELINE_TAG_MAX_TESSELLATION_FACTOR: u8 = 0x0d;
 /// `MTLRenderPipelineDescriptor.tessellationFactorStepFunction`.
@@ -1718,6 +1786,23 @@ pub struct ListObjectEntry {
     pub object_type: u8,
     pub descriptor_length: u32,
     pub descriptor_gva: u64,
+    /// The guest tagged it [`OBJECT_TYPE_TWIN_LAYOUT_TEXTURE`].
+    pub twin_layout: bool,
+}
+
+const TWIN_ALPHA_PLANE_MAGIC: [u8; 8] = *b"TWINPLN1";
+
+/// Give a type-12 descriptor type 2's shape while preserving its Plane 1
+/// level-0 layout in a self-identifying trailer for [`decode_texture_descriptor`].
+pub fn reshape_twin_layout_descriptor(bytes: &mut Vec<u8>) -> bool {
+    if bytes.len() < TEXTURE_DESC_PIXEL_FORMAT + 2 + TWIN_LAYOUT_COPY.len() {
+        return false;
+    }
+    let plane1 = bytes[TWIN_LAYOUT_COPY].to_vec();
+    bytes.drain(TWIN_LAYOUT_COPY);
+    bytes.extend_from_slice(&TWIN_ALPHA_PLANE_MAGIC);
+    bytes.extend_from_slice(&plane1);
+    true
 }
 
 /// Decode one 12-byte object-list entry (live arm Reims VGPU contract).
@@ -1726,10 +1811,17 @@ pub fn decode_list_object_entry(bytes: &[u8]) -> Result<ListObjectEntry, DecodeS
         return Err(DecodeStatus::ErrShort("res_list_entry_short"));
     }
     let first = ld32(&bytes[OBJECT_LIST_ENTRY_HEADER..]);
+    let object_type = (first & OBJECT_TYPE_MASK) as u8;
+    let twin_layout = object_type == OBJECT_TYPE_TWIN_LAYOUT_TEXTURE;
     Ok(ListObjectEntry {
-        object_type: (first & OBJECT_TYPE_MASK) as u8,
+        object_type: match object_type {
+            OBJECT_TYPE_TWIN_LAYOUT_TEXTURE => OBJECT_TYPE_TEXTURE_VARIANT,
+            OBJECT_TYPE_POOL_BUFFER => OBJECT_TYPE_BUFFER,
+            other => other,
+        },
         descriptor_length: first >> OBJECT_DESC_LEN_SHIFT,
         descriptor_gva: ld64(&bytes[OBJECT_LIST_ENTRY_DESC_GVA..]),
+        twin_layout,
     })
 }
 
@@ -1739,6 +1831,109 @@ pub fn list_object_entry_offset(ref_: u32, entry_count: u32) -> Option<u64> {
         return None;
     }
     (ref_ as u64).checked_mul(OBJECT_LIST_ENTRY_LEN as u64)
+}
+
+/// Bytes of a pool buffer's descriptor; see [`OBJECT_TYPE_POOL_BUFFER`].
+pub const POOL_BUFFER_DESC_LEN: usize = 12;
+
+/// The record opcode a protocol-62 type-11 descriptor carries after its mapping
+/// prefix, as a 26-era guest writes it. Its `TextureDescriptor2` form is the
+/// IOSurface-texture opcode `0x39`.
+const IOSURFACE_TEXTURE_OBJECT_OPCODE: u32 = 0x2f;
+
+/// Rewrite a 40-byte `TextureDescriptor2` descriptor as the 32-byte one.
+///
+/// The wide form packs type and flags into one byte, then the pixel format,
+/// then `usage` as a `u32` of its own. The narrow form packs type and flags, an
+/// eight-bit `usage` and the pixel format into one word. Everything from
+/// `width` to the trailing `u64` is the same fields in the same order, three
+/// bytes later. Usage bits above the eighth and the swizzle the wide form
+/// appends have no slot in the narrow form and are dropped; nothing that reads
+/// the narrow form reads either.
+pub fn narrow_texture_descriptor(wide: &[u8]) -> Option<[u8; w_tex::TEXTURE_DESCRIPTOR_LEN]> {
+    let wide = wide.get(..w_tex::WIDE_TEXTURE_DESCRIPTOR_LEN)?;
+    let pixel_format = u32::from(ld16(&wide[1..]));
+    let usage = ld32(&wide[3..]);
+    let packed = u32::from(wide[0]) | ((usage & 0xff) << 8) | (pixel_format << 16);
+    let mut narrow = [0u8; w_tex::TEXTURE_DESCRIPTOR_LEN];
+    narrow[..4].copy_from_slice(&packed.to_le_bytes());
+    narrow[4..].copy_from_slice(&wide[7..7 + w_tex::TEXTURE_DESCRIPTOR_LEN - 4]);
+    Some(narrow)
+}
+
+/// Give an object-list descriptor the shape protocol 62 gives the same object,
+/// so every decoder downstream reads one layout. `true` when it changed.
+///
+/// At protocol 237 the guest's serializer writes `TextureDescriptor2` records,
+/// and an object-list descriptor embeds the record its object was made from:
+///
+/// - type 9 is a `0x34` record (`newTextureWithDescriptor:`), narrow `1`;
+/// - type 11 is an eight-byte mapping prefix and a `0x39` IOSurface-texture
+///   record, narrow `0x2f`, whose plane widens from two bytes to four;
+/// - type 2 and 3 end in the `0x34` record after the kernel's layout and level
+///   records.
+///
+/// The `0x37` buffer-texture and `0x38` heap-texture records are not rewritten:
+/// their wide forms already have decoders. A pool buffer's 12-byte descriptor
+/// is padded to the buffer descriptor's 16.
+pub fn normalize_object_descriptor(object_type: u8, bytes: &mut Vec<u8>) -> bool {
+    if object_type == OBJECT_TYPE_BUFFER && bytes.len() == POOL_BUFFER_DESC_LEN {
+        bytes.resize(LINEAR_DESC_MIN_LEN, 0);
+        return true;
+    }
+    narrow_leading_record(object_type, bytes) || narrow_trailing_record(bytes)
+}
+
+/// The record at the start of a type-9 or type-11 descriptor.
+fn narrow_leading_record(object_type: u8, bytes: &mut Vec<u8>) -> bool {
+    let base = if object_type == OBJECT_TYPE_IOSURFACE { 8 } else { 0 };
+    let Some(opcode) = bytes.get(base..base + 4).map(ld32) else {
+        return false;
+    };
+    // (narrow opcode, object refs before the descriptor, bytes kept after it)
+    let (narrow_op, refs, tail) = match opcode {
+        w_tex::OPCODE_NEW_TEXTURE_WIDE => (w_tex::OPCODE_NEW_TEXTURE, 1, 0),
+        w_backed::OPCODE_IOSURFACE_TEXTURE_WIDE => (IOSURFACE_TEXTURE_OBJECT_OPCODE, 1, 4),
+        _ => return false,
+    };
+    let desc_at = base + OP_HDR + 4 * refs;
+    let Some(narrow) = bytes.get(desc_at..).and_then(narrow_texture_descriptor) else {
+        return false;
+    };
+    let tail_at = desc_at + w_tex::WIDE_TEXTURE_DESCRIPTOR_LEN;
+    let tail_end = tail_at.saturating_add(tail).min(bytes.len());
+    let mut out = Vec::with_capacity(bytes.len());
+    out.extend_from_slice(&bytes[..desc_at]);
+    out.extend_from_slice(&narrow);
+    out.extend_from_slice(&bytes[tail_at..tail_end]);
+    let record_len = (out.len() - base) as u32;
+    out[base..base + 4].copy_from_slice(&narrow_op.to_le_bytes());
+    out[base + 4..base + 8].copy_from_slice(&record_len.to_le_bytes());
+    *bytes = out;
+    true
+}
+
+/// The `0x34` record a linear texture's descriptor ends in.
+fn narrow_trailing_record(bytes: &mut Vec<u8>) -> bool {
+    let wide_len = w_tex::NEW_TEXTURE_WIDE_TOTAL_LEN as usize;
+    let Some(at) = bytes.len().checked_sub(wide_len) else {
+        return false;
+    };
+    if at < OP_HDR
+        || ld32(&bytes[at..]) != w_tex::OPCODE_NEW_TEXTURE_WIDE
+        || ld32(&bytes[at + 4..]) as usize != wide_len
+    {
+        return false;
+    }
+    let Some(narrow) = narrow_texture_descriptor(&bytes[at + OP_HDR + 4..]) else {
+        return false;
+    };
+    bytes.truncate(at + OP_HDR + 4);
+    bytes.extend_from_slice(&narrow);
+    let narrow_len = (bytes.len() - at) as u32;
+    bytes[at..at + 4].copy_from_slice(&w_tex::OPCODE_NEW_TEXTURE.to_le_bytes());
+    bytes[at + 4..at + 8].copy_from_slice(&narrow_len.to_le_bytes());
+    true
 }
 
 pub fn decode_buffer_descriptor(bytes: &[u8]) -> Result<BufferDescriptor, DecodeStatus> {
@@ -1753,7 +1948,59 @@ pub fn decode_buffer_descriptor(bytes: &[u8]) -> Result<BufferDescriptor, Decode
     })
 }
 
+/// A type-9 texture: the geometry of a texture that lives only in tile memory.
+///
+/// Measured on macOS 15.6.1, every one of these reads
+/// `01000000 2c000000 <ref> 4205 <format> <width> <height> <depth>
+/// <levels:u16> <array:u16> <samples:u16> 0030 …`. The same record sits at
+/// offset 72 of a type-2 descriptor, where the last field reads `0020`: the
+/// `MTLResourceOptions` storage mode, private there and memoryless here.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MemorylessTextureDescriptor {
+    pub pixel_format: u16,
+    pub width: u32,
+    pub height: u32,
+    pub depth: u32,
+    pub sample_count: u32,
+}
+
+pub const MEMORYLESS_DESC_LEN: usize = 36;
+const MEMORYLESS_DESC_PIXEL_FORMAT: usize = 14;
+const MEMORYLESS_DESC_WIDTH: usize = 16;
+const MEMORYLESS_DESC_HEIGHT: usize = 20;
+const MEMORYLESS_DESC_DEPTH: usize = 24;
+const MEMORYLESS_DESC_SAMPLE_COUNT: usize = 32;
+
+pub fn decode_memoryless_texture_descriptor(
+    bytes: &[u8],
+) -> Result<MemorylessTextureDescriptor, DecodeStatus> {
+    if bytes.len() < MEMORYLESS_DESC_LEN {
+        return Err(DecodeStatus::ErrShort("res_memoryless_desc_short"));
+    }
+    Ok(MemorylessTextureDescriptor {
+        pixel_format: stored_format(ld16(&bytes[MEMORYLESS_DESC_PIXEL_FORMAT..])),
+        width: ld32(&bytes[MEMORYLESS_DESC_WIDTH..]),
+        height: ld32(&bytes[MEMORYLESS_DESC_HEIGHT..]),
+        depth: ld32(&bytes[MEMORYLESS_DESC_DEPTH..]).max(1),
+        sample_count: u32::from(ld16(&bytes[MEMORYLESS_DESC_SAMPLE_COUNT..])).max(1),
+    })
+}
+
 pub fn decode_texture_descriptor(bytes: &[u8]) -> Result<TextureDescriptor, DecodeStatus> {
+    let trailer_len = TWIN_ALPHA_PLANE_MAGIC.len() + TWIN_LAYOUT_COPY.len();
+    let (bytes, twin_plane1) = if bytes.len() >= TEXTURE_DESC_GEOMETRY_LEN + trailer_len {
+        let split = bytes.len() - trailer_len;
+        if bytes[split..split + TWIN_ALPHA_PLANE_MAGIC.len()] == TWIN_ALPHA_PLANE_MAGIC {
+            (
+                &bytes[..split],
+                Some(&bytes[split + TWIN_ALPHA_PLANE_MAGIC.len()..]),
+            )
+        } else {
+            (bytes, None)
+        }
+    } else {
+        (bytes, None)
+    };
     if bytes.len() < TEXTURE_DESC_GEOMETRY_LEN {
         return Err(DecodeStatus::ErrShort("res_texture_desc_short"));
     }
@@ -1886,7 +2133,7 @@ pub fn decode_texture_descriptor(bytes: &[u8]) -> Result<TextureDescriptor, Deco
     };
     let pf_off = TEXTURE_DESC_PIXEL_FORMAT + format_shift;
     if bytes.len() >= pf_off + 2 {
-        out.pixel_format = ld16(&bytes[pf_off..]);
+        out.pixel_format = stored_format(ld16(&bytes[pf_off..]));
     } else if crate::observe::first_sight("texture_desc_format_unreachable", levels as u64) {
         // No fallback to the unshifted offset. The fallback's own length test
         // was `TEXTURE_DESC_PIXEL_FORMAT + 2`, so for a single-mip body it
@@ -1902,6 +2149,35 @@ pub fn decode_texture_descriptor(bytes: &[u8]) -> Result<TextureDescriptor, Deco
              (multi-mip body too short for its shifted format trailer)",
             bytes.len()
         ));
+    }
+    if let Some(p1) = twin_plane1 {
+        let off_rel = TEXTURE_DESC_DATA_OFFSET - TEXTURE_DESC_MIPMAP_LEVEL_COUNT;
+        let used_rel = TEXTURE_DESC_USED_SIZE - TEXTURE_DESC_MIPMAP_LEVEL_COUNT;
+        let bpr_rel = TEXTURE_DESC_ROW_STRIDE - TEXTURE_DESC_MIPMAP_LEVEL_COUNT;
+        let w_rel = TEXTURE_DESC_WIDTH - TEXTURE_DESC_MIPMAP_LEVEL_COUNT;
+        let h_rel = TEXTURE_DESC_HEIGHT - TEXTURE_DESC_MIPMAP_LEVEL_COUNT;
+        let d_rel = TEXTURE_DESC_DEPTH - TEXTURE_DESC_MIPMAP_LEVEL_COUNT;
+        let offset = u64::from(ld32(&p1[off_rel..]));
+        let used_size = u64::from(ld32(&p1[used_rel..]));
+        let row_stride = u64::from(ld32(&p1[bpr_rel..]));
+        let width = ld32(&p1[w_rel..]);
+        let height = ld32(&p1[h_rel..]);
+        let depth = ld32(&p1[d_rel..]).max(1);
+        let size = if used_size != 0 {
+            used_size
+        } else {
+            row_stride.saturating_mul(u64::from(height))
+        };
+        if width != 0 && height != 0 && row_stride != 0 {
+            out.alpha_plane = Some(TextureLevelLayout {
+                offset,
+                size,
+                row_stride,
+                width,
+                height,
+                depth,
+            });
+        }
     }
     Ok(out)
 }
@@ -2163,14 +2439,39 @@ pub fn decode_depth_stencil_descriptor(
     // unidentified (Metal substitutes default faces before serialize). Keep the
     // product field names; source the bit from the same byte the view exposes.
     let state = body.depth_state;
+    let front_stencil_enabled = (state & DEPTH_STENCIL_FRONT_STENCIL_ENABLED as u8) != 0;
+    let back_stencil_enabled = (state & DEPTH_STENCIL_BACK_STENCIL_ENABLED as u8) != 0;
+    // A face block is only meaningful behind its own enable bit, and reading it
+    // otherwise reads the guest's stale ring.
+    //
+    // The paragraph above says Metal substitutes default faces before it
+    // serializes, so both blocks are always written. That is not true of every
+    // record: Apple's own capture of a descriptor whose front face is absent
+    // leaves the front block untouched, and the bytes under it on a real wire
+    // are whatever the ring last held. Decoding them made one record decode two
+    // ways depending on noise, which is the property
+    // `no_decoder_reads_a_bit_apples_serializer_never_wrote` exists to hold.
+    //
+    // Gating changes no execution — every consumer already reads a face only
+    // behind the same bit (`runtime::draw::vulkan`'s stencil block,
+    // `backend::metal::render`) — it removes the nondeterminism ahead of them,
+    // so the decoded record is a function of what the serializer wrote.
     Ok(DepthStencilDescriptor {
         depth_stencil_id: body.object_ref.get(),
         depth_compare_function: body.depth_compare_function() as u32,
         depth_write_enabled: body.depth_write_enabled(),
-        front_stencil_enabled: (state & DEPTH_STENCIL_FRONT_STENCIL_ENABLED as u8) != 0,
-        back_stencil_enabled: (state & DEPTH_STENCIL_BACK_STENCIL_ENABLED as u8) != 0,
-        front_face: face_from_wire(&body.front),
-        back_face: face_from_wire(&body.back),
+        front_stencil_enabled,
+        back_stencil_enabled,
+        front_face: if front_stencil_enabled {
+            face_from_wire(&body.front)
+        } else {
+            DepthStencilFace::default()
+        },
+        back_face: if back_stencil_enabled {
+            face_from_wire(&body.back)
+        } else {
+            DepthStencilFace::default()
+        },
     })
 }
 
@@ -2289,6 +2590,17 @@ const COMPUTE_PIPELINE_TAG_THREADGROUP_MULTIPLE: u8 = 0x01;
 /// [`RENDER_PIPELINE_TAG_LABEL`] at a different index, for the reason that
 /// constant's doc gives.
 const COMPUTE_PIPELINE_TAG_LABEL: u8 = 0x02;
+/// Property 10 of the compute descriptor, value 2 on every record seen. A
+/// macOS 15 Core Image kernel (`k7x1RGBA14X1Yh`) sets it beside the label and
+/// the threadgroup hint; refusing it lost every frame drawn through that
+/// kernel. Not identified, and taken as a compiler hint like its neighbours.
+const COMPUTE_PIPELINE_TAG_10: u8 = 0x0a;
+/// `MTLComputePipelineDescriptor.maxTotalThreadsPerThreadgroup`, which macOS 27
+/// sets from the `computePipelineStateInfo:` answer (1024 on every record seen).
+/// It caps the threadgroups the guest may dispatch with the pipeline; this
+/// device takes each threadgroup size from the dispatch record, and the guest
+/// sized those from the same answer, so there is nothing to apply.
+const COMPUTE_PIPELINE_TAG_MAX_TOTAL_THREADS: u8 = 0x08;
 /// `MTLComputePipelineDescriptor.stageInputDescriptor` — a byte offset from the
 /// end of the 16-byte type-7 header to a nested property list, in the same units
 /// as [`PIPELINE_TAG_VERTEX_DESCRIPTOR_OFFSET`] and
@@ -2372,22 +2684,37 @@ pub const PIPELINE_TAG_COMPUTE_STAGE_INPUT_OFFSET: u8 = 0x03;
 ///   change what the guest observes; the attachment it observes is the one its
 ///   own pass named.
 ///
+/// * [`PIPELINE_TAG_INPUT_PRIMITIVE_TOPOLOGY`] declares the *class* of primitive
+///   the pipeline is compiled for. It does not select one: every draw record
+///   carries its own `MTLPrimitiveType`, which
+///   `translate::raster::primitive_topology` turns into the
+///   `VkPipelineInputAssemblyStateCreateInfo` topology, so the class restates
+///   what the draw already names — the same relationship the two attachment
+///   formats above have with the pass descriptor. Metal requires a draw's
+///   primitive type to belong to the class its pipeline declared, so the two
+///   cannot disagree without the guest's own validation having rejected the
+///   draw first. Dropping it cannot change what the guest observes; the topology
+///   it observes is the one its own draw named.
+///
 /// **`rasterizationEnabled` and `alphaToCoverageEnabled` are deliberately not
 /// here.** They are two of the three the old doc named as silently defaulted,
 /// and neither has appeared in this block on a driven boot. If one arrives it
 /// must refuse rather than be waved through. The third,
 /// [`PIPELINE_TAG_RASTER_SAMPLE_COUNT`], is now read — it is consumed on both
 /// shapes and carried to the backend render-pass and pipeline keys.
-const RENDER_PIPELINE_TAGS_BENIGN: [u8; 3] = [
+const RENDER_PIPELINE_TAGS_BENIGN: [u8; 4] = [
     RENDER_PIPELINE_TAG_LABEL,
     PIPELINE_TAG_DEPTH_ATTACH_FORMAT,
     PIPELINE_TAG_STENCIL_ATTACH_FORMAT,
+    PIPELINE_TAG_INPUT_PRIMITIVE_TOPOLOGY,
 ];
 /// The compute half of [`RENDER_PIPELINE_TAGS_BENIGN`]; same rule, and listed
 /// apart for the same reason `COMPUTE_PIPELINE_TAGS_CONSUMED` is.
-const COMPUTE_PIPELINE_TAGS_BENIGN: [u8; 2] = [
+const COMPUTE_PIPELINE_TAGS_BENIGN: [u8; 4] = [
     COMPUTE_PIPELINE_TAG_THREADGROUP_MULTIPLE,
     COMPUTE_PIPELINE_TAG_LABEL,
+    COMPUTE_PIPELINE_TAG_10,
+    COMPUTE_PIPELINE_TAG_MAX_TOTAL_THREADS,
 ];
 
 /// A pipeline-descriptor field this decoder does not read **and has not
@@ -2813,7 +3140,7 @@ pub fn decode_render_pipeline_descriptor(
         }
         if color_abs < declared {
             out.color_attachments = parse_color_attachments(bytes, declared, color_abs)?;
-            if let Some(c0) = out.color_attachments.first().copied() {
+            if let Some(c0) = out.color_attachments.iter().find(|a| a.slot == 0).copied() {
                 out.color0 = c0;
             }
         }
@@ -3287,7 +3614,7 @@ fn parse_one_color_entry(
     let pf = entry_tag_u32(bytes, entry, COLOR_ATTACHMENT_TAG_PIXEL_FORMAT, u32::MAX);
     if pf != u32::MAX {
         out.has_pixel_format = true;
-        out.pixel_format = pf;
+        out.pixel_format = u16::try_from(pf).map_or(pf, |pf| u32::from(stored_format(pf)));
     }
     out.blending_enabled = entry_tag_u32(bytes, entry, COLOR_ATTACHMENT_TAG_BLEND_ENABLE, 0) != 0;
     out.src_rgb = entry_tag_u32(bytes, entry, COLOR_ATTACHMENT_TAG_SRC_RGB, BLEND_FACTOR_ONE);
@@ -3610,7 +3937,7 @@ pub fn decode_texture_view_descriptor(bytes: &[u8]) -> Result<TextureViewDescrip
         TEXTURE_VIEW_OPCODE_SIMPLE => {
             let b = w_view::texture_view(&op)
                 .map_err(|_| DecodeStatus::ErrShort("res_texture_view_short"))?;
-            let pixel_format = b.pixel_format.get();
+            let pixel_format = stored_format(b.pixel_format.get());
             Ok(TextureViewDescriptor {
                 view_opcode,
                 view_texture_ref: b.object_ref.get(),
@@ -3622,7 +3949,7 @@ pub fn decode_texture_view_descriptor(bytes: &[u8]) -> Result<TextureViewDescrip
         TEXTURE_VIEW_OPCODE_RANGED => {
             let b = w_view::texture_view_ranged(&op)
                 .map_err(|_| DecodeStatus::ErrShort("res_texture_view_short"))?;
-            let pixel_format = b.pixel_format.get();
+            let pixel_format = stored_format(b.pixel_format.get());
             Ok(TextureViewDescriptor {
                 view_opcode,
                 view_texture_ref: b.object_ref.get(),
@@ -3640,7 +3967,7 @@ pub fn decode_texture_view_descriptor(bytes: &[u8]) -> Result<TextureViewDescrip
             let b = w_view::texture_view_swizzle(&op)
                 .map_err(|_| DecodeStatus::ErrShort("res_texture_view_short"))?;
             let r = &b.ranged;
-            let pixel_format = r.pixel_format.get();
+            let pixel_format = stored_format(r.pixel_format.get());
             Ok(TextureViewDescriptor {
                 view_opcode,
                 view_texture_ref: r.object_ref.get(),
@@ -3835,7 +4162,7 @@ pub fn decode_iosurface_texture_descriptor(bytes: &[u8]) -> Result<Descriptor, D
     Ok(Descriptor::IOSurfaceTexture {
         mapping_id: ld32(&bytes[IOSURFACE_TEX_MAPPING_ID..]),
         object_ref: ld32(&bytes[IOSURFACE_TEX_OBJECT_REF..]),
-        pixel_format: ld16(&bytes[IOSURFACE_TEX_PIXEL_FORMAT..]),
+        pixel_format: stored_format(ld16(&bytes[IOSURFACE_TEX_PIXEL_FORMAT..])),
         width: ld32(&bytes[IOSURFACE_TEX_WIDTH..]),
         height: ld32(&bytes[IOSURFACE_TEX_HEIGHT..]),
     })

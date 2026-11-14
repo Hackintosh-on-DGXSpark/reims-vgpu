@@ -28,6 +28,7 @@ mod guest_scatter;
 mod host_ram;
 pub mod init_decline;
 mod linear_target_import;
+mod pipeline_compiler;
 mod pools;
 mod queue_owner;
 mod scatter_shader;
@@ -57,6 +58,7 @@ pub use context::MAX_DEVICE_RECREATES;
 pub(crate) use counters::{CounterSnapshot, EngineCounters};
 pub(crate) use draw_phase::take_window as draw_phase_window;
 pub(crate) use draw_preparation::DrawPreparationDecline;
+pub(crate) use pipeline_compiler::{PipelineOutcome, PipelineTicket};
 pub(crate) use facade_decline::EngineFacadeDecline;
 pub(crate) use host_ram::GuestWriteDecline;
 pub use types::viewport_slot_count;
@@ -64,7 +66,8 @@ pub use types::{
     BlendFactor, BlendOp, BlendStateResource, BufferContent, ColorWriteMask, ComputeBufferResource,
     ComputeOutput, ComputeRequest, ComputeResidentSampleBind, ComputeSampledImageResource,
     ComputeStorageImageResource, ComputeStorageResidency, CullMode, DepthClipMode, DepthState,
-    DrawError, DrawOutput, DrawRequest, FillMode, GuestRun, GuestRunSource, GuestSampledBacking,
+    DrawAnswer, DrawError, DrawOutput, DrawRequest, DrawScratchStorageImage, FillMode, GuestRun,
+    GuestRunSource, GuestSampledBacking,
     GuestTargetBacking, GuestTargetMemory, GuestTargetSeed, IndexType, IndexedDrawResource,
     PipelineObjectIdentity, PrimitiveTopology, SampledByteOrigin, SampledContentIdentity,
     SampledImageResource, SampledSource, SamplerAddressMode, SamplerBorderColor,
@@ -169,7 +172,10 @@ pub(crate) fn registry_subresource_range(
 /// geometry matches. Deriving usage here makes "same bucket implies same usage"
 /// true by construction, so a fourth creation site cannot get it wrong and
 /// nothing has to scan for one that did.
-pub(crate) fn registry_target_usage(format: ash::vk::Format) -> ash::vk::ImageUsageFlags {
+pub(crate) fn registry_target_usage(
+    format: ash::vk::Format,
+    attachment_feedback_loop_layout: bool,
+) -> ash::vk::ImageUsageFlags {
     if format_is_depth(format) {
         // A depth resident is only ever attachment N of an ad-hoc framebuffer.
         // No SAMPLED and no TRANSFER: nothing in this device reads a depth
@@ -178,11 +184,15 @@ pub(crate) fn registry_target_usage(format: ash::vk::Format) -> ash::vk::ImageUs
         // support the attachment alone.
         ash::vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
     } else {
-        ash::vk::ImageUsageFlags::COLOR_ATTACHMENT
+        let mut usage = ash::vk::ImageUsageFlags::COLOR_ATTACHMENT
             | ash::vk::ImageUsageFlags::INPUT_ATTACHMENT
             | ash::vk::ImageUsageFlags::TRANSFER_SRC
             | ash::vk::ImageUsageFlags::TRANSFER_DST
-            | ash::vk::ImageUsageFlags::SAMPLED
+            | ash::vk::ImageUsageFlags::SAMPLED;
+        if attachment_feedback_loop_layout {
+            usage |= ash::vk::ImageUsageFlags::ATTACHMENT_FEEDBACK_LOOP_EXT;
+        }
+        usage
     }
 }
 
@@ -296,7 +306,12 @@ impl EngineState {
                 if let Some(mut presenter) = presenter {
                     presenter.destroy(ctx, Some(&mut self.pools));
                 }
-                self.caches.destroy_all(&ctx.device);
+                // Not `destroy_all`: a graphics compile may still be inside the
+                // driver with this cache's layouts and passes, and the engine
+                // lock must not wait for it. Its tickets are answered
+                // `DeviceRebuilt` here, and whatever it names is destroyed when
+                // it lets go of the device.
+                self.caches.retire_into(&ctx.life);
                 self.pools.destroy_all(&ctx.device);
             }
         } else {
@@ -405,7 +420,10 @@ fn end_of_tranche_requires_engine(batch_open: bool, device_lost: bool) -> bool {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct DeviceCapabilitySnapshot(u64);
 
-const CAP_MAX_DIMENSION_BITS: u32 = u32::BITS;
+/// Wide enough for any Vulkan image dimension; the rest of the word is one bit
+/// per texel layout, twice over.
+const CAP_MAX_DIMENSION_BITS: u32 = 24;
+const CAP_MAX_DIMENSION_MASK: u64 = (1 << CAP_MAX_DIMENSION_BITS) - 1;
 const CAP_LAYOUT_SHIFT: u32 = CAP_MAX_DIMENSION_BITS;
 const CAP_GPU_ONLY_BIT: u32 =
     CAP_LAYOUT_SHIFT + crate::contract::pixel_format::TexelLayout::ALL.len() as u32;
@@ -426,7 +444,7 @@ impl DeviceCapabilitySnapshot {
         features: &crate::backend::vulkan::caps::device_features::DeviceFeatures,
         quirks: crate::backend::vulkan::caps::DriverQuirk,
     ) -> Self {
-        let mut word = u64::from(features.max_image_dimension_2d);
+        let mut word = u64::from(features.max_image_dimension_2d).min(CAP_MAX_DIMENSION_MASK);
         for (index, supported) in features.color_attachment_blend.iter().enumerate() {
             if *supported {
                 word |= 1_u64 << (CAP_LAYOUT_SHIFT + index as u32);
@@ -445,7 +463,7 @@ impl DeviceCapabilitySnapshot {
     }
 
     fn max_render_target_dimension(self) -> u32 {
-        self.0 as u32
+        (self.0 & CAP_MAX_DIMENSION_MASK) as u32
     }
 
     fn render_target_layout_supported(
@@ -465,6 +483,14 @@ impl DeviceCapabilitySnapshot {
     ) -> Option<bool> {
         (self.0 & (1_u64 << CAP_PUBLISHED_BIT) != 0)
             .then_some(self.0 & (1_u64 << (CAP_SAMPLED_FILTER_SHIFT + layout.index() as u32)) != 0)
+    }
+
+    fn render_target_layout_supported_if_published(
+        self,
+        layout: crate::contract::pixel_format::TexelLayout,
+    ) -> Option<bool> {
+        (self.0 & (1_u64 << CAP_PUBLISHED_BIT) != 0)
+            .then_some(self.render_target_layout_supported(layout))
     }
 }
 
@@ -539,6 +565,36 @@ mod device_capability_snapshot_tests {
             },
         );
         assert!(!narrowed.deferred_gpu_only_content_allowed());
+    }
+
+    /// A colour attachment is refused only on a device's own word: a host that
+    /// published no `A2R10G10B10` attachment support declines `BGR10A2Unorm`
+    /// targets, the same host renders its required red-low twin, and a snapshot
+    /// no device has published yet declines nothing.
+    #[test]
+    fn only_a_published_device_declines_a_render_target_layout() {
+        let mut features = crate::backend::vulkan::caps::device_features::DeviceFeatures {
+            max_image_dimension_2d: 16_384,
+            ..Default::default()
+        };
+        features.color_attachment_blend[TexelLayout::Rgb10a2Unorm.index()] = true;
+        let snapshot = DeviceCapabilitySnapshot::from_parts(
+            &features,
+            crate::backend::vulkan::caps::DriverQuirk::default(),
+        );
+        assert_eq!(
+            snapshot.render_target_layout_supported_if_published(TexelLayout::Bgr10a2Unorm),
+            Some(false)
+        );
+        assert_eq!(
+            snapshot.render_target_layout_supported_if_published(TexelLayout::Rgb10a2Unorm),
+            Some(true)
+        );
+        assert_eq!(
+            DeviceCapabilitySnapshot::CONSERVATIVE
+                .render_target_layout_supported_if_published(TexelLayout::Bgr10a2Unorm),
+            None
+        );
     }
 }
 
@@ -1005,7 +1061,10 @@ pub fn window_present_detach() {
 }
 
 /// Execute one draw against the persistent engine.
-pub fn execute_draw_request(req: &DrawRequest) -> Result<DrawOutput, DrawError> {
+///
+/// `DrawAnswer::PipelinePending` means the draw did nothing and waits for a
+/// pipeline the compiler is building; see [`pipeline_ticket_settled`].
+pub fn execute_draw_request(req: &DrawRequest) -> Result<DrawAnswer, DrawError> {
     let mut guard = lock_engine();
     let EngineState {
         ref mut owner,
@@ -1033,19 +1092,81 @@ pub fn execute_draw_request(req: &DrawRequest) -> Result<DrawOutput, DrawError> 
         }
     }
     match result {
-        Ok(out) => {
+        Ok(DrawAnswer::Drawn(out)) => {
             // Guest work reached the GPU, so any recreate that got us here did
             // its job and the storm budget starts over. See
             // `ContextOwner::note_work_completed`.
             guard.owner.note_work_completed();
-            Ok(out)
+            Ok(DrawAnswer::Drawn(out))
         }
+        Ok(pending) => Ok(pending),
         Err(DrawError::DeviceLost(decline)) => {
             guard.on_device_lost();
             Err(DrawError::DeviceLost(decline))
         }
         Err(e) => Err(e),
     }
+}
+
+/// Whether `ticket` has been answered, publishing finished compiles first if
+/// its own is among them.
+///
+/// The waiting packet asks this on every retry, so the unanswered case takes
+/// no lock: a ticket the compiler has not finished is answered `false` from
+/// two atomics. Only a finished, unpublished one takes the engine lock, for as
+/// long as filing the finished results takes.
+/// A ticket for no compile, for tests of what waits on one. Answer it with
+/// [`PipelineTicket::settle`].
+#[cfg(test)]
+pub(crate) fn test_ticket(seed: u32) -> PipelineTicket {
+    PipelineTicket::new(caches::test_pipeline_key(seed))
+}
+
+pub(crate) fn pipeline_ticket_settled(ticket: &PipelineTicket) -> bool {
+    if ticket.outcome().is_some() {
+        return true;
+    }
+    if !ticket.compiled() {
+        return false;
+    }
+    let mut guard = lock_engine();
+    let EngineState {
+        ref owner,
+        ref mut caches,
+        ref mut pools,
+        ref counters,
+        ..
+    } = &mut *guard;
+    unsafe { caches.publish_compiled(owner.ctx.as_ref(), pools, counters) };
+    ticket.outcome().is_some()
+}
+
+/// [`execute_draw_request`], waiting out a pipeline that is still being built.
+///
+/// For callers that hold no lock and have nothing else to do meanwhile: tests
+/// and tools. The drain must never call it — a draw there waits by leaving its
+/// packet at the FIFO head, not by blocking — and nothing on a guest path does.
+/// A wait that ends in a refusal returns that refusal rather than drawing again.
+pub fn execute_draw_request_blocking(req: &DrawRequest) -> Result<DrawOutput, DrawError> {
+    loop {
+        match execute_draw_request(req)? {
+            DrawAnswer::Drawn(out) => return Ok(out),
+            DrawAnswer::PipelinePending(ticket) => {
+                while !pipeline_ticket_settled(&ticket) {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                if let Some(PipelineOutcome::Failed(error)) = ticket.outcome() {
+                    return Err(error.clone());
+                }
+            }
+        }
+    }
+}
+
+/// The pipeline compiler's census line for the window just ended. See
+/// [`pipeline_compiler::take_census`].
+pub(crate) fn take_pipeline_compile_census(win_ms: u64) -> Option<String> {
+    pipeline_compiler::take_census(win_ms)
 }
 
 /// Submit any open deferred draw batch (draw batching increment 1). Called at
@@ -1297,6 +1418,15 @@ fn arm_guest_write_pages(pages: &[u64]) {
         }
     }
     f.armed.push(sorted);
+}
+
+/// A guest-page write submitted and not yet settled, over `pages`, for a test of
+/// a caller that must wait for one. Settles like any other: with no device the
+/// wait clears it.
+#[cfg(test)]
+pub(crate) fn test_arm_guest_write(pages: &[u64]) {
+    arm_guest_write_pages(pages);
+    GUEST_WRITE_DEBT.store(true, std::sync::atomic::Ordering::Release);
 }
 
 /// Record one resource-owned allocation that an outstanding GPU Store writes.
@@ -1898,6 +2028,125 @@ pub fn resident_content_ready(identity: &TargetIdentity) -> bool {
     resident_content_backing(identity) != ResidentContentBacking::NotReady
 }
 
+/// Materialize a clear-only pass on a resident target so subsequent `LOAD` or
+/// `SampledSource::Target` binds read the declared clear colour rather than an
+/// absent/unready resident.
+pub fn clear_resident_target(
+    identity: TargetIdentity,
+    clear_color: [f64; 4],
+    mtl_format: u16,
+) -> Result<(), DrawError> {
+    let _ = mtl_format;
+    let width = identity.width();
+    let height = identity.height();
+    if width == 0 || height == 0 {
+        return Ok(());
+    }
+    let mut guard = lock_engine();
+    let EngineState {
+        ref mut owner,
+        ref mut caches,
+        ref mut pools,
+        ref counters,
+        ..
+    } = *guard;
+    let ctx = owner.ensure(counters)?;
+    unsafe { pools.ensure_init(ctx, counters)? };
+    let format = identity.resident_format();
+    let pass_key = caches::PassKey::single(false, format);
+    let render_pass = unsafe { caches.get_or_create_pass(ctx, pass_key, counters, pools)? };
+    let (framebuffer, prior_access) = unsafe {
+        let (slot, _) = pools.registry_ensure(
+            ctx,
+            identity.clone(),
+            width,
+            height,
+            1,
+            render_pass,
+            pass_key.framebuffer_compatibility(),
+            identity.generation(),
+            format,
+            None,
+            counters,
+        )?;
+        (slot.framebuffer, slot.access)
+    };
+    let clear_val = match format {
+        ash::vk::Format::R8_UINT
+        | ash::vk::Format::R8G8_UINT
+        | ash::vk::Format::R16G16_UINT
+        | ash::vk::Format::R32_UINT
+        | ash::vk::Format::R8G8B8A8_UINT
+        | ash::vk::Format::R16G16B16A16_UINT
+        | ash::vk::Format::R32G32B32A32_UINT => ash::vk::ClearColorValue {
+            uint32: clear_color.map(|c| c.max(0.0) as u32),
+        },
+        ash::vk::Format::R8_SINT
+        | ash::vk::Format::R16_SINT
+        | ash::vk::Format::R32_SINT
+        | ash::vk::Format::R8G8B8A8_SINT
+        | ash::vk::Format::R16G16B16A16_SINT
+        | ash::vk::Format::R32G32B32A32_SINT => ash::vk::ClearColorValue {
+            int32: clear_color.map(|c| c as i32),
+        },
+        _ => ash::vk::ClearColorValue {
+            float32: clear_color.map(|c| c as f32),
+        },
+    };
+    let clears = [ash::vk::ClearValue { color: clear_val }];
+    unsafe {
+        let (cb, fence) = pools.begin_entry(ctx, counters)?;
+        pools.begin_slot_recording(
+            ctx,
+            cb,
+            gpu_span::Kind::Draw,
+            VkOp::GuestWriteResetCb,
+            VkOp::GuestWriteBeginCb,
+        )?;
+        if prior_access != pools::ResidentAccess::Untouched {
+            let (src_stage, src_access) = prior_access.source_scope();
+            let barrier = [ash::vk::MemoryBarrier::default()
+                .src_access_mask(src_access)
+                .dst_access_mask(ash::vk::AccessFlags::COLOR_ATTACHMENT_WRITE)];
+            ctx.device.cmd_pipeline_barrier(
+                cb,
+                src_stage,
+                ash::vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                ash::vk::DependencyFlags::empty(),
+                &barrier,
+                &[],
+                &[],
+            );
+        }
+        let rp_begin = ash::vk::RenderPassBeginInfo::default()
+            .render_pass(render_pass)
+            .framebuffer(framebuffer)
+            .render_area(ash::vk::Rect2D {
+                offset: ash::vk::Offset2D { x: 0, y: 0 },
+                extent: ash::vk::Extent2D { width, height },
+            })
+            .clear_values(&clears);
+        ctx.device.cmd_begin_render_pass(
+            cb,
+            &rp_begin,
+            ash::vk::SubpassContents::INLINE,
+        );
+        ctx.device.cmd_end_render_pass(cb);
+        pools.gpu_span_seal_current(ctx, cb);
+        ctx.device
+            .end_command_buffer(cb)
+            .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::GuestWriteEndCb, e)))?;
+        let cbs = [cb];
+        ctx.submit_guest_work(&cbs, fence)
+            .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::GuestWriteSubmit, e)))?;
+        let sealed = pools.seal_entry(Vec::new(), Vec::new());
+        pools.finish_entry_async(&ctx.device, sealed);
+        pools.registry_mark_ready_at(&identity, caches::color0_pass_exit_layout());
+    }
+    Ok(())
+}
+
+
 #[cfg(test)]
 mod resident_content_backing_tests {
     use super::*;
@@ -1920,6 +2169,42 @@ mod resident_content_backing_tests {
             classify_resident_content(false, false),
             ResidentContentBacking::NotReady
         );
+    }
+
+    #[test]
+    fn clear_resident_target_survives_ring_wrap_and_publishes_native_float16() {
+        let identity = TargetIdentity::Gva {
+            gva: 0xDEAD_BEEF_7000,
+            width: 4,
+            height: 4,
+            generation: 1,
+            format: ash::vk::Format::R16G16B16A16_SFLOAT,
+        };
+        for i in 0..40 {
+            match clear_resident_target(
+                identity.clone(),
+                [-0.5, 2.0, 0.25, 1.0 + i as f64 * 0.0],
+                crate::contract::pixel_format::MTL_FORMAT_RGBA16_FLOAT,
+            ) {
+                Ok(()) => {}
+                Err(DrawError::Init(_)) => return,
+                Err(other) => panic!("unexpected clear_resident_target failure at {i}: {other:?}"),
+            }
+        }
+        let rb = read_target_native(&identity).expect("cleared GVA resident must be readable");
+        assert_eq!(
+            rb.layout,
+            crate::contract::pixel_format::TexelLayout::Rgba16Float
+        );
+        assert_eq!(rb.pixels.len(), 4 * 4 * 8);
+        let expected = crate::contract::pixel_format::solid_native_texels(
+            4,
+            4,
+            crate::contract::pixel_format::TexelLayout::Rgba16Float,
+            &[-0.5, 2.0, 0.25, 1.0],
+        )
+        .unwrap();
+        assert_eq!(rb.pixels, expected);
     }
 }
 
@@ -2066,6 +2351,24 @@ pub fn render_target_layout_supported(layout: crate::contract::pixel_format::Tex
     device_capabilities().render_target_layout_supported(layout)
 }
 
+/// Whether the resolved device has said it cannot render to and blend into
+/// this layout, so a draw must not create a colour attachment at it.
+///
+/// The refusing half of [`render_target_layout_supported`], for the one caller
+/// that has no fallback to narrow to: the attachment a pass renders through is
+/// created at the format the guest declared, and Vulkan leaves colour-attachment
+/// support optional for some renderable formats (`A2R10G10B10_UNORM_PACK32`,
+/// which `BGR10A2Unorm` renders through, is one). Asked only of a published
+/// snapshot: before a device has answered there is nothing to refuse on, and
+/// the device that will create the image is the one that answers.
+pub fn render_target_layout_declined(layout: crate::contract::pixel_format::TexelLayout) -> bool {
+    use crate::contract::pixel_format::TexelLayout;
+    if matches!(layout, TexelLayout::Rgba8 | TexelLayout::Bgra8) {
+        return false;
+    }
+    device_capabilities().render_target_layout_supported_if_published(layout) == Some(false)
+}
+
 pub fn deferred_gpu_only_content_allowed() -> bool {
     device_capabilities().deferred_gpu_only_content_allowed()
 }
@@ -2080,19 +2383,24 @@ pub fn max_render_target_dimension() -> u32 {
 /// What this Vulkan device can execute, for the GPU-dependent half of the
 /// guest's device-info reply.
 ///
-/// Before a device is resolved the answer is the Vulkan 1.2 floor rather than
-/// the reply table's own values: the served reply is only ever *reduced* by
-/// this, so a boot that answers before the device is up must not be the one
-/// that promises the most.
+/// The device is brought up here if no draw has done it yet. The guest asks
+/// once, about four seconds into boot, before any draw. Answering from
+/// whatever context happened to exist served the Vulkan 1.2 floor on every
+/// boot: one sample, no D24S8, 128 threads, 16 KiB of threadgroup memory and
+/// no native FP16. The guest keeps that answer for the life of the boot, so
+/// it was told it ran on a far smaller GPU than the one doing the work.
+///
+/// The floor is still the answer when the device cannot be created: the served
+/// reply is only ever *reduced* by this, so a host that cannot say must not be
+/// the one that promises the most.
 pub fn device_info_limits() -> crate::model::DeviceInfoLimits {
     use crate::backend::vulkan::caps::device_features::{
         VULKAN_MIN_COMPUTE_SHARED_MEMORY_BYTES, VULKAN_MIN_COMPUTE_WORKGROUP_SIZE,
     };
-    lock_engine()
-        .owner
-        .ctx
-        .as_ref()
-        .map(|ctx| crate::model::DeviceInfoLimits {
+    let mut guard = lock_engine();
+    let engine = &mut *guard;
+    match engine.owner.ensure(&engine.counters) {
+        Ok(ctx) => crate::model::DeviceInfoLimits {
             max_sample_count: ctx.features.max_sample_count,
             d24_stencil8: ctx.features.d24_unorm_s8_attachment,
             max_threads_per_threadgroup: ctx.features.max_compute_workgroup_size,
@@ -2104,14 +2412,17 @@ pub fn device_info_limits() -> crate::model::DeviceInfoLimits {
             // let the Apple plugin choose its non-native-FP16 path.
             native_fp16: ctx.features.float16
                 && ctx.caps.device_type != ash::vk::PhysicalDeviceType::CPU,
-        })
-        .unwrap_or(crate::model::DeviceInfoLimits {
+            tile_memory: false,
+        },
+        Err(_) => crate::model::DeviceInfoLimits {
             max_sample_count: 1,
             d24_stencil8: false,
             max_threads_per_threadgroup: VULKAN_MIN_COMPUTE_WORKGROUP_SIZE,
             max_threadgroup_memory_bytes: VULKAN_MIN_COMPUTE_SHARED_MEMORY_BYTES,
             native_fp16: false,
-        })
+            tile_memory: false,
+        },
+    }
 }
 
 /// `(maxTotalThreadsPerThreadgroup, threadExecutionWidth)` for this host, as
@@ -2821,6 +3132,12 @@ pub struct TargetReadback {
     pub bgra: bool,
 }
 
+/// Unclamped native texels read back from a resident render target.
+pub struct NativeTargetReadback {
+    pub pixels: Vec<u8>,
+    pub layout: crate::contract::pixel_format::TexelLayout,
+}
+
 impl TargetReadback {
     /// The frame in semantic RGBA8, exchanging R and B only when it is not
     /// already in that order.
@@ -2936,8 +3253,12 @@ pub fn read_target_leased(identity: &TargetIdentity) -> Result<Option<LeasedFram
     // so unlike `read_target_inner` it has nowhere to narrow a wide resident to
     // — the bytes the caller reads are the slot's. Bounded rather than
     // converted, and named so a firing says which rail could not serve.
+    //
+    // Bounded on the colour order, not the width: a packed ten-bit or
+    // two-channel half-float texel is four bytes too, and the caller would read
+    // its word as four eight-bit channels.
     let (snap, layout) = readback_snapshot(pools, identity)?;
-    if layout.bytes_per_texel() != RESIDENT_READ_BYTES_PER_TEXEL {
+    if !layout.is_four_byte_color() {
         return Err(DrawError::TargetRead(
             reason::TargetReadDecline::TexelNotFourBytes {
                 format: snap.format,
@@ -3419,7 +3740,7 @@ pub fn probe_guest_backed_target(
             width,
             height,
             format,
-            registry_target_usage(format),
+            registry_target_usage(format, ctx.features.attachment_feedback_loop_layout),
         )
     };
 }
@@ -4283,6 +4604,11 @@ fn readback_bytes_per_texel(format: ash::vk::Format) -> u32 {
 /// Returns the bytes and the channel order they are in — `narrow_texel_to_rgba8`
 /// produces semantic RGBA8 whatever the resident's order was, so a narrowed
 /// frame owes no exchange and says so.
+///
+/// Only the two eight-bit colour orders pass through untouched. Four bytes a
+/// texel is not the test: a packed ten-bit word or a two-channel half-float
+/// texel is four bytes too, and handing one on would have its consumer read the
+/// word as four eight-bit channels.
 fn narrow_readback_to_rgba8(
     out: Vec<u8>,
     layout: crate::contract::pixel_format::TexelLayout,
@@ -4290,7 +4616,7 @@ fn narrow_readback_to_rgba8(
     pixels: u64,
     bgra: bool,
 ) -> Result<(Vec<u8>, bool), DrawError> {
-    if layout.bytes_per_texel() == RESIDENT_READ_BYTES_PER_TEXEL {
+    if layout.is_four_byte_color() {
         return Ok((out, bgra));
     }
     let count = u32::try_from(pixels).unwrap_or(u32::MAX);
@@ -4606,7 +4932,18 @@ fn readback_snapshot(
     Ok((snap, layout))
 }
 
-fn read_target_inner(identity: &TargetIdentity) -> Result<TargetReadback, DrawError> {
+fn read_target_raw(
+    identity: &TargetIdentity,
+) -> Result<
+    (
+        Vec<u8>,
+        crate::contract::pixel_format::TexelLayout,
+        ash::vk::Format,
+        u64,
+        bool,
+    ),
+    DrawError,
+> {
     let mut guard = lock_engine();
     let EngineState {
         ref mut owner,
@@ -4617,9 +4954,6 @@ fn read_target_inner(identity: &TargetIdentity) -> Result<TargetReadback, DrawEr
     let ctx = owner.ensure(counters)?;
     unsafe { pools.ensure_init(ctx, counters)? };
     let (snap, layout) = readback_snapshot(pools, identity)?;
-    // Asked for at the resident's own width — the copy is a raw image→buffer
-    // move and reads the image format's texel — and narrowed below if that is
-    // not what the caller can read.
     let pixels = (snap.width as u64) * (snap.height as u64);
     let rb_size = pixels * u64::from(layout.bytes_per_texel());
     let read_access = pools::ResidentAccess::transfer_read(snap.guest_backing.is_some());
@@ -4639,17 +4973,25 @@ fn read_target_inner(identity: &TargetIdentity) -> Result<TargetReadback, DrawEr
         )?;
         pools.registry_note_access(identity, read_access);
         counters.note_target_read(rb_size);
-        // A wide resident is quantized here rather than refused; see
-        // `narrow_readback_to_rgba8` for why that direction is the safe one.
-        let (pixels, bgra) =
-            narrow_readback_to_rgba8(out, layout, snap.format, pixels, snap.bgra())?;
-        Ok(TargetReadback { pixels, bgra })
+        Ok((out, layout, snap.format, pixels, snap.bgra()))
     }
+}
+
+fn read_target_inner(identity: &TargetIdentity) -> Result<TargetReadback, DrawError> {
+    let (out, layout, format, pixels, snap_bgra) = read_target_raw(identity)?;
+    let (pixels, bgra) = narrow_readback_to_rgba8(out, layout, format, pixels, snap_bgra)?;
+    Ok(TargetReadback { pixels, bgra })
 }
 
 /// Full-frame readback of a resident target (present / Synchronize / Map / Store boundary).
 pub fn read_target(identity: &TargetIdentity) -> Result<TargetReadback, DrawError> {
     read_target_inner(identity)
+}
+
+/// Full-frame native-texel readback of a resident target, without narrowing to RGBA8.
+pub fn read_target_native(identity: &TargetIdentity) -> Result<NativeTargetReadback, DrawError> {
+    let (pixels, layout, _, _, _) = read_target_raw(identity)?;
+    Ok(NativeTargetReadback { pixels, layout })
 }
 
 /// Run bounded maintenance for dead resources and already-free pool entries.
@@ -4782,6 +5124,9 @@ pub fn test_reset_engine() {
     // replacement.
     let poisoned = g.owner.poisoned;
     if let Some(mut ctx) = g.owner.ctx.take() {
+        // A compile still running names this cache's layouts and passes,
+        // which `destroy_all` is about to destroy on a device that stays up.
+        pipeline_compiler::wait_idle();
         // A healthy test reset reuses the device after destroying every pool.
         // Settle both the owner's FIFO and the GPU before those handles go.
         if !poisoned {
@@ -5530,12 +5875,12 @@ mod readback_width_tests {
                         (PIXELS * u64::from(RESIDENT_READ_BYTES_PER_TEXEL)) as usize,
                         "{layout:?}: a consumer of drawn pixels reads RGBA8"
                     );
-                    // A four-byte layout is handed back untouched, so it keeps
-                    // the order it was read in; a narrowed one is semantic RGBA8
-                    // and owes no exchange. Both rails pass this straight on.
+                    // An eight-bit colour order is handed back untouched, so it
+                    // keeps the order it was read in; a narrowed one is semantic
+                    // RGBA8 and owes no exchange. Both rails pass this straight on.
                     assert_eq!(
                         bgra,
-                        layout.bytes_per_texel() == RESIDENT_READ_BYTES_PER_TEXEL,
+                        layout.is_four_byte_color(),
                         "{layout:?}: reported the wrong channel order for its rail"
                     );
                 }
@@ -5555,6 +5900,27 @@ mod readback_width_tests {
                     );
                 }
             }
+        }
+    }
+
+    /// A packed ten-bit resident is four bytes a texel and still not RGBA8, so
+    /// a readback of one is narrowed channel by channel rather than handed on
+    /// as four bytes of colour. Both Vulkan words, with red in the low field
+    /// for `A2B10G10R10` and blue there for `A2R10G10B10`.
+    #[test]
+    fn a_ten_bit_readback_is_narrowed_not_passed_through() {
+        // Low field full, green half, high field empty, alpha full.
+        let word: u32 = 0x3ff | (0x200 << 10) | (0b11 << 30);
+        for (layout, want) in [
+            (TexelLayout::Rgb10a2Unorm, [0xff, 0x80, 0x00, 0xff]),
+            (TexelLayout::Bgr10a2Unorm, [0x00, 0x80, 0xff, 0xff]),
+        ] {
+            let format = crate::backend::vulkan::translate::pixel::vk_texel_layout(layout);
+            let (pixels, bgra) =
+                narrow_readback_to_rgba8(word.to_le_bytes().to_vec(), layout, format, 1, true)
+                    .expect("a renderable layout narrows");
+            assert_eq!(pixels, want, "{layout:?}");
+            assert!(!bgra, "{layout:?}: narrowed bytes are semantic RGBA8");
         }
     }
 }

@@ -362,6 +362,22 @@ pub(super) fn identity_fields(identity: &TargetIdentity) -> Vec<(&'static str, S
             // slots an order alone would print identically.
             ("identity_format", format!("{format:?}")),
         ],
+        TargetIdentity::Heap {
+            task_id,
+            ref_,
+            width,
+            height,
+            generation,
+            format,
+        } => vec![
+            ("identity_kind", "heap".into()),
+            ("identity_task", task_id.to_string()),
+            ("identity_ref", ref_.to_string()),
+            ("identity_width", width.to_string()),
+            ("identity_height", height.to_string()),
+            ("identity_generation", generation.to_string()),
+            ("identity_format", format!("{format:?}")),
+        ],
         TargetIdentity::Anonymous { slot } => vec![
             ("identity_kind", "anonymous".into()),
             ("identity_slot", slot.to_string()),

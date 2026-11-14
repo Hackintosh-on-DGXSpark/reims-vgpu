@@ -197,11 +197,12 @@ pub(crate) struct PassKey {
     /// pass); the depth attachment is always appended AFTER color + secondaries
     /// so slot 0 stays the primary color (the zero-copy readback assumes this).
     pub depth: Option<DepthAttachKey>,
-    /// Attachment 0 is ALSO referenced as a subpass input (framebuffer fetch).
-    /// Both references use GENERAL layout and the subpass carries a BY_REGION
-    /// self-dependency — the Vulkan feedback-loop form MoltenVK lowers to Metal
-    /// programmable blending. `false` keeps the pass byte-identical.
-    pub color_input: bool,
+    /// Bit N: colour attachment N is ALSO referenced as a subpass input
+    /// (framebuffer fetch), at input attachment index N. Both references use
+    /// GENERAL layout and the subpass carries a BY_REGION self-dependency — the
+    /// Vulkan feedback-loop form MoltenVK lowers to Metal programmable
+    /// blending. `0` keeps the pass byte-identical.
+    pub color_inputs: u8,
     /// Bit N says colour attachment N is also sampled through
     /// `VK_EXT_attachment_feedback_loop_layout`. The decoded render pass has at
     /// most eight colour attachments, so the wire-derived attachment table is
@@ -224,7 +225,7 @@ impl PassKey {
             secondary: [SecondaryAttachKey::default(); MAX_SECONDARY_ATTACH],
             secondary_count: 0,
             depth: None,
-            color_input: false,
+            color_inputs: 0,
             feedback_colors: 0,
             sample_count: 1,
             multisample_resolve: false,
@@ -289,10 +290,14 @@ impl PassKey {
         FramebufferCompatibilityKey(key)
     }
 
+    pub(crate) fn color_fetched(self, index: usize) -> bool {
+        index < 8 && self.color_inputs & (1 << index) != 0
+    }
+
     pub(crate) fn color_layout(self, index: usize) -> vk::ImageLayout {
         if self.color_feedback(index) {
             color_feedback_layout()
-        } else if index == 0 && (self.color_input || self.host_accessible_color0) {
+        } else if self.color_fetched(index) || (index == 0 && self.host_accessible_color0) {
             vk::ImageLayout::GENERAL
         } else {
             // The same layout the pass exits at, so an ordinary pass performs no
@@ -386,6 +391,16 @@ impl PassCompatibilityKey {
         self.0.depth.is_some()
     }
 
+    /// A render pass key with nothing in it but this compatibility state.
+    ///
+    /// A pipeline needs only *a* render pass compatible with the one it will be
+    /// drawn in, and this one depends on nothing a draw learns while acquiring
+    /// its attachments — which is what lets its pipeline be asked for before
+    /// any of them is acquired.
+    pub(crate) fn pass_key(self) -> PassKey {
+        self.0
+    }
+
     /// Which field makes two compatibility keys disagree, or `None` when they
     /// are equal.
     ///
@@ -418,7 +433,7 @@ impl PassCompatibilityKey {
             secondary,
             secondary_count,
             depth,
-            color_input,
+            color_inputs,
             feedback_colors,
             sample_count,
             multisample_resolve,
@@ -439,7 +454,7 @@ impl PassCompatibilityKey {
         if host_accessible_color0 != them.host_accessible_color0 {
             return Some(PassCompatField::HostAccessibleColor0);
         }
-        if color_input != them.color_input {
+        if color_inputs != them.color_inputs {
             return Some(PassCompatField::ColorInput);
         }
         if feedback_colors != them.feedback_colors {
@@ -596,6 +611,28 @@ pub(crate) struct ComputePipelineKey {
 pub(crate) struct ShaderModuleSource<'a> {
     pub module: vk::ShaderModule,
     pub spirv: &'a [u32],
+}
+
+/// What a draw brings to [`ObjectCaches::resolve_graphics_pipeline`].
+pub(crate) struct GraphicsPipelineAsk<'a> {
+    pub key: &'a PipelineKey,
+    pub pipeline_object: Option<&'a super::types::PipelineObjectIdentity>,
+    /// The ticket this draw waited on before it was resumed, if it was.
+    pub wait: Option<&'a super::pipeline_compiler::PipelineTicket>,
+    /// The post-relocation words of each stage, shared with the compile rather
+    /// than copied.
+    pub vert: &'a std::sync::Arc<Vec<u32>>,
+    pub frag: &'a std::sync::Arc<Vec<u32>>,
+    pub pipeline_layout: vk::PipelineLayout,
+    /// Any render pass compatible with the one the draw records into; see
+    /// [`PassCompatibilityKey::pass_key`].
+    pub render_pass: vk::RenderPass,
+}
+
+/// A draw's pipeline, or the ticket to wait on while the compiler builds it.
+pub(crate) enum PipelineReady {
+    Built(vk::Pipeline),
+    Pending(super::pipeline_compiler::PipelineTicket),
 }
 
 /// How many distinct never-creatable keys a cache remembers the refusal for.
@@ -893,6 +930,11 @@ pub(crate) struct ObjectCaches {
     /// to, so a repeat bind of the same module does not walk it three times to
     /// find that out.
     shader_digests: ShaderDigestIndex,
+    /// Graphics pipelines the compiler is building, by key, so a second ask for
+    /// one joins the first rather than compiling it again. An entry leaves when
+    /// [`Self::publish_compiled`] files its result or [`Self::abandon_flights`]
+    /// gives it up with its device.
+    flights: HashMap<PipelineKey, super::pipeline_compiler::PipelineTicket>,
 }
 
 struct ObjectVariantIndex<K, V> {
@@ -945,15 +987,30 @@ impl<K: Clone + Eq, V: Copy> ObjectVariantIndex<K, V> {
         key: &K,
         value: V,
     ) {
-        let id = identity.id();
+        self.remember_weak(identity.id(), &identity.downgrade(), key, value);
+    }
+
+    /// [`Self::remember`] for an object known only by its identity's parts — a
+    /// compile that finished after its draw returned holds no strong reference
+    /// to the guest object, and must not keep it alive. An object that died in
+    /// the meantime is not remembered.
+    fn remember_weak(
+        &mut self,
+        id: std::num::NonZeroU64,
+        life: &std::sync::Weak<super::types::PipelineObjectLife>,
+        key: &K,
+        value: V,
+    ) {
+        if life.strong_count() == 0 {
+            return;
+        }
         if !self.map.contains_key(&id) {
             // Object construction is rare. Reap identities whose runtime
             // object has gone before admitting the new one, so the index
             // follows object lifetime without a capacity or eviction policy.
             self.map.retain(|_, (life, _, _)| life.strong_count() != 0);
         }
-        self.map
-            .insert(id, (identity.downgrade(), key.clone(), value));
+        self.map.insert(id, (life.clone(), key.clone(), value));
     }
 
     fn clear(&mut self) {
@@ -1364,33 +1421,30 @@ impl ObjectCaches {
             samplers: ObjectCache::new(),
             compute_pipelines: ObjectCache::new(),
             shader_digests: ShaderDigestIndex::default(),
+            flights: HashMap::new(),
         }
     }
 
+    /// Destroy every object this cache owns, now. Only for a caller that knows
+    /// no graphics compile is using one; a device teardown goes through
+    /// [`Self::retire_into`] instead.
     pub(crate) unsafe fn destroy_all(&mut self, device: &ash::Device) {
+        self.abandon_flights();
+        self.take_handles().destroy(device);
+    }
+
+    fn take_handles(&mut self) -> CacheHandles {
         // This index borrows handles owned by `pipelines`; forget those echoes
-        // before destroying the authoritative objects.
+        // before taking the authoritative objects.
         self.pipeline_objects.clear();
-        for p in self.pipelines.take_all() {
-            device.destroy_pipeline(p, None);
-        }
-        for p in self.compute_pipelines.take_all() {
-            device.destroy_pipeline(p, None);
-        }
-        for (dsl, pl) in self.layouts.take_all() {
-            device.destroy_pipeline_layout(pl, None);
-            if dsl != vk::DescriptorSetLayout::null() {
-                device.destroy_descriptor_set_layout(dsl, None);
-            }
-        }
-        for rp in self.passes.take_all() {
-            device.destroy_render_pass(rp, None);
-        }
-        for s in self.shaders.take_all() {
-            device.destroy_shader_module(s, None);
-        }
-        for s in self.samplers.take_all() {
-            device.destroy_sampler(s, None);
+        let mut pipelines = self.pipelines.take_all();
+        pipelines.extend(self.compute_pipelines.take_all());
+        CacheHandles {
+            pipelines,
+            layouts: self.layouts.take_all(),
+            passes: self.passes.take_all(),
+            shaders: self.shaders.take_all(),
+            samplers: self.samplers.take_all(),
         }
     }
 
@@ -1415,6 +1469,7 @@ impl ObjectCaches {
     }
 
     pub(crate) fn clear_logical(&mut self) {
+        self.abandon_flights();
         // Before the modules it indexes, so no window exists where a front-index
         // hit names a digest whose module has already gone.
         self.shader_digests.clear();
@@ -1427,71 +1482,58 @@ impl ObjectCaches {
         self.compute_pipelines.clear();
     }
 
-    /// Report a driver call this device refused to repeat, and hand back the
-    /// error every one of the three call sites caches negatively.
+    /// The digest a graphics stage's module is keyed by, without building the
+    /// module.
     ///
-    /// One place rather than three so the three cannot drift into three
-    /// different accounts of the same event — and so the line always carries
-    /// both the key (which identifies the call) and what the dead process called
-    /// it (which is the only human-readable thing about it).
-    fn note_quarantined(
-        &self,
-        site: &'static str,
-        hit: &super::driver_breadcrumb::quarantine::Quarantined,
-    ) -> DrawError {
-        let reason = super::reason::DrawReason::DriverCallQuarantined;
-        crate::observe::Emit::decline("driver_quarantine", &reason)
-            .field("site", site)
-            .field("key", &hit.key)
-            .field("previously", &hit.previously)
-            .field(
-                "list",
-                super::driver_breadcrumb::quarantine::list_path().display(),
-            )
-            .fail();
-        DrawError::Unsupported(reason)
-    }
-
-    /// [`Self::get_or_create_shader`] with the three whole-module walks skipped
-    /// for an allocation that has been through it before.
+    /// A graphics module is built by the pipeline compiler, off every lock,
+    /// immediately before the pipeline that consumes it; the draw path only
+    /// needs the digest to key the pipeline. Building it here would put
+    /// `spirv-val` and `vkCreateShaderModule` back under the engine lock —
+    /// 166 ms of `pl_shader_us` for the 368 062-word glass fragment shader on a
+    /// macOS 27.2 boot — for an object no draw records.
     ///
-    /// The draw path is the caller that needs this: it binds two modules a draw
-    /// at ~30 000 draws a second, from `Arc`s the runtime holds for each
-    /// shader's lifetime, into a cache that on a driven macos-13 boot reports
-    /// `shader_misses=0`. `pl_shader_us` was **63 ms of every second** — the
-    /// largest single item inside `engine_us` — spent deriving a key for a
-    /// module already in hand.
+    /// The three whole-module walks are skipped for an allocation that has been
+    /// through them before: the draw path binds two modules a draw at ~30 000
+    /// draws a second, from `Arc`s the runtime holds for each shader's
+    /// lifetime, and `pl_shader_us` was once 63 ms of every second spent
+    /// deriving a key for a module already in hand.
     ///
-    /// The compute path calls the walking form directly and deliberately: its
-    /// `spirv` is an owned `Vec` with no stable allocation to key on, and a
-    /// dispatch is three orders rarer than a draw.
-    pub(crate) unsafe fn get_or_create_shader_memoized(
+    /// A module the compiler refused is answered here by its negative entry,
+    /// which [`Self::publish_compiled`] files under the same digest.
+    pub(crate) fn graphics_shader_digest(
         &mut self,
-        ctx: &DeviceContext,
+        caps: SpirvStorageCaps,
         words: &std::sync::Arc<Vec<u32>>,
         counters: &EngineCounters,
-        pools: &mut ResourcePools,
-    ) -> Result<(Digest128, vk::ShaderModule), DrawError> {
+    ) -> Result<Digest128, DrawError> {
         if let Some(key) = self.shader_digests.get(words) {
-            // Negative before positive, in the order the walking form asks them:
-            // a module this device refused is refused again without being
-            // rebuilt, and without the front index quietly promoting it.
             if let Some(err) = self.shaders.get_negative(&key) {
                 counters.shader_misses.fetch_add(1, Ordering::Relaxed);
                 return Err(err);
             }
-            if let Some(module) = self.shaders.get(&key) {
-                counters.shader_hits.fetch_add(1, Ordering::Relaxed);
-                counters.shader_digest_hits.fetch_add(1, Ordering::Relaxed);
-                return Ok((key, module));
-            }
-            // The module was evicted or destroyed under a digest this index
-            // still names. Falling through re-walks and re-creates it, which is
-            // why the index may hold a digest the cache does not.
+            counters.shader_hits.fetch_add(1, Ordering::Relaxed);
+            counters.shader_digest_hits.fetch_add(1, Ordering::Relaxed);
+            return Ok(key);
         }
-        let (key, module) = self.get_or_create_shader(ctx, words, counters, pools)?;
+        counters
+            .shader_hash_words
+            .fetch_add(words.len() as u64, Ordering::Relaxed);
+        let declared = match declare_image_capabilities(words, caps) {
+            Ok(declared) => declared,
+            Err(err) => {
+                self.shaders
+                    .insert_negative(Digest128::of_u32_words(words), err.clone());
+                return Err(err);
+            }
+        };
+        let key = Digest128::of_u32_words(&declared);
+        if let Some(err) = self.shaders.get_negative(&key) {
+            counters.shader_misses.fetch_add(1, Ordering::Relaxed);
+            return Err(err);
+        }
+        counters.shader_misses.fetch_add(1, Ordering::Relaxed);
         self.shader_digests.insert(words, key);
-        Ok((key, module))
+        Ok(key)
     }
 
     pub(crate) unsafe fn get_or_create_shader(
@@ -1501,67 +1543,21 @@ impl ObjectCaches {
         counters: &EngineCounters,
         pools: &mut ResourcePools,
     ) -> Result<(Digest128, vk::ShaderModule), DrawError> {
-        // Declare the storage-image capabilities this module's own contents
-        // require, before it is keyed or validated.
-        //
-        // This is the only place every module from every path passes through, so
-        // it is the only place the question can be asked once. It used to be
-        // asked at one producer instead, and phrased as provenance — "did *this
-        // device* retarget a binding to `Unknown`?" — which is a claim about how
-        // a module came to need the capability rather than whether it does. The
-        // translator emits `Unknown`-format storage images and extended formats
-        // of its own accord; those modules arrived here undeclared and were
-        // rejected, losing the dispatch. Both x86 rails lose compute work to it.
-        //
-        // A capability whose Vulkan feature was not enabled at device creation
-        // cannot be declared — that is invalid usage, and an invalid module is
-        // undefined behaviour inside a driver rather than an error it returns —
-        // so an unsupported requirement is a named decline instead.
-        // Both passes below walk the whole module, and so does the digest, so the
-        // charge is levied once here on the words the caller handed over rather
-        // than at each walk.
+        // Both passes inside `declare_image_capabilities` walk the whole
+        // module, and so does the digest, so the charge is levied once here on
+        // the words the caller handed over rather than at each walk.
         counters
             .shader_hash_words
             .fetch_add(words.len() as u64, Ordering::Relaxed);
-        let need = crate::runtime::spirv_bind::required_image_capabilities(words);
-        let mut patched;
-        let words: &[u32] = if need.any() {
-            let missing = (need.extended_formats && !ctx.spirv_storage_extended_formats)
-                || (need.write_without_format && !ctx.spirv_storage_write_without_format)
-                || (need.read_without_format && !ctx.spirv_storage_read_without_format);
-            if missing {
-                let err = DrawError::Unsupported(super::reason::DrawReason::SpirvInvalid);
-                crate::observe::fail(format!(
-                    "spirv_capability reason=host_lacks_feature words={} \
-                     need_extended={} need_write={} need_read={} \
-                     have_extended={} have_write={} have_read={}",
-                    words.len(),
-                    need.extended_formats,
-                    need.write_without_format,
-                    need.read_without_format,
-                    ctx.spirv_storage_extended_formats,
-                    ctx.spirv_storage_write_without_format,
-                    ctx.spirv_storage_read_without_format,
-                ));
-                let key = Digest128::of_u32_words(words);
-                self.shaders.insert_negative(key, err.clone());
+        let declared = match declare_image_capabilities(words, SpirvStorageCaps::of(ctx)) {
+            Ok(declared) => declared,
+            Err(err) => {
+                self.shaders
+                    .insert_negative(Digest128::of_u32_words(words), err.clone());
                 return Err(err);
             }
-            patched = words.to_vec();
-            let added = crate::runtime::spirv_bind::ensure_image_capabilities(&mut patched, &need);
-            if added.any() {
-                crate::observe::off(format!(
-                    "spirv_capability added extended={} write={} read={} words={}",
-                    added.extended_formats,
-                    added.write_without_format,
-                    added.read_without_format,
-                    patched.len()
-                ));
-            }
-            &patched
-        } else {
-            words
         };
+        let words: &[u32] = &declared;
         let key = Digest128::of_u32_words(words);
         if let Some(err) = self.shaders.get_negative(&key) {
             counters.shader_misses.fetch_add(1, Ordering::Relaxed);
@@ -1572,45 +1568,22 @@ impl ObjectCaches {
             return Ok((key, m));
         }
         counters.shader_misses.fetch_add(1, Ordering::Relaxed);
-        // Last gate before the driver, and the only place every module from
-        // every path passes through exactly once. An invalid module is
-        // undefined behaviour inside a driver rather than an error it returns,
-        // and one has been observed ending the VM process — so it becomes a
-        // negative cache entry here and the guest's work is declined by name.
-        // See `crate::runtime::spirv_bind::validate`.
-        if let crate::runtime::spirv_bind::SpirvValidation::Rejected(why) =
-            crate::runtime::spirv_bind::validate(words)
-        {
-            let err = DrawError::Unsupported(super::reason::DrawReason::SpirvInvalid);
-            // Print what the capability derivation saw alongside the
-            // validator's complaint. When the two disagree the difference is
-            // the whole bug, and neither one alone says which walk is wrong.
-            crate::observe::fail(format!(
-                "spirv_validate reason=module_rejected words={} need={:?} imgs={:?} detail={why}",
-                words.len(),
-                crate::runtime::spirv_bind::required_image_capabilities(words),
-                crate::runtime::spirv_bind::image_type_census(words),
-            ));
-            // The complaint above names instructions by result id, which cannot
-            // be read without the module they belong to. Keep it.
-            super::driver_breadcrumb::keep_rejected_module(
-                &format!("{:016x}{:016x}", key.a, key.b),
-                words,
-            );
+        if let Err(err) = refuse_invalid_module(words, key) {
             self.shaders.insert_negative(key, err.clone());
             return Err(err);
         }
         // The driver parses SPIR-V here, so this is one of the three calls that
         // can end the process on a module this device assembled — the other two
-        // being the compute and graphics pipeline compiles below. See
+        // being the compute and graphics pipeline compiles. See
         // `driver_breadcrumb` for why the words go to disk across it.
         let breadcrumb = match super::driver_breadcrumb::DriverBreadcrumb::arm(
+            super::driver_breadcrumb::DriverLane::Drain,
             "create_shader_module",
             &[("module", words)],
         ) {
             Ok(breadcrumb) => breadcrumb,
             Err(hit) => {
-                let err = self.note_quarantined("create_shader_module", &hit);
+                let err = note_quarantined("create_shader_module", &hit);
                 self.shaders.insert_negative(key, err.clone());
                 return Err(err);
             }
@@ -1873,16 +1846,29 @@ impl ObjectCaches {
                 .attachment(index)
                 .layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
         });
-        let input_ref = [vk::AttachmentReference::default()
-            .attachment(0)
-            .layout(key.color_layout(0))];
+        // Input attachment index N is colour attachment N, the way the
+        // translator numbers `dest_N`; a colour slot nothing fetches is a gap.
+        let input_ref: Vec<vk::AttachmentReference> = (0..8 - key.color_inputs.leading_zeros()
+            as usize)
+            .map(|index| {
+                if key.color_fetched(index) {
+                    vk::AttachmentReference::default()
+                        .attachment(index as u32)
+                        .layout(key.color_layout(index))
+                } else {
+                    vk::AttachmentReference::default()
+                        .attachment(vk::ATTACHMENT_UNUSED)
+                        .layout(vk::ImageLayout::UNDEFINED)
+                }
+            })
+            .collect();
         let mut subpass_desc = vk::SubpassDescription::default()
             .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
             .color_attachments(&color_ref);
         if !resolve_ref.is_empty() {
             subpass_desc = subpass_desc.resolve_attachments(&resolve_ref);
         }
-        if key.color_input {
+        if !input_ref.is_empty() {
             subpass_desc = subpass_desc.input_attachments(&input_ref);
         }
         if let Some(depth_ref) = &depth_ref {
@@ -1902,15 +1888,20 @@ impl ObjectCaches {
             .dependency_flags(vk::DependencyFlags::BY_REGION);
         let mut deps: Vec<vk::SubpassDependency> = external_dependencies(
             key.depth.is_some(),
-            key.color_input,
+            key.color_inputs != 0,
             key.host_accessible_color0,
             pass_exit_scope_narrow(),
         )
         .to_vec();
-        if key.color_input {
+        if key.color_inputs != 0 {
             deps.push(fetch_dep);
         }
-        deps.push(color_feedback_self_dependency(key.color_layout(0)));
+        let feedback_layout = if key.feedback_colors != 0 {
+            color_feedback_layout()
+        } else {
+            key.color_layout(0)
+        };
+        deps.push(color_feedback_self_dependency(feedback_layout));
         let rp_info = vk::RenderPassCreateInfo::default()
             .attachments(&attachments)
             .subpasses(&subpass)
@@ -2121,37 +2112,43 @@ impl ObjectCaches {
         Ok(sampler)
     }
 
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "pipeline creation mirrors the Vulkan shader, layout, pass, and cache handles"
-    )]
-    pub(crate) unsafe fn get_or_create_pipeline(
+    /// The pipeline a draw asks for, if it is already built; otherwise its
+    /// creation is handed to the pipeline compiler and the draw is told to
+    /// wait.
+    ///
+    /// Only a pipeline already in the map is answered here. Every creation —
+    /// including one the driver would satisfy from its pipeline cache — runs on
+    /// the compiler thread, because a `vkCreateGraphicsPipelines` call under
+    /// this lock can block on the cache's own internal lock while the compiler
+    /// holds it, and that wait would be the engine lock's again. See
+    /// [`super::pipeline_compiler`] for the whole arrangement.
+    ///
+    /// A key already being compiled answers with that compile's ticket rather
+    /// than starting a second one. A draw resuming after its wait carries the
+    /// ticket it waited on in `ask.wait`, and a failure recorded on it is that
+    /// draw's answer — delivered once, even for a refusal like out-of-memory
+    /// that the negative cache deliberately forgets, so the resumed draw cannot
+    /// start the same compile over.
+    pub(crate) unsafe fn resolve_graphics_pipeline(
         &mut self,
         ctx: &DeviceContext,
-        key: &PipelineKey,
-        pipeline_object: Option<&super::types::PipelineObjectIdentity>,
-        vert_module: vk::ShaderModule,
-        // The post-relocation words `vert_module` was built from. Read only to
-        // answer how wide this shader's stage-in reads are, and only on a host
-        // that substitutes a vertex format; see the resolution loop below.
-        vert_spirv: &[u32],
-        frag_module: vk::ShaderModule,
-        // Read only by the driver breadcrumb: a graphics compile consumes both
-        // stages and nothing outside the driver can say which one it choked on,
-        // so both go to disk across the call.
-        frag_spirv: &[u32],
-        pipeline_layout: vk::PipelineLayout,
-        render_pass: vk::RenderPass,
-        counters: &EngineCounters,
         pools: &mut ResourcePools,
-    ) -> Result<vk::Pipeline, DrawError> {
-        if let Some(identity) = pipeline_object {
+        counters: &EngineCounters,
+        ask: GraphicsPipelineAsk<'_>,
+    ) -> Result<PipelineReady, DrawError> {
+        self.publish_compiled(Some(ctx), pools, counters);
+        let key = ask.key;
+        if let Some(err) = ask.wait.and_then(|ticket| ticket.failure_for(key)) {
+            super::pipeline_compiler::note_failure_delivered();
+            return Err(err);
+        }
+        if let Some(identity) = ask.pipeline_object {
             if let Some(pipeline) = self.pipeline_objects.get(identity, key) {
                 counters.pipeline_hits.fetch_add(1, Ordering::Relaxed);
                 counters
                     .pipeline_object_hits
                     .fetch_add(1, Ordering::Relaxed);
-                return Ok(pipeline);
+                return Ok(PipelineReady::Built(pipeline));
             }
         }
         if let Some(err) = self.pipelines.get_negative(key) {
@@ -2163,12 +2160,186 @@ impl ObjectCaches {
             if front {
                 counters.pipeline_front_hits.fetch_add(1, Ordering::Relaxed);
             }
-            if let Some(identity) = pipeline_object {
+            if let Some(identity) = ask.pipeline_object {
                 self.pipeline_objects.remember(identity, key, p);
             }
-            return Ok(p);
+            return Ok(PipelineReady::Built(p));
+        }
+        if let Some(ticket) = self.flights.get(key) {
+            counters
+                .pipeline_flight_joins
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(PipelineReady::Pending(ticket.clone()));
         }
         counters.pipeline_misses.fetch_add(1, Ordering::Relaxed);
+        let attribute_formats = self.graphics_pipeline_formats(ctx, key, ask.vert)?;
+        let ticket = super::pipeline_compiler::PipelineTicket::new(key.clone());
+        let job = super::pipeline_compiler::GraphicsCompileJob {
+            ticket: ticket.clone(),
+            life: std::sync::Arc::clone(&ctx.life),
+            recipe: GraphicsRecipe {
+                key: key.clone(),
+                attribute_formats,
+                pipeline_layout: ask.pipeline_layout,
+                render_pass: ask.render_pass,
+                attachment_feedback_loop_layout: ctx.features.attachment_feedback_loop_layout,
+            },
+            vert: std::sync::Arc::clone(ask.vert),
+            frag: std::sync::Arc::clone(ask.frag),
+            caps: SpirvStorageCaps::of(ctx),
+            pipeline_object: ask
+                .pipeline_object
+                .map(|identity| (identity.id(), identity.downgrade())),
+        };
+        if !super::pipeline_compiler::off_the_draw() {
+            // `REIMS_VGPU_PIPELINE_ASYNC=off`: built here, under the locks, and
+            // filed before this draw goes on, as before the compiler thread.
+            let done = super::pipeline_compiler::compile_in_draw(job);
+            self.publish_one(Some(ctx), pools, counters, done);
+            return match ticket.outcome() {
+                Some(super::pipeline_compiler::PipelineOutcome::Ready) => Ok(PipelineReady::Built(
+                    self.pipelines
+                        .get(key)
+                        .expect("a pipeline answered Ready was filed under its key"),
+                )),
+                Some(super::pipeline_compiler::PipelineOutcome::Failed(error)) => Err(error.clone()),
+                // Only a compile that returned `VK_ERROR_DEVICE_LOST` is answered
+                // `DeviceRebuilt` on the device it ran on; the loss is latched.
+                _ => Err(DrawError::VkCall(VkCall::new(
+                    VkOp::CachesCreateGraphicsPipelines,
+                    vk::Result::ERROR_DEVICE_LOST,
+                ))),
+            };
+        }
+        self.flights.insert(key.clone(), ticket.clone());
+        super::pipeline_compiler::submit(job);
+        Ok(PipelineReady::Pending(ticket))
+    }
+
+    /// File everything the pipeline compiler has finished, and answer each
+    /// finished ticket.
+    ///
+    /// A result compiled on a device that has since been replaced — `ctx` is a
+    /// different device, or none — is destroyed on the device it was made on
+    /// and answered [`PipelineOutcome::DeviceRebuilt`]. Otherwise a pipeline is
+    /// filed and answered `Ready`; a refusal is remembered under the same rule
+    /// every other create here follows ([`ObjectCache::insert_negative`]) and
+    /// answered `Failed` with exactly that refusal. A lost device is latched
+    /// for the drain's end-of-tranche recovery and answered `DeviceRebuilt`,
+    /// because the waiting draw belongs on the device that replaces it.
+    pub(crate) unsafe fn publish_compiled(
+        &mut self,
+        ctx: Option<&DeviceContext>,
+        pools: &mut ResourcePools,
+        counters: &EngineCounters,
+    ) {
+        for done in super::pipeline_compiler::take_finished() {
+            self.publish_one(ctx, pools, counters, done);
+        }
+    }
+
+    /// File one finished compile and answer its ticket. See
+    /// [`Self::publish_compiled`].
+    unsafe fn publish_one(
+        &mut self,
+        ctx: Option<&DeviceContext>,
+        pools: &mut ResourcePools,
+        counters: &EngineCounters,
+        done: super::pipeline_compiler::CompiledPipeline,
+    ) {
+        use super::pipeline_compiler::{CompileFailure, PipelineOutcome};
+        {
+            let key = done.ticket.key();
+            if self.flights.get(key).is_some_and(|t| t.is(&done.ticket)) {
+                self.flights.remove(key);
+            }
+            let current = ctx
+                .filter(|ctx| std::sync::Arc::ptr_eq(&ctx.life, &done.life))
+                .filter(|_| !done.life.is_stale());
+            let Some(ctx) = current else {
+                if let Ok(pipeline) = done.result {
+                    done.life.device.destroy_pipeline(pipeline, None);
+                }
+                done.ticket.settle(PipelineOutcome::DeviceRebuilt);
+                super::pipeline_compiler::note_published_stale();
+                return;
+            };
+            match done.result {
+                Ok(pipeline) => {
+                    counters.note_create(CreateSite::GraphicsPipeline);
+                    if let Some(old) = self.pipelines.insert(key.clone(), pipeline) {
+                        pools.dispose(&ctx.device, DeferredHandle::Pipeline(old));
+                    }
+                    if let Some((id, life)) = &done.pipeline_object {
+                        self.pipeline_objects.remember_weak(*id, life, key, pipeline);
+                    }
+                    done.ticket.settle(PipelineOutcome::Ready);
+                }
+                Err(CompileFailure::Stale) => {
+                    done.ticket.settle(PipelineOutcome::DeviceRebuilt);
+                    super::pipeline_compiler::note_published_stale();
+                }
+                Err(CompileFailure::Refused { error, module }) => {
+                    let lost = matches!(
+                        &error,
+                        DrawError::VkCall(call) if call.result == vk::Result::ERROR_DEVICE_LOST
+                    );
+                    if lost {
+                        super::device_lost::note_device_lost_seen();
+                        done.ticket.settle(PipelineOutcome::DeviceRebuilt);
+                        return;
+                    }
+                    if let Some(module) = module {
+                        self.shaders.insert_negative(module, error.clone());
+                    }
+                    self.pipelines.insert_negative(key.clone(), error.clone());
+                    done.ticket.settle(PipelineOutcome::Failed(error));
+                }
+            }
+        }
+    }
+
+    /// Answer every compile in flight [`PipelineOutcome::DeviceRebuilt`] and
+    /// forget it. Called when the device they were compiling for is going away,
+    /// so the draws waiting on them ask again on its replacement.
+    ///
+    /// [`PipelineOutcome::DeviceRebuilt`]: super::pipeline_compiler::PipelineOutcome::DeviceRebuilt
+    pub(crate) fn abandon_flights(&mut self) {
+        for (_, ticket) in self.flights.drain() {
+            ticket.settle(super::pipeline_compiler::PipelineOutcome::DeviceRebuilt);
+        }
+    }
+
+    /// Hand every object this cache owns to `life` for destruction, now if no
+    /// compile can still be using one and when the last compile lets go
+    /// otherwise. The device-teardown form of [`Self::destroy_all`].
+    pub(crate) unsafe fn retire_into(&mut self, life: &std::sync::Arc<super::context::DeviceLife>) {
+        self.abandon_flights();
+        life.mark_stale();
+        let handles = self.take_handles();
+        // Every clone of `life` is made and dropped under the engine lock the
+        // caller holds, so a count of one cannot rise while this runs.
+        if std::sync::Arc::strong_count(life) == 1 {
+            handles.destroy(&life.device);
+        } else {
+            life.defer(handles);
+        }
+    }
+
+    /// The device's checks on a pipeline key, made where the context is at
+    /// hand, and the vertex formats it resolves the key's attributes to.
+    ///
+    /// Each refusal is cached negatively, exactly as when the create followed
+    /// it on the same call.
+    unsafe fn graphics_pipeline_formats(
+        &mut self,
+        ctx: &DeviceContext,
+        key: &PipelineKey,
+        // The post-relocation vertex words. Read only to answer how wide this
+        // shader's stage-in reads are, and only on a host that substitutes a
+        // vertex format; see the resolution loop below.
+        vert_spirv: &[u32],
+    ) -> Result<Vec<vk::Format>, DrawError> {
 
         // `MTLBlendFactor` 15-18 are the dual-source factors; Vulkan spells them
         // `SRC1_*` and gates them behind `VkPhysicalDeviceFeatures::dualSrcBlend`.
@@ -2311,236 +2482,7 @@ impl ObjectCaches {
                 }
             }
         }
-
-        let main_c = super::context::main_entry();
-        let stages = [
-            vk::PipelineShaderStageCreateInfo::default()
-                .stage(vk::ShaderStageFlags::VERTEX)
-                .module(vert_module)
-                .name(&main_c),
-            vk::PipelineShaderStageCreateInfo::default()
-                .stage(vk::ShaderStageFlags::FRAGMENT)
-                .module(frag_module)
-                .name(&main_c),
-        ];
-        let vertex_binding_descs: Vec<_> = key
-            .attrs
-            .iter()
-            .map(|attribute| {
-                vk::VertexInputBindingDescription::default()
-                    .binding(attribute.binding)
-                    .stride(attribute.stride)
-                    .input_rate(translate::vertex::vk_input_rate(attribute.step_function))
-            })
-            .collect();
-        let vertex_binding_divisors: Vec<_> = key
-            .attrs
-            .iter()
-            .filter_map(|attribute| {
-                let divisor = match attribute.step_function {
-                    VertexStepFunction::Constant => 0,
-                    VertexStepFunction::PerVertex => return None,
-                    VertexStepFunction::PerInstance if attribute.step_rate == 1 => return None,
-                    VertexStepFunction::PerInstance => attribute.step_rate,
-                };
-                Some(
-                    vk::VertexInputBindingDivisorDescriptionKHR::default()
-                        .binding(attribute.binding)
-                        .divisor(divisor),
-                )
-            })
-            .collect();
-        let vertex_attribute_descs: Vec<_> = key
-            .attrs
-            .iter()
-            .zip(&attribute_formats)
-            .map(|(attribute, format)| {
-                vk::VertexInputAttributeDescription::default()
-                    .location(attribute.location)
-                    .binding(attribute.binding)
-                    // The device-resolved format, which equals the attribute's
-                    // own on every host seen so far and its mandatory wider
-                    // sibling where the device declined the optional one.
-                    .format(*format)
-                    .offset(attribute.offset)
-            })
-            .collect();
-        let mut vertex_divisor_state = vk::PipelineVertexInputDivisorStateCreateInfoKHR::default()
-            .vertex_binding_divisors(&vertex_binding_divisors);
-        let mut vtx_input = vk::PipelineVertexInputStateCreateInfo::default()
-            .vertex_binding_descriptions(&vertex_binding_descs)
-            .vertex_attribute_descriptions(&vertex_attribute_descs);
-        if !vertex_binding_divisors.is_empty() {
-            vtx_input = vtx_input.push_next(&mut vertex_divisor_state);
-        }
-        let input_asm =
-            vk::PipelineInputAssemblyStateCreateInfo::default().topology(key.topology.vk());
-        // Dynamic viewport/scissor so L5 key need not include extent (flip flag is static).
-        // Stencil reference is dynamic (Metal's `SetStencilReferenceValue` is a
-        // command distinct from the state object) so distinct references reuse
-        // one pipeline; only listed for stencil pipelines.
-        let mut dynamic_states = vec![vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
-        if key.stencil.is_some() {
-            dynamic_states.push(vk::DynamicState::STENCIL_REFERENCE);
-        }
-        let dynamic_state =
-            vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
-        // Both counts are the key's one number: the viewports and scissors
-        // themselves are dynamic, but how many of them there are is not, and
-        // Vulkan requires the two counts to be equal.
-        let vp_state = vk::PipelineViewportStateCreateInfo::default()
-            .viewport_count(key.viewport_slots)
-            .scissor_count(key.viewport_slots);
-        // Cull mode, winding, fill mode and depth clip mode all come from the
-        // guest; the last two were refused above where the host cannot spell
-        // them, so reaching here means both are bindable.
-        let raster = vk::PipelineRasterizationStateCreateInfo::default()
-            .polygon_mode(translate::raster::vk_polygon_mode(key.fill_mode))
-            .depth_clamp_enable(translate::raster::vk_depth_clamp_enable(key.depth_clip))
-            .cull_mode(translate::raster::vk_cull_mode(key.cull_mode))
-            .front_face(translate::raster::vk_front_face(key.front_face_ccw))
-            .line_width(1.0);
-        // `rasterSampleCount` is a property of `MTLRenderPipelineDescriptor`,
-        // so it reaches this device inside the type-7 pipeline's own
-        // compact-TLV block. The pass key carries that decoded count, and the
-        // render-pass attachment is created with the same value; unsupported
-        // count/attachment combinations are refused before either object is
-        // built.
-        let multisample = vk::PipelineMultisampleStateCreateInfo::default()
-            .rasterization_samples(vk_sample_count(key.pass.0.sample_count));
-        // One blend attachment state per color attachment; Vulkan requires the
-        // count to match the render pass. Every slot uses its own decoded
-        // blend, slot 0 from `key.blend` and slot n from
-        // `key.secondary_blend[n-1]`.
-        //
-        // The secondaries used to be forced unblended here, justified by a
-        // comment saying the decode side did not carry per-attachment blend
-        // state. It did, and had all along — the Metal arm reads exactly these
-        // fields per slot. Only this key collapsed them, so a guest MRT
-        // pipeline that asked to blend slot 1 silently got a raw store.
-        //
-        // The colour write mask comes from the guest too, and it is applied on
-        // both arms because `MTLColorWriteMask` is independent of
-        // `blendingEnabled` — an unblended masked attachment still leaves its
-        // unwritten channels alone. Metal's bits are alpha-first and Vulkan's
-        // are red-first, so the exchange goes through `vk_color_write_mask`
-        // rather than a cast.
-        let attachment_blend = |blend: Option<BlendKey>, mask: ColorWriteMask| {
-            let write = translate::blend::vk_color_write_mask(mask);
-            match blend {
-                Some(b) => vk::PipelineColorBlendAttachmentState::default()
-                    .color_write_mask(write)
-                    .blend_enable(true)
-                    .src_color_blend_factor(b.src_color.vk())
-                    .dst_color_blend_factor(b.dst_color.vk())
-                    .color_blend_op(b.color_op.vk())
-                    .src_alpha_blend_factor(b.src_alpha.vk())
-                    .dst_alpha_blend_factor(b.dst_alpha.vk())
-                    .alpha_blend_op(b.alpha_op.vk()),
-                None => vk::PipelineColorBlendAttachmentState::default()
-                    .color_write_mask(write)
-                    .blend_enable(false),
-            }
-        };
-        let mut blend_att = vec![attachment_blend(key.blend, key.color_write_mask[0])];
-        for slot in 0..key.pass.secondary_count() {
-            blend_att.push(attachment_blend(
-                key.secondary_blend[slot],
-                key.color_write_mask[slot + 1],
-            ));
-        }
-        let blend_constants = key
-            .blend
-            .map(|b| b.constants.map(f32::from_bits))
-            .unwrap_or([0.0; 4]);
-        let blend = vk::PipelineColorBlendStateCreateInfo::default()
-            .attachments(&blend_att)
-            .blend_constants(blend_constants);
-        // Depth-stencil state: attached ONLY when the pass carries a depth
-        // attachment (Vulkan requires the pipeline's depth-stencil state to be
-        // consistent with the subpass). Without it the color-only pipeline is
-        // byte-identical to the pre-depth engine. Stencil is enabled only when
-        // the bound state requested it (`key.stencil`); the reference field is
-        // left 0 here and supplied dynamically per draw.
-        let stencil_face = |ops: super::types::StencilFaceOps| {
-            vk::StencilOpState::default()
-                .fail_op(ops.fail_op.vk())
-                .pass_op(ops.pass_op.vk())
-                .depth_fail_op(ops.depth_fail_op.vk())
-                .compare_op(ops.compare.vk())
-                .compare_mask(ops.read_mask)
-                .write_mask(ops.write_mask)
-                .reference(0)
-        };
-        let mut depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
-            .depth_test_enable(key.depth_test)
-            .depth_write_enable(key.depth_write)
-            .depth_compare_op(key.depth_compare.vk())
-            .depth_bounds_test_enable(false)
-            .stencil_test_enable(key.stencil.is_some());
-        if let Some(s) = key.stencil {
-            depth_stencil = depth_stencil
-                .front(stencil_face(s.front))
-                .back(stencil_face(s.back));
-        }
-        let mut gpci = vk::GraphicsPipelineCreateInfo::default()
-            .stages(&stages)
-            .vertex_input_state(&vtx_input)
-            .input_assembly_state(&input_asm)
-            .viewport_state(&vp_state)
-            .rasterization_state(&raster)
-            .multisample_state(&multisample)
-            .color_blend_state(&blend)
-            .dynamic_state(&dynamic_state)
-            .layout(pipeline_layout)
-            .render_pass(render_pass)
-            .subpass(0);
-        if key.feedback_colors != 0 {
-            gpci = gpci.flags(vk::PipelineCreateFlags::COLOR_ATTACHMENT_FEEDBACK_LOOP_EXT);
-        }
-        if key.pass.has_depth() {
-            gpci = gpci.depth_stencil_state(&depth_stencil);
-        }
-        // The third call that compiles a module this device assembled, and the
-        // only one that compiles two at once. A macOS 15 guest's CoreAnimation
-        // uber fragment shader has been observed keeping NVIDIA's compiler in
-        // here for over ten minutes with the device lock held; see
-        // `crate::observe::driver_watch`, which this arming also starts.
-        let breadcrumb = match super::driver_breadcrumb::DriverBreadcrumb::arm(
-            &format!(
-                "create_graphics_pipelines vert_words={} frag_words={}",
-                vert_spirv.len(),
-                frag_spirv.len()
-            ),
-            &[("vert", vert_spirv), ("frag", frag_spirv)],
-        ) {
-            Ok(breadcrumb) => breadcrumb,
-            Err(hit) => {
-                let err = self.note_quarantined("create_graphics_pipelines", &hit);
-                self.pipelines.insert_negative(key.clone(), err.clone());
-                return Err(err);
-            }
-        };
-        let created = ctx
-            .device
-            .create_graphics_pipelines(ctx.pipeline_cache, &[gpci], None);
-        breadcrumb.disarm();
-        let pipe = created.map_err(|(_, e)| {
-            let err = DrawError::VkCall(VkCall::new(VkOp::CachesCreateGraphicsPipelines, e));
-            self.pipelines.insert_negative(key.clone(), err.clone());
-            err
-        })?[0];
-        counters.note_create(CreateSite::GraphicsPipeline);
-        // A fresh pipeline compile grew the VkPipelineCache — persist it so
-        // the next boot warm-starts (file write is off-thread, debounced).
-        ctx.persist_pipeline_cache();
-        if let Some(old) = self.pipelines.insert(key.clone(), pipe) {
-            pools.dispose(&ctx.device, DeferredHandle::Pipeline(old));
-        }
-        if let Some(identity) = pipeline_object {
-            self.pipeline_objects.remember(identity, key, pipe);
-        }
-        Ok(pipe)
+        Ok(attribute_formats)
     }
 
     pub(crate) unsafe fn get_or_create_compute_pipeline(
@@ -2581,22 +2523,28 @@ impl ObjectCaches {
             .layout(pipeline_layout);
         // The other call that compiles the module, and the one an NVIDIA driver
         // has been observed dying inside on a macos-14 guest's first dispatch.
+        // Still made here, on the drain thread under both locks: a dispatch
+        // cannot wait at its FIFO head the way a draw can (see
+        // `super::pipeline_compiler`), so `cp_compile_us` measures what that costs.
         let breadcrumb = match super::driver_breadcrumb::DriverBreadcrumb::arm(
+            super::driver_breadcrumb::DriverLane::Drain,
             &format!("create_compute_pipelines entry={}", key.entry),
             &[("kernel", shader.spirv)],
         ) {
             Ok(breadcrumb) => breadcrumb,
             Err(hit) => {
-                let err = self.note_quarantined("create_compute_pipelines", &hit);
+                let err = note_quarantined("create_compute_pipelines", &hit);
                 self.compute_pipelines
                     .insert_negative(key.clone(), err.clone());
                 return Err(err);
             }
         };
+        let compile_started = std::time::Instant::now();
         let created = ctx
             .device
             .create_compute_pipelines(ctx.pipeline_cache, &[cpci], None);
         breadcrumb.disarm();
+        super::pipeline_compiler::note_compute_compile(compile_started.elapsed());
         let pipe = created.map_err(|(_, e)| {
             let err = DrawError::VkCall(VkCall::new(VkOp::CachesCreateComputePipelines, e));
             self.compute_pipelines
@@ -2610,6 +2558,457 @@ impl ObjectCaches {
             pools.dispose(&ctx.device, DeferredHandle::Pipeline(old));
         }
         Ok(pipe)
+    }
+}
+
+/// A content-keyed cache's Vulkan objects, taken out of it to be destroyed
+/// together.
+///
+/// Its own type so a device teardown can hand them to the device's
+/// [`super::context::DeviceLife`] when a graphics compile may still be using
+/// one: the compile names a layout and a render pass this cache owns, and
+/// destroying either under it would be a use-after-free inside the driver.
+#[derive(Default)]
+pub(crate) struct CacheHandles {
+    pipelines: Vec<vk::Pipeline>,
+    layouts: Vec<(vk::DescriptorSetLayout, vk::PipelineLayout)>,
+    passes: Vec<vk::RenderPass>,
+    shaders: Vec<vk::ShaderModule>,
+    samplers: Vec<vk::Sampler>,
+}
+
+impl CacheHandles {
+    pub(crate) unsafe fn destroy(self, device: &ash::Device) {
+        for p in self.pipelines {
+            device.destroy_pipeline(p, None);
+        }
+        for (dsl, pl) in self.layouts {
+            device.destroy_pipeline_layout(pl, None);
+            if dsl != vk::DescriptorSetLayout::null() {
+                device.destroy_descriptor_set_layout(dsl, None);
+            }
+        }
+        for rp in self.passes {
+            device.destroy_render_pass(rp, None);
+        }
+        for s in self.shaders {
+            device.destroy_shader_module(s, None);
+        }
+        for s in self.samplers {
+            device.destroy_sampler(s, None);
+        }
+    }
+}
+
+/// Report a driver call this device refused to repeat, and hand back the
+/// error every call site caches negatively.
+///
+/// One place rather than three so the three cannot drift into three
+/// different accounts of the same event — and so the line always carries
+/// both the key (which identifies the call) and what the dead process called
+/// it (which is the only human-readable thing about it).
+pub(crate) fn note_quarantined(
+    site: &'static str,
+    hit: &super::driver_breadcrumb::quarantine::Quarantined,
+) -> DrawError {
+    let reason = super::reason::DrawReason::DriverCallQuarantined;
+    crate::observe::Emit::decline("driver_quarantine", &reason)
+        .field("site", site)
+        .field("key", &hit.key)
+        .field("previously", &hit.previously)
+        .field(
+            "list",
+            super::driver_breadcrumb::quarantine::list_path().display(),
+        )
+        .fail();
+    DrawError::Unsupported(reason)
+}
+
+/// The storage-image capabilities this device enabled at creation.
+///
+/// Copied out of [`DeviceContext`] so the pipeline compiler, which holds no
+/// reference to the context, declares a module exactly as the draw path keyed
+/// it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SpirvStorageCaps {
+    extended_formats: bool,
+    write_without_format: bool,
+    read_without_format: bool,
+}
+
+impl SpirvStorageCaps {
+    pub(crate) fn of(ctx: &DeviceContext) -> Self {
+        Self {
+            extended_formats: ctx.spirv_storage_extended_formats,
+            write_without_format: ctx.spirv_storage_write_without_format,
+            read_without_format: ctx.spirv_storage_read_without_format,
+        }
+    }
+}
+
+/// `words` with every storage-image capability its own contents require
+/// declared, before the module is keyed or validated.
+///
+/// This is the only place every module from every path passes through, so it
+/// is the only place the question can be asked once. It used to be asked at
+/// one producer instead, and phrased as provenance — "did *this device*
+/// retarget a binding to `Unknown`?" — which is a claim about how a module came
+/// to need the capability rather than whether it does. The translator emits
+/// `Unknown`-format storage images and extended formats of its own accord;
+/// those modules arrived here undeclared and were rejected, losing the
+/// dispatch. Both x86 rails lose compute work to it.
+///
+/// A capability whose Vulkan feature was not enabled at device creation
+/// cannot be declared — that is invalid usage, and an invalid module is
+/// undefined behaviour inside a driver rather than an error it returns — so an
+/// unsupported requirement is a named decline instead.
+pub(crate) fn declare_image_capabilities(
+    words: &[u32],
+    caps: SpirvStorageCaps,
+) -> Result<std::borrow::Cow<'_, [u32]>, DrawError> {
+    let need = crate::runtime::spirv_bind::required_image_capabilities(words);
+    if !need.any() {
+        return Ok(std::borrow::Cow::Borrowed(words));
+    }
+    let missing = (need.extended_formats && !caps.extended_formats)
+        || (need.write_without_format && !caps.write_without_format)
+        || (need.read_without_format && !caps.read_without_format);
+    if missing {
+        crate::observe::fail(format!(
+            "spirv_capability reason=host_lacks_feature words={} \
+             need_extended={} need_write={} need_read={} \
+             have_extended={} have_write={} have_read={}",
+            words.len(),
+            need.extended_formats,
+            need.write_without_format,
+            need.read_without_format,
+            caps.extended_formats,
+            caps.write_without_format,
+            caps.read_without_format,
+        ));
+        return Err(DrawError::Unsupported(super::reason::DrawReason::SpirvInvalid));
+    }
+    let mut patched = words.to_vec();
+    let added = crate::runtime::spirv_bind::ensure_image_capabilities(&mut patched, &need);
+    if added.any() {
+        crate::observe::off(format!(
+            "spirv_capability added extended={} write={} read={} words={}",
+            added.extended_formats,
+            added.write_without_format,
+            added.read_without_format,
+            patched.len()
+        ));
+    }
+    Ok(std::borrow::Cow::Owned(patched))
+}
+
+/// The last gate before the driver, and the only place every module from
+/// every path passes through exactly once.
+///
+/// An invalid module is undefined behaviour inside a driver rather than an
+/// error it returns, and one has been observed ending the VM process — so it
+/// becomes a negative cache entry and the guest's work is declined by name.
+/// See `crate::runtime::spirv_bind::validate`.
+pub(crate) fn refuse_invalid_module(words: &[u32], key: Digest128) -> Result<(), DrawError> {
+    let crate::runtime::spirv_bind::SpirvValidation::Rejected(why) =
+        crate::runtime::spirv_bind::validate(words)
+    else {
+        return Ok(());
+    };
+    // Print what the capability derivation saw alongside the validator's
+    // complaint. When the two disagree the difference is the whole bug, and
+    // neither one alone says which walk is wrong.
+    crate::observe::fail(format!(
+        "spirv_validate reason=module_rejected words={} need={:?} imgs={:?} detail={why}",
+        words.len(),
+        crate::runtime::spirv_bind::required_image_capabilities(words),
+        crate::runtime::spirv_bind::image_type_census(words),
+    ));
+    // The complaint above names instructions by result id, which cannot be
+    // read without the module they belong to. Keep it.
+    super::driver_breadcrumb::keep_rejected_module(&format!("{:016x}{:016x}", key.a, key.b), words);
+    Err(DrawError::Unsupported(super::reason::DrawReason::SpirvInvalid))
+}
+
+/// Everything `vkCreateGraphicsPipelines` reads beyond the two modules, owned,
+/// so the pipeline compiler can build the create info with no lock held.
+///
+/// `attribute_formats` is the device's resolution of `key.attrs`, made under
+/// the engine lock by [`ObjectCaches::graphics_pipeline_formats`] where the
+/// context is at hand. The layout and render pass belong to this cache, which
+/// destroys them only at device teardown; a teardown while this recipe is being
+/// compiled parks them with the device's [`super::context::DeviceLife`].
+#[derive(Debug)]
+pub(crate) struct GraphicsRecipe {
+    pub key: PipelineKey,
+    pub attribute_formats: Vec<vk::Format>,
+    pub pipeline_layout: vk::PipelineLayout,
+    pub render_pass: vk::RenderPass,
+    pub attachment_feedback_loop_layout: bool,
+}
+
+/// Build one graphics pipeline from `recipe`.
+///
+/// Runs on the pipeline compiler thread with no lock held. Caching the result,
+/// remembering a refusal and persisting the pipeline cache belong to the
+/// callers on either side of the call.
+pub(crate) unsafe fn create_graphics_pipeline(
+    lane: super::driver_breadcrumb::DriverLane,
+    device: &ash::Device,
+    cache: vk::PipelineCache,
+    recipe: &GraphicsRecipe,
+    vert: ShaderModuleSource<'_>,
+    // Read by the driver breadcrumb as well as compiled: a graphics compile
+    // consumes both stages and nothing outside the driver can say which one it
+    // choked on, so both go to disk across the call.
+    frag: ShaderModuleSource<'_>,
+) -> Result<vk::Pipeline, DrawError> {
+    let key = &recipe.key;
+    let main_c = super::context::main_entry();
+    let stages = [
+        vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::VERTEX)
+            .module(vert.module)
+            .name(&main_c),
+        vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::FRAGMENT)
+            .module(frag.module)
+            .name(&main_c),
+    ];
+    let vertex_binding_descs: Vec<_> = recipe
+        .key
+        .attrs
+        .iter()
+        .map(|attribute| {
+            vk::VertexInputBindingDescription::default()
+                .binding(attribute.binding)
+                .stride(attribute.stride)
+                .input_rate(translate::vertex::vk_input_rate(attribute.step_function))
+        })
+        .collect();
+    let vertex_binding_divisors: Vec<_> = recipe
+        .key
+        .attrs
+        .iter()
+        .filter_map(|attribute| {
+            let divisor = match attribute.step_function {
+                VertexStepFunction::Constant => 0,
+                VertexStepFunction::PerVertex => return None,
+                VertexStepFunction::PerInstance if attribute.step_rate == 1 => return None,
+                VertexStepFunction::PerInstance => attribute.step_rate,
+            };
+            Some(
+                vk::VertexInputBindingDivisorDescriptionKHR::default()
+                    .binding(attribute.binding)
+                    .divisor(divisor),
+            )
+        })
+        .collect();
+    let vertex_attribute_descs: Vec<_> = recipe
+        .key
+        .attrs
+        .iter()
+        .zip(&recipe.attribute_formats)
+        .map(|(attribute, format)| {
+            vk::VertexInputAttributeDescription::default()
+                .location(attribute.location)
+                .binding(attribute.binding)
+                // The device-resolved format, which equals the attribute's
+                // own on every host seen so far and its mandatory wider
+                // sibling where the device declined the optional one.
+                .format(*format)
+                .offset(attribute.offset)
+        })
+        .collect();
+    let mut vertex_divisor_state = vk::PipelineVertexInputDivisorStateCreateInfoKHR::default()
+        .vertex_binding_divisors(&vertex_binding_divisors);
+    let mut vtx_input = vk::PipelineVertexInputStateCreateInfo::default()
+        .vertex_binding_descriptions(&vertex_binding_descs)
+        .vertex_attribute_descriptions(&vertex_attribute_descs);
+    if !vertex_binding_divisors.is_empty() {
+        vtx_input = vtx_input.push_next(&mut vertex_divisor_state);
+    }
+    let input_asm = vk::PipelineInputAssemblyStateCreateInfo::default()
+        .topology(key.topology.vk())
+        .primitive_restart_enable(key.topology.primitive_restart());
+    // Dynamic viewport/scissor so L5 key need not include extent (flip flag is static).
+    // Stencil reference is dynamic (Metal's `SetStencilReferenceValue` is a
+    // command distinct from the state object) so distinct references reuse
+    // one pipeline; only listed for stencil pipelines.
+    let mut dynamic_states = vec![vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+    if key.stencil.is_some() {
+        dynamic_states.push(vk::DynamicState::STENCIL_REFERENCE);
+    }
+    let dynamic_state =
+        vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
+    // Both counts are the key's one number: the viewports and scissors
+    // themselves are dynamic, but how many of them there are is not, and
+    // Vulkan requires the two counts to be equal.
+    let vp_state = vk::PipelineViewportStateCreateInfo::default()
+        .viewport_count(key.viewport_slots)
+        .scissor_count(key.viewport_slots);
+    // Cull mode, winding, fill mode and depth clip mode all come from the
+    // guest; the last two were refused above where the host cannot spell
+    // them, so reaching here means both are bindable.
+    let raster = vk::PipelineRasterizationStateCreateInfo::default()
+        .polygon_mode(translate::raster::vk_polygon_mode(key.fill_mode))
+        .depth_clamp_enable(translate::raster::vk_depth_clamp_enable(key.depth_clip))
+        .cull_mode(translate::raster::vk_cull_mode(key.cull_mode))
+        .front_face(translate::raster::vk_front_face(key.front_face_ccw))
+        .line_width(1.0);
+    // `rasterSampleCount` is a property of `MTLRenderPipelineDescriptor`,
+    // so it reaches this device inside the type-7 pipeline's own
+    // compact-TLV block. The pass key carries that decoded count, and the
+    // render-pass attachment is created with the same value; unsupported
+    // count/attachment combinations are refused before either object is
+    // built.
+    let multisample = vk::PipelineMultisampleStateCreateInfo::default()
+        .rasterization_samples(vk_sample_count(key.pass.0.sample_count));
+    // One blend attachment state per color attachment; Vulkan requires the
+    // count to match the render pass. Every slot uses its own decoded
+    // blend, slot 0 from `key.blend` and slot n from
+    // `key.secondary_blend[n-1]`.
+    //
+    // The secondaries used to be forced unblended here, justified by a
+    // comment saying the decode side did not carry per-attachment blend
+    // state. It did, and had all along — the Metal arm reads exactly these
+    // fields per slot. Only this key collapsed them, so a guest MRT
+    // pipeline that asked to blend slot 1 silently got a raw store.
+    //
+    // The colour write mask comes from the guest too, and it is applied on
+    // both arms because `MTLColorWriteMask` is independent of
+    // `blendingEnabled` — an unblended masked attachment still leaves its
+    // unwritten channels alone. Metal's bits are alpha-first and Vulkan's
+    // are red-first, so the exchange goes through `vk_color_write_mask`
+    // rather than a cast.
+    let attachment_blend = |blend: Option<BlendKey>, mask: ColorWriteMask| {
+        let write = translate::blend::vk_color_write_mask(mask);
+        match blend {
+            Some(b) => vk::PipelineColorBlendAttachmentState::default()
+                .color_write_mask(write)
+                .blend_enable(true)
+                .src_color_blend_factor(b.src_color.vk())
+                .dst_color_blend_factor(b.dst_color.vk())
+                .color_blend_op(b.color_op.vk())
+                .src_alpha_blend_factor(b.src_alpha.vk())
+                .dst_alpha_blend_factor(b.dst_alpha.vk())
+                .alpha_blend_op(b.alpha_op.vk()),
+            None => vk::PipelineColorBlendAttachmentState::default()
+                .color_write_mask(write)
+                .blend_enable(false),
+        }
+    };
+    let mut blend_att = vec![attachment_blend(key.blend, key.color_write_mask[0])];
+    for slot in 0..key.pass.secondary_count() {
+        blend_att.push(attachment_blend(
+            key.secondary_blend[slot],
+            key.color_write_mask[slot + 1],
+        ));
+    }
+    let blend_constants = key
+        .blend
+        .map(|b| b.constants.map(f32::from_bits))
+        .unwrap_or([0.0; 4]);
+    let blend = vk::PipelineColorBlendStateCreateInfo::default()
+        .attachments(&blend_att)
+        .blend_constants(blend_constants);
+    // Depth-stencil state: attached ONLY when the pass carries a depth
+    // attachment (Vulkan requires the pipeline's depth-stencil state to be
+    // consistent with the subpass). Without it the color-only pipeline is
+    // byte-identical to the pre-depth engine. Stencil is enabled only when
+    // the bound state requested it (`key.stencil`); the reference field is
+    // left 0 here and supplied dynamically per draw.
+    let stencil_face = |ops: super::types::StencilFaceOps| {
+        vk::StencilOpState::default()
+            .fail_op(ops.fail_op.vk())
+            .pass_op(ops.pass_op.vk())
+            .depth_fail_op(ops.depth_fail_op.vk())
+            .compare_op(ops.compare.vk())
+            .compare_mask(ops.read_mask)
+            .write_mask(ops.write_mask)
+            .reference(0)
+    };
+    let mut depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
+        .depth_test_enable(key.depth_test)
+        .depth_write_enable(key.depth_write)
+        .depth_compare_op(key.depth_compare.vk())
+        .depth_bounds_test_enable(false)
+        .stencil_test_enable(key.stencil.is_some());
+    if let Some(s) = key.stencil {
+        depth_stencil = depth_stencil
+            .front(stencil_face(s.front))
+            .back(stencil_face(s.back));
+    }
+    let mut gpci = vk::GraphicsPipelineCreateInfo::default()
+        .stages(&stages)
+        .vertex_input_state(&vtx_input)
+        .input_assembly_state(&input_asm)
+        .viewport_state(&vp_state)
+        .rasterization_state(&raster)
+        .multisample_state(&multisample)
+        .color_blend_state(&blend)
+        .dynamic_state(&dynamic_state)
+        .layout(recipe.pipeline_layout)
+        .render_pass(recipe.render_pass)
+        .subpass(0);
+    if key.feedback_colors != 0
+        || (key.pass.pass_key().color_inputs != 0 && recipe.attachment_feedback_loop_layout)
+    {
+        gpci = gpci.flags(vk::PipelineCreateFlags::COLOR_ATTACHMENT_FEEDBACK_LOOP_EXT);
+    }
+    if key.pass.has_depth() {
+        gpci = gpci.depth_stencil_state(&depth_stencil);
+    }
+    // The third call that compiles a module this device assembled, and the
+    // only one that compiles two at once. A macOS 15 guest's CoreAnimation
+    // uber fragment shader has been observed keeping NVIDIA's compiler in
+    // here for over ten minutes; see `crate::observe::driver_watch`, which
+    // this arming also starts on the compiler's lane.
+    let breadcrumb = match super::driver_breadcrumb::DriverBreadcrumb::arm(
+        lane,
+        &format!(
+            "create_graphics_pipelines vert_words={} frag_words={}",
+            vert.spirv.len(),
+            frag.spirv.len()
+        ),
+        &[("vert", vert.spirv), ("frag", frag.spirv)],
+    ) {
+        Ok(breadcrumb) => breadcrumb,
+        Err(hit) => return Err(note_quarantined("create_graphics_pipelines", &hit)),
+    };
+    let created = device.create_graphics_pipelines(cache, &[gpci], None);
+    breadcrumb.disarm();
+    created
+        .map(|pipelines| pipelines[0])
+        .map_err(|(_, e)| DrawError::VkCall(VkCall::new(VkOp::CachesCreateGraphicsPipelines, e)))
+}
+
+/// A pipeline key no draw asks for, distinct per `seed`, for tests that need a
+/// key and not a pipeline.
+#[cfg(test)]
+pub(crate) fn test_pipeline_key(seed: u32) -> PipelineKey {
+    PipelineKey {
+        vert: Digest128::of_u32_words(&[seed, 0]),
+        frag: Digest128::of_u32_words(&[seed, 1]),
+        attrs: Vec::new(),
+        topology: PrimitiveTopology::Triangle,
+        blend: None,
+        secondary_blend: [None; MAX_SECONDARY_ATTACH],
+        color_write_mask: [ColorWriteMask::default(); 1 + MAX_SECONDARY_ATTACH],
+        pass: PassKey::single(false, vk::Format::R8G8B8A8_UNORM).compatibility(),
+        feedback_colors: 0,
+        cull_mode: CullMode::None,
+        front_face_ccw: false,
+        fill_mode: FillMode::default(),
+        depth_clip: DepthClipMode::default(),
+        depth_test: false,
+        depth_write: false,
+        depth_compare: super::types::SamplerCompareFunction::Always,
+        stencil: None,
+        viewport_slots: 1,
+        layout: LayoutKey {
+            bindings: Vec::new(),
+        },
     }
 }
 
@@ -2714,7 +3113,7 @@ mod object_cache_tests {
         assert_ne!(clear.compatibility(), different_format.compatibility());
 
         let mut different_subpass = load;
-        different_subpass.color_input = true;
+        different_subpass.color_inputs = 1;
         assert_ne!(clear.compatibility(), different_subpass.compatibility());
 
         let mut different_depth = load;
@@ -2771,7 +3170,7 @@ mod object_cache_tests {
             ("depth", |k| k.depth = None, Some(PassCompatField::Depth)),
             ("host accessible", |k| k.host_accessible_color0 = true,
              Some(PassCompatField::HostAccessibleColor0)),
-            ("color input", |k| k.color_input = true, Some(PassCompatField::ColorInput)),
+            ("color input", |k| k.color_inputs = 1, Some(PassCompatField::ColorInput)),
             // Feedback is a property of the draw, and it makes two passes
             // incompatible only on the arm where it still moves a layout. On the
             // shipping arm `compatibility` erases it, which is what stops a
@@ -2821,7 +3220,7 @@ mod object_cache_tests {
         assert_ne!(plain.compatibility(), transported.compatibility());
 
         let mut input = transported;
-        input.color_input = true;
+        input.color_inputs = 1;
         assert_ne!(
             plain.framebuffer_compatibility(),
             input.framebuffer_compatibility()
@@ -3461,7 +3860,7 @@ mod object_cache_tests {
         key.host_accessible_color0 = true;
         for color_input in [false, true] {
             for feedback in [false, true] {
-                key.color_input = color_input;
+                key.color_inputs = u8::from(color_input);
                 key.feedback_colors = u8::from(feedback);
                 assert_eq!(
                     key.color_layout(0),
@@ -3493,7 +3892,7 @@ mod object_cache_tests {
     #[test]
     fn feedback_attachment_layout_is_derived_consistently_from_the_mask() {
         let mut key = PassKey::single(true, vk::Format::R8G8B8A8_UNORM);
-        key.color_input = true;
+        key.color_inputs = 1;
         key.feedback_colors = (1 << 0) | (1 << 3);
 
         for index in 0..=MAX_SECONDARY_ATTACH {
@@ -3575,12 +3974,12 @@ mod object_cache_tests {
     fn pass_dependency_count(key: PassKey) -> usize {
         external_dependencies(
             key.depth.is_some(),
-            key.color_input,
+            key.color_inputs != 0,
             key.host_accessible_color0,
             pass_exit_scope_narrow(),
         )
         .len()
-            + usize::from(key.color_input)
+            + usize::from(key.color_inputs != 0)
             + 1
     }
 

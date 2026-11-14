@@ -15,12 +15,43 @@ use crate::runtime::decode::render::{
 };
 use crate::runtime::host::FakeHost;
 
+/// Where the tests that call `process_exec_indirect2` directly say their packet
+/// sits. None of them stops at a pipeline, so the slot is only a name.
+const TEST_SLOT: ExecSlot = ExecSlot {
+    channel: 1,
+    next_head: 0,
+    completion_stamp: 0,
+};
+
 #[test]
 fn render_pass_chain_edges_follow_the_decoded_encoder() {
     assert_eq!(render_pass_chain_position(0, 1), (false, false));
     assert_eq!(render_pass_chain_position(0, 3), (false, true));
     assert_eq!(render_pass_chain_position(1, 3), (true, true));
     assert_eq!(render_pass_chain_position(2, 3), (true, false));
+}
+
+#[test]
+fn a_later_record_loads_depth_and_stencil_as_well_as_colour() {
+    let mut req = draw::DrawEncodeRequest {
+        colors: vec![draw::ColorRtRequest {
+            load_action: MTL_LOAD_ACTION_CLEAR,
+            ..Default::default()
+        }],
+        depth_attach: Some(DepthAttachment {
+            load_action: MTL_LOAD_ACTION_CLEAR,
+            ..Default::default()
+        }),
+        stencil_attach: Some(StencilAttachment {
+            load_action: MTL_LOAD_ACTION_CLEAR,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    load_prior_record(&mut req);
+    assert_eq!(req.colors[0].load_action, MTL_LOAD_ACTION_LOAD);
+    assert_eq!(req.depth_attach.map(|d| d.load_action), Some(MTL_LOAD_ACTION_LOAD));
+    assert_eq!(req.stencil_attach.map(|s| s.load_action), Some(MTL_LOAD_ACTION_LOAD));
 }
 
 /// The abandon line must say how much guest work it dropped.
@@ -63,7 +94,7 @@ fn chain_abandon_reports_how_many_draws_were_lost() {
 fn short_payload_noop() {
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
-    let r = process_exec_indirect2(&mut state, &mut host, &[0u8; 4]);
+    let r = process_exec_indirect2(&mut state, &mut host, TEST_SLOT, &[0u8; 4]);
     assert_eq!(r.streams_loaded, 0);
 }
 
@@ -96,7 +127,7 @@ fn an_exec_packet_naming_a_dead_slot_is_refused_not_aimed_at_its_neighbour() {
     st32(&mut payload[CHILD_EXEC_INDIRECT_TASK_ID as usize..], 6);
     st32(&mut payload[CHILD_EXEC_INDIRECT_CMDBUF_COUNT as usize..], 1);
 
-    let r = process_exec_indirect2(&mut state, &mut host, &payload);
+    let r = process_exec_indirect2(&mut state, &mut host, TEST_SLOT, &payload);
     assert_eq!(
         r.task_id, 6,
         "the refusal must name the word the guest sent, not the slot we \
@@ -167,7 +198,7 @@ fn a_resource_record_that_populates_its_unrecovered_tail_says_so() {
     );
 
     let cap = crate::observe::sink::FailCapture::start();
-    let r = process_exec_indirect2(&mut state, &mut host, &payload);
+    let r = process_exec_indirect2(&mut state, &mut host, TEST_SLOT, &payload);
     assert_eq!(r.task_id, 3);
     assert_eq!(r.streams_loaded, 0, "no page table backs the cmdbuf gva");
     let line = cap.one("exec_res_table");
@@ -2274,7 +2305,10 @@ fn render_pass_template_reuses_attachment_without_load_seed() {
             store_action: MTL_STORE_ACTION_STORE,
             clear_color: [0.1, 0.2, 0.3, 1.0],
             target_seed_rgba: Some(vec![0xbb; 16]),
+            target_seed_layout: None,
             multisample_source_ref: 0,
+            memoryless: false,
+            buffer_backed: false,
         }],
         ..Default::default()
     };
@@ -4450,7 +4484,7 @@ fn every_declared_command_buffer_is_visited_not_just_the_first_sixteen() {
     }
 
     let cap = crate::observe::sink::FailCapture::start();
-    let r = process_exec_indirect2(&mut state, &mut host, &payload);
+    let r = process_exec_indirect2(&mut state, &mut host, TEST_SLOT, &payload);
     assert_eq!(r.task_id, 3);
     let visited: Vec<String> = cap
         .lines()
@@ -4997,5 +5031,80 @@ fn a_clear_seeds_the_pass_for_any_store_action_and_publishes_only_for_store() {
         0,
         "DontCare says the result is dropped, so writing the clear colour into \
          guest pages would be inventing content the guest declined"
+    );
+}
+
+/// A clear-only pass publishes through its resolve texture for **both**
+/// resolve-carrying store actions, not just one of them.
+///
+/// `MTLLoadActionClear` with no draws leaves every sample holding `clearColor`,
+/// so resolving those samples yields exactly `clearColor`. That makes
+/// `StoreAndMultisampleResolve` and `MultisampleResolve` identical in what they
+/// publish to the single-sample surface the guest scans out; they differ only in
+/// whether the multisample texture is additionally retained, which this path
+/// does not publish and the guest does not scan out.
+///
+/// `StoreAndMultisampleResolve` used to be refused by name immediately above the
+/// code that already retargeted its sibling correctly, so the clear was dropped.
+/// A driven macos-13 app sweep fired that refusal 27 times on one attachment
+/// pair (`source=4 resolve=3`) — each one a clear the guest asked for and did
+/// not get, on the only rail that still lands a pass clear in guest memory.
+#[test]
+fn a_clear_publishes_through_the_resolve_texture_for_both_resolving_store_actions() {
+    use crate::contract::pass_action::{
+        MTL_STORE_ACTION_DONT_CARE, MTL_STORE_ACTION_MULTISAMPLE_RESOLVE,
+        MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE,
+    };
+
+    let att = |store: u16, texture_ref: u32, resolve_texture_ref: u32| ColorAttachment {
+        texture_ref,
+        resolve_texture_ref,
+        store_action: store,
+        load_action: MTL_LOAD_ACTION_CLEAR,
+        ..Default::default()
+    };
+
+    // The pair the sweep actually sent.
+    assert_eq!(
+        clear_publish_target(&att(MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE, 4, 3)),
+        ClearPublish::Resolved(3),
+        "a store-and-resolve clear publishes into its resolve texture"
+    );
+    assert_eq!(
+        clear_publish_target(&att(MTL_STORE_ACTION_MULTISAMPLE_RESOLVE, 4, 3)),
+        ClearPublish::Resolved(3),
+        "its sibling has always published there, and the two must agree"
+    );
+
+    // A plain single-sample store keeps the attachment the guest declared,
+    // level and all — it is not retargeted.
+    assert_eq!(
+        clear_publish_target(&att(MTL_STORE_ACTION_STORE, 4, 0)),
+        ClearPublish::Direct
+    );
+
+    // A resolve with nowhere to resolve into is still a named refusal, for both
+    // actions. This is the half that must NOT be lost by admitting the pair
+    // above.
+    for store in [
+        MTL_STORE_ACTION_MULTISAMPLE_RESOLVE,
+        MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE,
+    ] {
+        assert_eq!(
+            clear_publish_target(&att(store, 4, 0)),
+            ClearPublish::ResolveTargetMissing,
+            "a resolve naming no resolve texture has nowhere to publish"
+        );
+    }
+
+    // Nothing to publish: an action that keeps no single sample, and no
+    // attachment at all. Neither is a loss.
+    assert_eq!(
+        clear_publish_target(&att(MTL_STORE_ACTION_DONT_CARE, 4, 3)),
+        ClearPublish::NotPublished
+    );
+    assert_eq!(
+        clear_publish_target(&att(MTL_STORE_ACTION_STORE, 0, 0)),
+        ClearPublish::NotPublished
     );
 }

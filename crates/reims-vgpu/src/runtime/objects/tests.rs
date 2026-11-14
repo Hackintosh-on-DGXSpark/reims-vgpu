@@ -2331,3 +2331,54 @@ fn a_claimant_count_is_banded_against_the_tasks_that_could_have_claimed() {
     assert_eq!(band(0, 1), "list_miss_slot_empty_claimed_nowhere");
     assert_eq!(band(0, 0), "list_miss_slot_empty_claimed_nowhere");
 }
+
+#[test]
+fn iosurface_xr10_and_extended_fourccs_map_to_metal_formats() {
+    use crate::contract::pixel_format::{
+        MTL_FORMAT_BGR10A2_UNORM, MTL_FORMAT_BGR10_XR, MTL_FORMAT_BGRA10_XR,
+        MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_R16_FLOAT, MTL_FORMAT_R8_UNORM, MTL_FORMAT_RG8_UNORM,
+        MTL_FORMAT_RGB10A8_2P_XR10, MTL_FORMAT_RGBA16_FLOAT,
+    };
+
+    assert_eq!(
+        device_desc_format_to_mtl(u32::from_be_bytes(*b"b3a8")),
+        MTL_FORMAT_RGB10A8_2P_XR10
+    );
+    assert_eq!(
+        device_desc_format_to_mtl(u32::from_be_bytes(*b"&b38")),
+        MTL_FORMAT_RGB10A8_2P_XR10
+    );
+    assert_eq!(
+        device_desc_format_to_mtl(u32::from_be_bytes(*b"w30r")),
+        MTL_FORMAT_BGR10_XR
+    );
+    assert_eq!(
+        device_desc_format_to_mtl(u32::from_be_bytes(*b"w40a")),
+        MTL_FORMAT_BGRA10_XR
+    );
+    assert_eq!(
+        device_desc_format_to_mtl(u32::from_be_bytes(*b"l10r")),
+        MTL_FORMAT_BGR10A2_UNORM
+    );
+    assert_eq!(
+        device_desc_format_to_mtl(u32::from_be_bytes(*b"&BGA")),
+        MTL_FORMAT_BGRA8_UNORM
+    );
+    assert_eq!(
+        device_desc_format_to_mtl(u32::from_be_bytes(*b"&RhA")),
+        MTL_FORMAT_RGBA16_FLOAT
+    );
+    assert_eq!(
+        device_desc_format_to_mtl(u32::from_be_bytes(*b"L008")),
+        MTL_FORMAT_R8_UNORM
+    );
+    assert_eq!(
+        device_desc_format_to_mtl(u32::from_be_bytes(*b"2C08")),
+        MTL_FORMAT_RG8_UNORM
+    );
+    assert_eq!(
+        device_desc_format_to_mtl(u32::from_be_bytes(*b"L00h")),
+        MTL_FORMAT_R16_FLOAT
+    );
+    assert_eq!(device_desc_format_to_mtl(IOSURFACE_FOURCC_420F), 0);
+}

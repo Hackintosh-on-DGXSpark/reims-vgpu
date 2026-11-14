@@ -6399,3 +6399,469 @@ fn a_pending_stamp_discharges_a_wait_on_its_own_slot_and_no_other() {
         "a drain that has latched nothing discharges nothing"
     );
 }
+
+/// Two child channels for the tests of a packet stopped at a pipeline: channel
+/// 1 holds one `EXEC_INDIRECT2`, channel 2 one `UNMAP_MEMORY` behind it in the
+/// scheduler's order. Each has its own ring and its own stamp slot.
+#[cfg(feature = "backend-vulkan")]
+mod pipeline_wait {
+    use super::*;
+    use crate::backend::vulkan::engine::{test_ticket, DrawError, PipelineOutcome};
+    use crate::runtime::exec::scripted_draws::{self, Scripted};
+    use crate::runtime::exec::{test_run_and_park, ExecSlot};
+    use crate::runtime::host::FakeHost;
+
+    const EXEC_CH: u32 = 1;
+    const SIBLING_CH: u32 = 2;
+    const EXEC_STAMP: u32 = 0x55;
+    const SIBLING_STAMP: u32 = 0x66;
+    const TASK: u32 = 9;
+
+    struct Rig {
+        state: DeviceState,
+        host: FakeHost,
+        exec_regs: u64,
+        sibling_regs: u64,
+        stamp_gpa: u64,
+        exec_len: u32,
+        sibling_len: u32,
+        payload: Vec<u8>,
+    }
+
+    impl Rig {
+        /// `exec_stamp` is the stamp the ring entry carries, which a test can
+        /// make differ from the one the continuation was parked for.
+        fn new(exec_stamp: u32) -> Self {
+            let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+            let mut host = FakeHost::new();
+            let page_size = state.page_size() as usize;
+            let (root_pfn, stamp_pfn) = (0x10u32, 0x40u32);
+            let (exec_list, exec_ring) = (0x20u32, 0x30u32);
+            let (sibling_list, sibling_ring) = (0x21u32, 0x31u32);
+            for pfn in [root_pfn, stamp_pfn, exec_list, exec_ring, sibling_list, sibling_ring] {
+                host.map_range(state.pfn_gpa(pfn), page_size, 0);
+            }
+            let root_gpa = state.pfn_gpa(root_pfn);
+
+            let mut payload = vec![0u8; 24];
+            payload[0..4].copy_from_slice(&TASK.to_le_bytes());
+            let exec = packet_bytes(CHILD_OP_EXEC_INDIRECT2, exec_stamp, &payload);
+            host.write_gpa(state.pfn_gpa(exec_ring), &exec).unwrap();
+            host.put_u32(state.pfn_gpa(exec_list), exec_ring);
+
+            let mut unmap = vec![0u8; 20];
+            unmap[0..4].copy_from_slice(&6u32.to_le_bytes());
+            unmap[4..12].copy_from_slice(&0x101000u64.to_le_bytes());
+            unmap[12..20].copy_from_slice(&0x4000u64.to_le_bytes());
+            let sibling = packet_bytes(CHILD_OP_UNMAP_MEMORY, SIBLING_STAMP, &unmap);
+            host.write_gpa(state.pfn_gpa(sibling_ring), &sibling).unwrap();
+            host.put_u32(state.pfn_gpa(sibling_list), sibling_ring);
+
+            let regs = |ch: u32| root_gpa + child_reg_block_offset(ch).unwrap();
+            for (ch, len, list, stamp_index) in [
+                (EXEC_CH, exec.len(), exec_list, 1u32),
+                (SIBLING_CH, sibling.len(), sibling_list, 2u32),
+            ] {
+                host.put_u32(regs(ch) + CHILD_REG_TAIL, len as u32);
+                host.put_u32(regs(ch) + CHILD_REG_HEAD, 0);
+                host.put_u32(regs(ch) + CHILD_REG_STAMP_INDEX, stamp_index);
+                host.put_u32(regs(ch) + CHILD_REG_BASE_PFN, list);
+            }
+            state.gfx.root_page = root_pfn;
+            state.gfx.fifo_base_page = stamp_pfn;
+            state.active_child_mask = (1 << EXEC_CH) | (1 << SIBLING_CH);
+            Self {
+                exec_regs: regs(EXEC_CH),
+                sibling_regs: regs(SIBLING_CH),
+                stamp_gpa: state.pfn_gpa(stamp_pfn),
+                exec_len: exec.len() as u32,
+                sibling_len: sibling.len() as u32,
+                state,
+                host,
+                payload,
+            }
+        }
+
+        /// The ring entry the continuation is parked for.
+        fn slot(&self) -> ExecSlot {
+            ExecSlot {
+                channel: EXEC_CH,
+                next_head: self.exec_len,
+                completion_stamp: EXEC_STAMP,
+            }
+        }
+
+        /// The packet's first run, as the drain makes it: the pass runs until a
+        /// draw answers `PipelinePending`, and the packet parks there.
+        fn first_run(&mut self, pipeline_refs: &[u32]) {
+            let slot = self.slot();
+            let payload = self.payload.clone();
+            let out = test_run_and_park(
+                &mut self.state,
+                &mut self.host,
+                slot,
+                &payload,
+                TASK,
+                pipeline_refs,
+                1,
+            );
+            assert!(out.deferred.is_some(), "the scripted pass stops at its pending draw");
+            self.state.pending.child_mask = (1 << EXEC_CH) | (1 << SIBLING_CH);
+        }
+
+        fn exec_head(&self) -> u32 {
+            self.host.get_u32(self.exec_regs + CHILD_REG_HEAD)
+        }
+
+        fn sibling_head(&self) -> u32 {
+            self.host.get_u32(self.sibling_regs + CHILD_REG_HEAD)
+        }
+
+        fn exec_stamp(&self) -> u32 {
+            self.host.get_u32(self.stamp_gpa + 4)
+        }
+
+        fn sibling_stamp(&self) -> u32 {
+            self.host.get_u32(self.stamp_gpa + 8)
+        }
+
+        fn drain(&mut self) {
+            drain_pending(&mut self.state, &mut self.host);
+        }
+    }
+
+    fn pipeline_refs(ran: &[scripted_draws::Ran]) -> Vec<(u32, &'static str)> {
+        ran.iter().map(|r| (r.pipeline_ref, r.answer)).collect()
+    }
+
+    /// The draw after a pending one, the rest of the packet, the packet's
+    /// stamp and every other FIFO all wait for the pipeline, and nothing that
+    /// already ran runs again.
+    ///
+    /// Draw 71 runs, draw 72's pipeline is being compiled. Until its ticket is
+    /// answered, every drain leaves channel 1's head and stamp where they were
+    /// and holds channel 2's `UNMAP_MEMORY` — which could otherwise unmap what
+    /// the rest of the packet still reads. Once answered, 72 runs carrying the
+    /// ticket it waited on, then 73, then the packet's stamp is written, then
+    /// channel 2 runs. The attachment set is resolved once and draw 71 runs
+    /// once.
+    #[test]
+    fn a_draw_waiting_for_its_pipeline_holds_what_follows_and_stamps_only_after_it_runs() {
+        let ticket = test_ticket(7201);
+        let script = scripted_draws::install([
+            Scripted::Drawn,
+            Scripted::Pending(ticket.clone()),
+            Scripted::AsEngine,
+            Scripted::Drawn,
+        ]);
+        let mut rig = Rig::new(EXEC_STAMP);
+        rig.first_run(&[71, 72, 73]);
+        assert_eq!(pipeline_refs(&script.ran()), [(71, "drawn"), (72, "pending")]);
+
+        for _ in 0..3 {
+            rig.drain();
+            assert_eq!(rig.exec_head(), 0, "the stopped packet stays at its head");
+            assert_eq!(rig.exec_stamp(), 0, "no stamp before the packet's draws ran");
+            assert_eq!(rig.sibling_head(), 0, "a sibling FIFO may not overtake the packet");
+            assert_eq!(rig.sibling_stamp(), 0);
+        }
+        assert_eq!(rig.state.translation_deferred_mask, 1 << EXEC_CH);
+        assert_eq!(rig.state.translation_order_hold_mask & (1 << SIBLING_CH), 1 << SIBLING_CH);
+        assert_eq!(script.ran().len(), 2, "an unanswered ticket runs nothing again");
+
+        ticket.settle(PipelineOutcome::Ready);
+        rig.drain();
+        rig.drain();
+        let ran = script.ran();
+        assert_eq!(
+            pipeline_refs(&ran),
+            [(71, "drawn"), (72, "pending"), (72, "drawn"), (73, "drawn")]
+        );
+        assert!(
+            ran[2].carried.as_ref().is_some_and(|t| t.is(&ticket)),
+            "the resumed draw carries the ticket it waited on"
+        );
+        assert!(ran[3].carried.is_none(), "and only that draw carries it");
+        assert_eq!(script.requests(), 1, "the attachment set is resolved once");
+        assert_eq!(rig.exec_head(), rig.exec_len);
+        assert_eq!(rig.exec_stamp(), EXEC_STAMP);
+        assert_eq!(rig.sibling_head(), rig.sibling_len);
+        assert_eq!(rig.sibling_stamp(), SIBLING_STAMP);
+        assert_eq!(rig.state.translation_deferred_mask, 0);
+        assert!(rig.state.exec_continuations.is_empty());
+    }
+
+    /// A compile that failed is the waiting draw's answer, delivered once.
+    ///
+    /// Out-of-memory is the case that matters: the negative cache does not
+    /// remember it, so a draw that only looked its pipeline up again would
+    /// find nothing, compile again, and wait again — forever. The resumed draw
+    /// carries the ticket, the engine answers it with the ticket's refusal, the
+    /// pass abandons the way a refused draw always has, and the packet
+    /// completes instead of stopping a second time.
+    #[test]
+    fn an_out_of_memory_compile_reaches_the_waiting_packet_once_and_is_not_retried_by_it() {
+        let ticket = test_ticket(7202);
+        let script = scripted_draws::install([
+            Scripted::Drawn,
+            Scripted::Pending(ticket.clone()),
+            Scripted::AsEngine,
+        ]);
+        let mut rig = Rig::new(EXEC_STAMP);
+        rig.first_run(&[81, 82, 83]);
+        rig.drain();
+        assert_eq!(rig.exec_head(), 0);
+
+        let oom = DrawError::VkCall(crate::backend::vulkan::engine::VkCall::new(
+            crate::backend::vulkan::engine::VkOp::CachesCreateGraphicsPipelines,
+            ash::vk::Result::ERROR_OUT_OF_DEVICE_MEMORY,
+        ));
+        assert!(oom.out_of_memory());
+        ticket.settle(PipelineOutcome::Failed(oom));
+        rig.drain();
+        rig.drain();
+        let ran = script.ran();
+        assert_eq!(
+            pipeline_refs(&ran),
+            [(81, "drawn"), (82, "pending"), (82, "refused")],
+            "the refused draw ends the pass and nothing waits again"
+        );
+        assert!(ran[2].carried.as_ref().is_some_and(|t| t.is(&ticket)));
+        assert_eq!(rig.exec_head(), rig.exec_len, "the packet completed");
+        assert_eq!(rig.exec_stamp(), EXEC_STAMP);
+        assert!(rig.state.exec_continuations.is_empty());
+        assert_eq!(rig.state.translation_deferred_mask, 0);
+    }
+
+    /// A stopped packet is resumed only by the ring entry it stopped in.
+    ///
+    /// Here the entry at the head carries a different completion stamp. Its
+    /// first half — draw 91 — already ran, so running it from the start would
+    /// draw 91 again; it is refused by name instead, consumed, and nothing of
+    /// it runs.
+    #[test]
+    fn a_continuation_that_does_not_match_its_head_is_refused_and_not_replayed() {
+        let ticket = test_ticket(7203);
+        let script = scripted_draws::install([Scripted::Drawn, Scripted::Pending(ticket.clone())]);
+        let mut rig = Rig::new(EXEC_STAMP + 1);
+        rig.first_run(&[91, 92]);
+        ticket.settle(PipelineOutcome::Ready);
+
+        let cap = crate::observe::FailCapture::start();
+        rig.drain();
+        let lines = cap.lines();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("reason=exec_continuation_identity")),
+            "the refusal is named: {lines:?}"
+        );
+        assert_eq!(
+            pipeline_refs(&script.ran()),
+            [(91, "drawn"), (92, "pending")],
+            "nothing of the packet ran again"
+        );
+        assert_eq!(rig.exec_head(), rig.exec_len, "the refused entry is consumed");
+        assert!(rig.state.exec_continuations.is_empty());
+        assert_eq!(rig.state.translation_deferred_mask, 0);
+    }
+
+    /// A device reset while a packet waits for its pipeline drops the packet,
+    /// says so, and leaves nothing for the compile to come back to.
+    #[test]
+    fn a_reset_while_a_packet_waits_for_its_pipeline_drops_it_by_name() {
+        let ticket = test_ticket(7204);
+        let script = scripted_draws::install([Scripted::Drawn, Scripted::Pending(ticket.clone())]);
+        let mut rig = Rig::new(EXEC_STAMP);
+        rig.first_run(&[101, 102]);
+        rig.drain();
+        assert_eq!(rig.state.exec_continuations.len(), 1);
+
+        let cap = crate::observe::FailCapture::start();
+        rig.state.reset();
+        assert!(
+            cap.lines()
+                .iter()
+                .any(|l| l.contains("translation_hold_unreleased") && l.contains("pipeline_waits=1")),
+            "{:?}",
+            cap.lines()
+        );
+        assert!(rig.state.exec_continuations.is_empty());
+        assert_eq!(rig.state.translation_deferred_mask, 0);
+
+        // The compile finishing afterwards has nothing to resume.
+        ticket.settle(PipelineOutcome::Ready);
+        rig.drain();
+        assert_eq!(script.ran().len(), 2);
+    }
+
+    /// While a compile runs, the drain that finds its packet still waiting
+    /// returns at once, so the device lock — the mutex standing in for it here
+    /// — is free for a vCPU between the 4 ms polls, however long the compile
+    /// takes.
+    ///
+    /// The ticket stays unanswered for 300 ms, the length of a slow compile
+    /// scaled down. Every drain in that window must return in a few
+    /// milliseconds, and a "vCPU" thread taking the lock throughout must never
+    /// wait long.
+    #[test]
+    fn a_slow_compile_never_holds_the_device_lock() {
+        use std::sync::{Arc, Mutex};
+        use std::time::{Duration, Instant};
+
+        let ticket = test_ticket(7205);
+        let script = scripted_draws::install([
+            Scripted::Drawn,
+            Scripted::Pending(ticket.clone()),
+            Scripted::Drawn,
+        ]);
+        let mut rig = Rig::new(EXEC_STAMP);
+        rig.first_run(&[111, 112]);
+        let device = Arc::new(Mutex::new(()));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let vcpu = {
+            let device = Arc::clone(&device);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut worst = Duration::ZERO;
+                while !stop.load(std::sync::atomic::Ordering::Acquire) {
+                    let asked = Instant::now();
+                    drop(device.lock().unwrap());
+                    worst = worst.max(asked.elapsed());
+                    std::thread::sleep(Duration::from_micros(200));
+                }
+                worst
+            })
+        };
+        let compile_started = Instant::now();
+        let mut worst_hold = Duration::ZERO;
+        let mut polls = 0;
+        while compile_started.elapsed() < Duration::from_millis(300) {
+            let held = device.lock().unwrap();
+            let started = Instant::now();
+            rig.drain();
+            worst_hold = worst_hold.max(started.elapsed());
+            drop(held);
+            polls += 1;
+            assert_eq!(rig.exec_head(), 0);
+            std::thread::sleep(Duration::from_millis(4));
+        }
+        ticket.settle(PipelineOutcome::Ready);
+        stop.store(true, std::sync::atomic::Ordering::Release);
+        let worst_vcpu_wait = vcpu.join().unwrap();
+        {
+            let _held = device.lock().unwrap();
+            rig.drain();
+        }
+        eprintln!(
+            "PASYNC_MEASURE device_lock polls={polls} drain_hold_max_us={} vcpu_wait_max_us={}",
+            worst_hold.as_micros(),
+            worst_vcpu_wait.as_micros()
+        );
+        assert!(polls >= 30, "the poll ran through the compile");
+        assert!(
+            worst_hold < Duration::from_millis(10),
+            "a drain held the lock {worst_hold:?} while the compile ran"
+        );
+        assert!(
+            worst_vcpu_wait < Duration::from_millis(20),
+            "a vCPU waited {worst_vcpu_wait:?} for the lock while the compile ran"
+        );
+        assert_eq!(rig.exec_stamp(), EXEC_STAMP);
+        assert_eq!(
+            pipeline_refs(&script.ran()),
+            [(111, "drawn"), (112, "pending"), (112, "drawn")]
+        );
+    }
+}
+
+/// The ring backlog the mapper reports, at each edge.
+#[test]
+fn the_mapper_ring_backlog_names_an_overrun_and_a_consumer_ahead() {
+    assert_eq!(ring_backlog(5, 4, 4), RingBacklog::One);
+    assert_eq!(ring_backlog(7, 4, 4), RingBacklog::Several(3));
+    assert_eq!(
+        ring_backlog(8, 4, 4),
+        RingBacklog::Several(4),
+        "a full ring is not lost yet"
+    );
+    assert_eq!(ring_backlog(10, 4, 4), RingBacklog::Overrun { lost: 2 });
+    assert_eq!(ring_backlog(3, 4, 4), RingBacklog::ConsumerAhead);
+}
+
+#[test]
+fn set_object_list_converts_wire_byte_length_to_12_byte_slot_count() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    state.define_task(3, 0x1000, 1);
+
+    let mut root_payload = Vec::with_capacity(12);
+    root_payload.extend_from_slice(&3u32.to_le_bytes());
+    root_payload.extend_from_slice(&0x1u32.to_le_bytes());
+    root_payload.extend_from_slice(&49_152u32.to_le_bytes());
+    process_root_packet(
+        &mut state,
+        &mut host,
+        &Packet {
+            opcode: ROOT_OP_SET_OBJECT_LIST,
+            stamp_waits: Vec::new(),
+            total_size: PACKET_HEADER_LEN + 12,
+            completion_stamp: 0,
+            payload: root_payload,
+            next_head: 0,
+        },
+    );
+    assert_eq!(state.tasks[3].object_list_pfn, 0x1);
+    assert_eq!(state.tasks[3].object_list_count, 4096);
+
+    let mut child_payload = Vec::with_capacity(12);
+    child_payload.extend_from_slice(&3u32.to_le_bytes());
+    child_payload.extend_from_slice(&0x914u32.to_le_bytes());
+    child_payload.extend_from_slice(&98_304u32.to_le_bytes());
+    process_child_packet(
+        &mut state,
+        &mut host,
+        2,
+        &Packet {
+            opcode: CHILD_OP_SET_OBJECT_LIST,
+            stamp_waits: Vec::new(),
+            total_size: PACKET_HEADER_LEN + 12,
+            completion_stamp: 0,
+            payload: child_payload,
+            next_head: 0,
+        },
+    );
+    assert_eq!(state.tasks[3].object_list_pfn, 0x914);
+    assert_eq!(state.tasks[3].object_list_count, 8192);
+}
+
+/// macOS 27's `0x44` names the same object list by task GVA; the payload
+/// below is the first one a 27.2 boot sent for task 1.
+#[test]
+fn set_object_list2_applies_its_first_list_like_set_object_list() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    state.define_task(1, 0x1000, 1);
+
+    let mut payload = Vec::with_capacity(SET_OBJECT_LIST2_LEN);
+    payload.extend_from_slice(&1u32.to_le_bytes());
+    payload.extend_from_slice(&0x4000u64.to_le_bytes());
+    payload.extend_from_slice(&0x10_4000u64.to_le_bytes());
+    payload.extend_from_slice(&0xc000u32.to_le_bytes());
+    payload.extend_from_slice(&0x1_0000u32.to_le_bytes());
+    process_child_packet(
+        &mut state,
+        &mut host,
+        2,
+        &Packet {
+            opcode: CHILD_OP_SET_OBJECT_LIST2,
+            stamp_waits: Vec::new(),
+            total_size: PACKET_HEADER_LEN + SET_OBJECT_LIST2_LEN as u32,
+            completion_stamp: 0,
+            payload,
+            next_head: 0,
+        },
+    );
+    assert_eq!(state.tasks[1].object_list_pfn, 1);
+    assert_eq!(state.tasks[1].object_list_count, 4096);
+}

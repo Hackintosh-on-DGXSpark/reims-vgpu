@@ -1570,7 +1570,14 @@ fn stage_heap_texture_uses_host_only_residency_identity() {
         Some(StorageImageSelector::Rgba32Float)
     );
     assert_eq!(staged.bytes.len(), 180 * 135 * 16);
-    assert!(matches!(staged.writeback, TextureWriteback::None));
+    // No guest window: the output becomes the heap texture's snapshot.
+    assert!(matches!(
+        staged.writeback,
+        TextureWriteback::Heap {
+            key: (1, 20, _),
+            len: 388_800
+        }
+    ));
     let residency = staged.residency.expect("heap texture needs GPU residency");
     assert!(residency.key.is_heap());
     assert!(!residency.key.is_linear());
@@ -1646,6 +1653,43 @@ fn linear_writeback_retains_cache_when_guest_gva_is_unmapped() {
         &surface_cache::get_texture(&state, task_id, texture_ref, 2, 2).unwrap()[..4],
         &[3, 2, 1, 4],
         "RGBA compute output mirrors into the BGRA render-sample cache"
+    );
+}
+
+/// A kernel's output to a heap texture has no guest window to land in, so it
+/// becomes the snapshot the next draw samples.
+#[test]
+#[cfg(feature = "backend-vulkan")]
+fn a_heap_texture_kernel_output_becomes_its_snapshot() {
+    use crate::contract::pixel_format::MTL_FORMAT_RGBA8_UNORM;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+    let texels: Vec<u8> = (1..=16).collect();
+    let staged = StagedTexture {
+        binding: 33,
+        array_element: 0,
+        descriptor_count: 1,
+        #[cfg(all(feature = "backend-metal", target_os = "macos"))]
+        texture_ref: 11,
+        pixel_format: MTL_FORMAT_RGBA8_UNORM,
+        storage_selector: Some(pixel_format::StorageImageSelector::Rgba8Unorm),
+        width: 2,
+        height: 2,
+        bytes: texels.clone(),
+        is_storage: true,
+        residency: None,
+        serve: None,
+        writeback: TextureWriteback::Heap {
+            key: (6, 11, 4),
+            len: 16,
+        },
+    };
+
+    assert_eq!(writeback_texture(&mut state, &mut host, 6, &staged), Ok(()));
+    assert_eq!(
+        state.heap_snapshots.get(&(6, 11, 4)).map(|s| s.as_slice()),
+        Some(texels.as_slice())
     );
 }
 

@@ -512,6 +512,15 @@ static ACC: [AtomicU64; PHASES] = [const { AtomicU64::new(0) }; PHASES];
 static DRAWS: AtomicU64 = AtomicU64::new(0);
 static MAX_NS: AtomicU64 = AtomicU64::new(0);
 static STALLS: AtomicU64 = AtomicU64::new(0);
+/// Draws in the window that ended `PipelinePending`. They are in `draws` too —
+/// each ran its preparation and stopped at the pipeline — and each runs again,
+/// so `draws - pending` is the draws that recorded.
+static PENDING: AtomicU64 = AtomicU64::new(0);
+
+/// Count a draw that stopped at its pipeline. See [`PENDING`].
+pub(crate) fn note_pending() {
+    PENDING.fetch_add(1, Ordering::Relaxed);
+}
 static STALL_LINES: AtomicU64 = AtomicU64::new(0);
 
 /// One window of the split, as taken by the per-second census.
@@ -583,6 +592,8 @@ pub struct DrawPhaseWindow {
     pub draws: u64,
     pub max_us: u64,
     pub stalls: u64,
+    /// See [`PENDING`].
+    pub pending: u64,
 }
 
 /// Take and clear the window. `None` when no draw ran, so an idle second costs
@@ -628,6 +639,7 @@ pub fn take_window() -> Option<DrawPhaseWindow> {
         draws,
         max_us: to_us(MAX_NS.swap(0, Ordering::Relaxed)),
         stalls: STALLS.swap(0, Ordering::Relaxed),
+        pending: PENDING.swap(0, Ordering::Relaxed),
     };
     (draws > 0).then_some(w)
 }

@@ -176,7 +176,7 @@ fn assert_fullscreen_fragment_color(label: &str, px: &[u8], w: u32, h: u32) {
 }
 
 fn draw_or_skip(label: &str, req: &DrawRequest) -> Option<Vec<u8>> {
-    match engine::execute_draw_request(req) {
+    match engine::execute_draw_request_blocking(req) {
         Ok(o) => Some(semantic_rgba(&o)),
         Err(e) => {
             let s = e.to_string();
@@ -252,7 +252,7 @@ fn multisample_resolve_preserves_subpixel_coverage() {
 /// thing the same draw produced, so these ask for the record rather than for
 /// the picture.
 fn draw_out_or_skip(label: &str, req: &DrawRequest) -> Option<engine::DrawOutput> {
-    match engine::execute_draw_request(req) {
+    match engine::execute_draw_request_blocking(req) {
         Ok(o) => Some(o),
         Err(e) => {
             let s = e.to_string();
@@ -608,6 +608,7 @@ fn depth_test_honored_compare_and_clear_wired() {
             width: 2,
             height: 2,
             layers: 1,
+            mip_levels: 1,
             arrayed: false,
             volume: false,
             cube: false,
@@ -741,6 +742,7 @@ fn depth_test_honored_on_resident_target_path() {
             width: 2,
             height: 2,
             layers: 1,
+            mip_levels: 1,
             arrayed: false,
             volume: false,
             cube: false,
@@ -765,7 +767,7 @@ fn depth_test_honored_on_resident_target_path() {
             load: false,
             stencil: None,
         });
-        match engine::execute_draw_request(&req) {
+        match engine::execute_draw_request_blocking(&req) {
             Ok(_) => {}
             Err(e) if skip_if_no_gpu(&e.to_string()) => {
                 eprintln!("SKIP resident depth: {e}");
@@ -881,6 +883,7 @@ fn stencil_test_honored_compare_ref_and_clear_wired() {
             width: 2,
             height: 2,
             layers: 1,
+            mip_levels: 1,
             arrayed: false,
             volume: false,
             cube: false,
@@ -1007,7 +1010,7 @@ fn storage_buffer_binding_still_renders() {
         binding: 0,
         content: vec![0u8; 64].into(),
     });
-    match engine::execute_draw_request(&req) {
+    match engine::execute_draw_request_blocking(&req) {
         Ok(o) => assert_fullscreen_fragment_color("storage", &semantic_rgba(&o), 8, 8),
         Err(e) if skip_if_no_gpu(&e.to_string()) => eprintln!("SKIP storage: {e}"),
         Err(e) => {
@@ -1034,6 +1037,7 @@ fn sampled_and_sampler_still_renders() {
         width: 2,
         height: 2,
         layers: 1,
+        mip_levels: 1,
         arrayed: false,
         volume: false,
         cube: false,
@@ -1048,11 +1052,11 @@ fn sampled_and_sampler_still_renders() {
         swizzle: Default::default(),
     });
     req.samplers.push(SamplerResource::normalized_default(2));
-    match engine::execute_draw_request(&req) {
+    match engine::execute_draw_request_blocking(&req) {
         Ok(o) => {
             assert_fullscreen_fragment_color("sampled", &semantic_rgba(&o), 8, 8);
             let warm_before = engine::counter_snapshot();
-            let warm = engine::execute_draw_request(&req).expect("exact sampled cache hit");
+            let warm = engine::execute_draw_request_blocking(&req).expect("exact sampled cache hit");
             assert_eq!(warm.pixels, o.pixels, "cache hit must preserve draw bytes");
             let warm_delta = engine::counter_snapshot().delta_since(&warm_before);
             assert_eq!(
@@ -1081,7 +1085,7 @@ fn sampled_and_sampler_still_renders() {
                 bytes.len() as u64
             };
             let changed_before = engine::counter_snapshot();
-            let changed = engine::execute_draw_request(&req).expect("changed sampled upload");
+            let changed = engine::execute_draw_request_blocking(&req).expect("changed sampled upload");
             assert_eq!(
                 changed.pixels, o.pixels,
                 "test shader remains a solid-color oracle"
@@ -1138,6 +1142,7 @@ fn sampled_upload_happens_once_across_more_draws_than_the_ring_is_deep() {
         width: 2,
         height: 2,
         layers: 1,
+        mip_levels: 1,
         arrayed: false,
         volume: false,
         cube: false,
@@ -1156,10 +1161,10 @@ fn sampled_upload_happens_once_across_more_draws_than_the_ring_is_deep() {
     // Comfortably past RING_DEPTH so the ring wraps several times.
     const DRAWS: u32 = 24;
     let before = engine::counter_snapshot();
-    match engine::execute_draw_request(&req) {
+    match engine::execute_draw_request_blocking(&req) {
         Ok(first) => {
             for _ in 1..DRAWS {
-                let out = engine::execute_draw_request(&req).expect("repeat sampled draw");
+                let out = engine::execute_draw_request_blocking(&req).expect("repeat sampled draw");
                 assert_eq!(out.pixels, first.pixels, "every redraw is byte-identical");
             }
             let d = engine::counter_snapshot().delta_since(&before);
@@ -1199,7 +1204,7 @@ fn resident_sample_bind_avoids_roundtrip_and_remains_loadable() {
 
     let mut make_source = engine_req(&v, &f, 16, 16);
     make_source.target_identity = Some(source.clone());
-    match engine::execute_draw_request(&make_source) {
+    match engine::execute_draw_request_blocking(&make_source) {
         Ok(o) => {
             assert_fullscreen_fragment_color("resident_sample_source", &semantic_rgba(&o), 16, 16)
         }
@@ -1218,6 +1223,7 @@ fn resident_sample_bind_avoids_roundtrip_and_remains_loadable() {
         width: 16,
         height: 16,
         layers: 1,
+        mip_levels: 1,
         arrayed: false,
         volume: false,
         cube: false,
@@ -1231,7 +1237,7 @@ fn resident_sample_bind_avoids_roundtrip_and_remains_loadable() {
     });
     engine::reset_draw_counters();
     let before = engine::counter_snapshot();
-    let consumed = engine::execute_draw_request(&consume).expect("bind resident sample");
+    let consumed = engine::execute_draw_request_blocking(&consume).expect("bind resident sample");
     assert_fullscreen_fragment_color(
         "resident_sample_consumer",
         &semantic_rgba(&consumed),
@@ -1249,7 +1255,7 @@ fn resident_sample_bind_avoids_roundtrip_and_remains_loadable() {
     let mut load_again = engine_req(&v, &f, 16, 16);
     load_again.target_identity = Some(source.clone());
     load_again.load_from_target = true;
-    let loaded = engine::execute_draw_request(&load_again).expect("load after direct sample");
+    let loaded = engine::execute_draw_request_blocking(&load_again).expect("load after direct sample");
     assert_fullscreen_fragment_color("resident_sample_reloaded", &semantic_rgba(&loaded), 16, 16);
 }
 
@@ -1271,7 +1277,7 @@ fn resident_sample_uses_the_bindings_compatible_format_view() {
     let mut produce = engine_req(&source_v, &source_f, 16, 16);
     produce.target_identity = Some(source.clone());
     produce.skip_readback = true;
-    match engine::execute_draw_request(&produce) {
+    match engine::execute_draw_request_blocking(&produce) {
         Ok(_) => {}
         Err(e) if skip_if_no_gpu(&e.to_string()) => {
             eprintln!("SKIP resident compatible-format view: {e}");
@@ -1321,6 +1327,7 @@ fn resident_sample_uses_the_bindings_compatible_format_view() {
         width: 16,
         height: 16,
         layers: 1,
+        mip_levels: 1,
         arrayed: false,
         volume: false,
         cube: false,
@@ -1335,7 +1342,7 @@ fn resident_sample_uses_the_bindings_compatible_format_view() {
     consume
         .samplers
         .push(SamplerResource::normalized_default(sampler_binding(0)));
-    let out = engine::execute_draw_request(&consume).expect("sample compatible sRGB view");
+    let out = engine::execute_draw_request_blocking(&consume).expect("sample compatible sRGB view");
     let center = ((16 / 2) * 16 + 16 / 2) as usize * 4;
     let px = &out.pixels[center..center + 4];
     assert!(
@@ -1359,7 +1366,7 @@ fn resident_sample_alias_uses_native_feedback_or_snapshot_fallback() {
     };
     let mut cold = engine_req(&v, &f, 16, 16);
     cold.target_identity = Some(identity.clone());
-    match engine::execute_draw_request(&cold) {
+    match engine::execute_draw_request_blocking(&cold) {
         Ok(_) => {}
         Err(e) if skip_if_no_gpu(&e.to_string()) => {
             eprintln!("SKIP resident_sample_alias: {e}");
@@ -1380,6 +1387,7 @@ fn resident_sample_alias_uses_native_feedback_or_snapshot_fallback() {
         width: 16,
         height: 16,
         layers: 1,
+        mip_levels: 1,
         arrayed: false,
         volume: false,
         cube: false,
@@ -1398,6 +1406,7 @@ fn resident_sample_alias_uses_native_feedback_or_snapshot_fallback() {
         width: 16,
         height: 16,
         layers: 1,
+        mip_levels: 1,
         arrayed: false,
         volume: false,
         cube: false,
@@ -1411,7 +1420,7 @@ fn resident_sample_alias_uses_native_feedback_or_snapshot_fallback() {
     });
     engine::reset_draw_counters();
     let before = engine::counter_snapshot();
-    engine::execute_draw_request(&alias).expect("resident alias feedback");
+    engine::execute_draw_request_blocking(&alias).expect("resident alias feedback");
     let out = engine::read_target(&identity)
         .expect("read native feedback result after deferred draw")
         .into_rgba8();
@@ -1459,7 +1468,7 @@ fn vertex_buffers_bind_in_one_bulk_call_without_losing_slots() {
         });
     }
     let before = engine::counter_snapshot();
-    match engine::execute_draw_request(&req) {
+    match engine::execute_draw_request_blocking(&req) {
         Ok(o) => {
             assert_fullscreen_fragment_color("attr", &semantic_rgba(&o), 8, 8);
             let d = engine::counter_snapshot().delta_since(&before);
@@ -1494,6 +1503,7 @@ fn sampled_identity_fast_path_skips_content_compare() {
         width: 2,
         height: 2,
         layers: 1,
+        mip_levels: 1,
         arrayed: false,
         volume: false,
         cube: false,
@@ -1511,7 +1521,7 @@ fn sampled_identity_fast_path_skips_content_compare() {
         swizzle: Default::default(),
     });
     req.samplers.push(SamplerResource::normalized_default(2));
-    match engine::execute_draw_request(&req) {
+    match engine::execute_draw_request_blocking(&req) {
         Ok(_) => {}
         Err(e) if skip_if_no_gpu(&e.to_string()) => {
             eprintln!("SKIP sampled identity: {e}");
@@ -1523,7 +1533,7 @@ fn sampled_identity_fast_path_skips_content_compare() {
     // Same identity + generation: identity hit, no content hash/compare
     // accounting (cache_hit_bytes stays zero), no reupload.
     let warm_before = engine::counter_snapshot();
-    engine::execute_draw_request(&req).expect("identity rebind");
+    engine::execute_draw_request_blocking(&req).expect("identity rebind");
     let d = engine::counter_snapshot().delta_since(&warm_before);
     assert_eq!(d.sampled_identity_hits, 1, "identity hit: {d:?}");
     assert_eq!(d.sampled_cache_hits, 0, "no content hit: {d:?}");
@@ -1543,7 +1553,7 @@ fn sampled_identity_fast_path_skips_content_compare() {
         });
     }
     let changed_before = engine::counter_snapshot();
-    engine::execute_draw_request(&req).expect("gen bump upload");
+    engine::execute_draw_request_blocking(&req).expect("gen bump upload");
     let d = engine::counter_snapshot().delta_since(&changed_before);
     assert_eq!(d.sampled_identity_hits, 0, "gen bump no identity: {d:?}");
     assert_eq!(d.sampled_cache_misses, 1, "gen bump miss: {d:?}");
@@ -1551,7 +1561,7 @@ fn sampled_identity_fast_path_skips_content_compare() {
 
     // The new generation now identity-hits.
     let settle_before = engine::counter_snapshot();
-    engine::execute_draw_request(&req).expect("settled identity rebind");
+    engine::execute_draw_request_blocking(&req).expect("settled identity rebind");
     let d = engine::counter_snapshot().delta_since(&settle_before);
     assert_eq!(d.sampled_identity_hits, 1, "settled identity: {d:?}");
     assert_eq!(d.sampled_reuploads, 0, "settled no upload: {d:?}");
@@ -1562,7 +1572,7 @@ fn warm_identical_draw_zero_creates_and_allocs() {
     let _g = engine_test_session();
     let (v, f) = triangle_spirv();
     let req = engine_req(&v, &f, 16, 16);
-    match engine::execute_draw_request(&req) {
+    match engine::execute_draw_request_blocking(&req) {
         Ok(_) => {}
         Err(e) if skip_if_no_gpu(&e.to_string()) => {
             eprintln!("SKIP warm: {e}");
@@ -1570,10 +1580,10 @@ fn warm_identical_draw_zero_creates_and_allocs() {
         }
         Err(e) => panic!("cold draw: {e}"),
     }
-    engine::execute_draw_request(&req).expect("warm-up draw");
+    engine::execute_draw_request_blocking(&req).expect("warm-up draw");
     engine::reset_draw_counters();
     let before = engine::counter_snapshot();
-    engine::execute_draw_request(&req).expect("warm draw");
+    engine::execute_draw_request_blocking(&req).expect("warm draw");
     let after = engine::counter_snapshot();
     let d = after.delta_since(&before);
     assert_eq!(
@@ -1595,7 +1605,7 @@ fn warm_draw_byte_identical_hot_cache() {
     let _g = engine_test_session();
     let (v, f) = triangle_spirv();
     let req = engine_req(&v, &f, 16, 16);
-    let first = match engine::execute_draw_request(&req) {
+    let first = match engine::execute_draw_request_blocking(&req) {
         Ok(o) => o.pixels,
         Err(e) if skip_if_no_gpu(&e.to_string()) => {
             eprintln!("SKIP hot: {e}");
@@ -1605,7 +1615,7 @@ fn warm_draw_byte_identical_hot_cache() {
     };
     assert_fullscreen_fragment_color("hot_first", &first, 16, 16);
     for n in 1..=8 {
-        let px = engine::execute_draw_request(&req)
+        let px = engine::execute_draw_request_blocking(&req)
             .unwrap_or_else(|e| panic!("hot #{n}: {e}"))
             .pixels;
         assert_eq!(px, first, "hot draw #{n} diverged");
@@ -1628,7 +1638,7 @@ fn warm_non_store_zero_readback_seed_create_alloc() {
     let mut cold = engine_req(&v, &f, 16, 16);
     cold.target_identity = Some(identity.clone());
     cold.skip_readback = false;
-    match engine::execute_draw_request(&cold) {
+    match engine::execute_draw_request_blocking(&cold) {
         Ok(o) => assert_fullscreen_fragment_color("resident_cold", &semantic_rgba(&o), 16, 16),
         Err(e) if skip_if_no_gpu(&e.to_string()) => {
             eprintln!("SKIP warm_non_store: {e}");
@@ -1642,10 +1652,10 @@ fn warm_non_store_zero_readback_seed_create_alloc() {
     warm.load_from_target = true;
     warm.skip_readback = true;
     // One warm-up under residency.
-    engine::execute_draw_request(&warm).expect("resident warm-up");
+    engine::execute_draw_request_blocking(&warm).expect("resident warm-up");
     engine::reset_draw_counters();
     let before = engine::counter_snapshot();
-    engine::execute_draw_request(&warm).expect("resident warm non-Store");
+    engine::execute_draw_request_blocking(&warm).expect("resident warm non-Store");
     let after = engine::counter_snapshot();
     let d = after.delta_since(&before);
     assert_eq!(
@@ -1709,7 +1719,7 @@ fn every_admitted_resident_survives_past_the_retired_slot_cap() {
     };
     let mut make = engine_req(&v, &f, 16, 16);
     make.target_identity = Some(pinned.clone());
-    match engine::execute_draw_request(&make) {
+    match engine::execute_draw_request_blocking(&make) {
         Ok(_) => {}
         Err(e) if skip_if_no_gpu(&e.to_string()) => {
             eprintln!("SKIP pinned_resident_target: {e}");
@@ -1728,7 +1738,7 @@ fn every_admitted_resident_survives_past_the_retired_slot_cap() {
     };
     let mut make2 = engine_req(&v, &f, 16, 16);
     make2.target_identity = Some(unpinned.clone());
-    engine::execute_draw_request(&make2).expect("unpinned target draw");
+    engine::execute_draw_request_blocking(&make2).expect("unpinned target draw");
 
     // Admit more distinct 16x16 targets than the retired count permitted. 320 was
     // the last value that count held, and the walk ran on *admission*, so 336
@@ -1746,7 +1756,7 @@ fn every_admitted_resident_survives_past_the_retired_slot_cap() {
             generation: 1,
             format: SURFACE_TEST_FORMAT,
         });
-        engine::execute_draw_request(&filler).expect("filler draw");
+        engine::execute_draw_request_blocking(&filler).expect("filler draw");
     }
     assert!(
         engine::resident_content_ready(&pinned),
@@ -1819,7 +1829,7 @@ fn a_surface_resident_reads_back_in_guest_scanout_order() {
         generation: 1,
         format: SURFACE_TEST_FORMAT,
     });
-    let out = match engine::execute_draw_request(&resident) {
+    let out = match engine::execute_draw_request_blocking(&resident) {
         Ok(o) => o,
         Err(e) if skip_if_no_gpu(&e.to_string()) => {
             eprintln!("SKIP surface scanout order: {e}");
@@ -1851,7 +1861,7 @@ fn a_surface_resident_reads_back_in_guest_scanout_order() {
     // order from, and the bytes stay semantic. Without it an engine that had
     // simply been switched to BGRA everywhere would pass the arm above.
     let pooled = engine_req(&v, &f, w, h);
-    let out = engine::execute_draw_request(&pooled).expect("pooled draw");
+    let out = engine::execute_draw_request_blocking(&pooled).expect("pooled draw");
     assert!(
         !out.pixels_bgra,
         "a pooled target has no identity to take an order from"
@@ -1884,7 +1894,7 @@ fn a_bgra_resident_draw_reads_back_identically_twice() {
     let mut req = engine_req(&v, &f, w, h);
     req.target_identity = Some(identity.clone());
     req.skip_readback = true;
-    match engine::execute_draw_request(&req) {
+    match engine::execute_draw_request_blocking(&req) {
         Ok(_) => {}
         Err(e) if skip_if_no_gpu(&e.to_string()) => {
             eprintln!("SKIP bgra resident readback: {e}");
@@ -1941,7 +1951,7 @@ fn a_skipped_draw_readback_and_a_resident_read_are_counted_apart() {
     req.skip_readback = true;
 
     let before_draw = engine::counter_snapshot();
-    match engine::execute_draw_request(&req) {
+    match engine::execute_draw_request_blocking(&req) {
         Ok(_) => {}
         Err(e) if skip_if_no_gpu(&e.to_string()) => {
             eprintln!("SKIP readback split: {e}");
@@ -2043,6 +2053,7 @@ fn sampled_rgba_upload_to_bgra_target_preserves_semantic_channels() {
         width: 2,
         height: 2,
         layers: 1,
+        mip_levels: 1,
         arrayed: false,
         volume: false,
         cube: false,
@@ -2057,7 +2068,7 @@ fn sampled_rgba_upload_to_bgra_target_preserves_semantic_channels() {
     req.samplers
         .push(SamplerResource::normalized_default(sampler_binding(0)));
 
-    match engine::execute_draw_request(&req) {
+    match engine::execute_draw_request_blocking(&req) {
         Ok(_) => {}
         Err(e) if skip_if_no_gpu(&e.to_string()) => {
             eprintln!("SKIP sampled RGBA to BGRA target: {e}");
@@ -2076,7 +2087,7 @@ fn sampled_rgba_upload_to_bgra_target_preserves_semantic_channels() {
     );
 
     let warm_before = engine::counter_snapshot();
-    engine::execute_draw_request(&req).expect("exact sampled-content cache hit");
+    engine::execute_draw_request_blocking(&req).expect("exact sampled-content cache hit");
     let warm_delta = engine::counter_snapshot().delta_since(&warm_before);
     assert_eq!(warm_delta.sampled_cache_hits, 1, "warm hit: {warm_delta:?}");
     assert_eq!(
@@ -2096,7 +2107,7 @@ fn sampled_rgba_upload_to_bgra_target_preserves_semantic_channels() {
     req.sampled_images[0].source =
         SampledSource::Bytes(std::sync::Arc::new(changed_rgba.repeat(4)));
     let changed_before = engine::counter_snapshot();
-    engine::execute_draw_request(&req).expect("changed sampled-content cache miss");
+    engine::execute_draw_request_blocking(&req).expect("changed sampled-content cache miss");
     let changed_delta = engine::counter_snapshot().delta_since(&changed_before);
     assert_eq!(
         changed_delta.sampled_cache_misses, 1,
@@ -2205,6 +2216,7 @@ fn reflected_static_sampler_descriptor_samples_texture() {
         width: 2,
         height: 2,
         layers: 1,
+        mip_levels: 1,
         arrayed: false,
         volume: false,
         cube: false,
@@ -2241,7 +2253,7 @@ fn reflected_static_sampler_descriptor_samples_texture() {
     };
     assert!(first.pixels.is_empty());
     req.load_from_target = true;
-    let second = engine::execute_draw_request(&req).expect("second static sampler draw");
+    let second = engine::execute_draw_request_blocking(&req).expect("second static sampler draw");
     assert!(second.pixels.is_empty());
     let pixels = engine::read_target(&target)
         .expect("read repeated static sampler target")
@@ -2336,6 +2348,7 @@ fn sampled_bgra8_bytes_upload_matches_rgba8_semantic_color() {
             width: 2,
             height: 2,
             layers: 1,
+            mip_levels: 1,
             arrayed: false,
             volume: false,
             cube: false,
@@ -2349,7 +2362,7 @@ fn sampled_bgra8_bytes_upload_matches_rgba8_semantic_color() {
         });
         req.samplers
             .push(SamplerResource::normalized_default(sampler_binding(0)));
-        match engine::execute_draw_request(&req) {
+        match engine::execute_draw_request_blocking(&req) {
             Ok(_) => Some(
                 engine::read_target(&identity)
                     .expect("read BGRA target")
@@ -2462,6 +2475,7 @@ fn a_view_swizzle_is_performed_by_the_image_view_not_the_cpu() {
             width: 2,
             height: 2,
             layers: 1,
+            mip_levels: 1,
             arrayed: false,
             volume: false,
             cube: false,
@@ -2475,7 +2489,7 @@ fn a_view_swizzle_is_performed_by_the_image_view_not_the_cpu() {
         });
         req.samplers
             .push(SamplerResource::normalized_default(sampler_binding(0)));
-        match engine::execute_draw_request(&req) {
+        match engine::execute_draw_request_blocking(&req) {
             Ok(_) => Some(engine::read_target(&identity).expect("read target").pixels),
             Err(e) if skip_if_no_gpu(&e.to_string()) => {
                 eprintln!("SKIP view swizzle: {e}");
@@ -2542,7 +2556,7 @@ fn partial_draw_preserves_rgba_seed_on_bgra_target() {
         height: 1,
     }];
 
-    match engine::execute_draw_request(&req) {
+    match engine::execute_draw_request_blocking(&req) {
         Ok(_) => {}
         Err(e) if skip_if_no_gpu(&e.to_string()) => {
             eprintln!("SKIP BGRA partial seed: {e}");
@@ -2611,7 +2625,7 @@ fn partial_draw_preserves_a_native_guest_target_seed() {
         height: 1,
     }];
 
-    match engine::execute_draw_request(&req) {
+    match engine::execute_draw_request_blocking(&req) {
         Ok(_) => {}
         Err(e) if skip_if_no_gpu(&e.to_string()) => {
             eprintln!("SKIP guest target seed: {e}");
@@ -2657,7 +2671,7 @@ fn an_alpha_only_write_mask_leaves_the_colour_channels_alone() {
     let mut req = engine_req(&vert, &frag, w, h);
     req.target_rgba8 = Some(std::sync::Arc::new(seed.repeat((w * h) as usize)));
     req.color_write_mask = ColorWriteMask::new(1).expect("MTLColorWriteMaskAlpha");
-    let masked = match engine::execute_draw_request(&req) {
+    let masked = match engine::execute_draw_request_blocking(&req) {
         Ok(out) => out.pixels,
         Err(e) if skip_if_no_gpu(&e.to_string()) => {
             eprintln!("SKIP alpha-only write mask: {e}");
@@ -2683,7 +2697,7 @@ fn an_alpha_only_write_mask_leaves_the_colour_channels_alone() {
     // Control: the same draw with the default `all` mask writes every channel.
     // Run in the same session so a difference cannot come from device state.
     req.color_write_mask = ColorWriteMask::default();
-    let unmasked = engine::execute_draw_request(&req)
+    let unmasked = engine::execute_draw_request_blocking(&req)
         .expect("unmasked control draw")
         .pixels;
     assert_fullscreen_fragment_color("unmasked control", &unmasked, w, h);
@@ -2743,7 +2757,7 @@ fn a_bgra_ordered_seed_lands_the_same_pixels_as_the_rgba_ordered_one() {
             width: 1,
             height: 1,
         }];
-        match engine::execute_draw_request(&req) {
+        match engine::execute_draw_request_blocking(&req) {
             Ok(_) => {}
             Err(e) if skip_if_no_gpu(&e.to_string()) => {
                 eprintln!("SKIP seed order: {e}");
@@ -2804,7 +2818,7 @@ fn premult_one_omsa_gpu_blend_matches_software_oracle() {
         alpha_op: BlendOp::Add,
         constants: [0.0; 4],
     });
-    let gpu_px = match engine::execute_draw_request(&gpu) {
+    let gpu_px = match engine::execute_draw_request_blocking(&gpu) {
         Ok(o) => o.pixels,
         Err(e) if skip_if_no_gpu(&e.to_string()) => {
             eprintln!("SKIP premult: {e}");
@@ -2815,7 +2829,7 @@ fn premult_one_omsa_gpu_blend_matches_software_oracle() {
     // Software oracle: draw over black with same blend, then composite.
     let mut black = engine_req(&v, &f, w, h);
     black.blend = gpu.blend;
-    let over_black = engine::execute_draw_request(&black)
+    let over_black = engine::execute_draw_request_blocking(&black)
         .expect("over black")
         .pixels;
     let (soft, _) = reims_vgpu::runtime::draw::load_composite_premult_one_omsa(&over_black, &seed);
@@ -2850,7 +2864,7 @@ fn skip_readback_store_then_load_from_target_preserves_content() {
     let mut store1 = engine_req(&v, &f, 16, 16);
     store1.target_identity = Some(identity.clone());
     store1.skip_readback = true;
-    match engine::execute_draw_request(&store1) {
+    match engine::execute_draw_request_blocking(&store1) {
         Ok(_) => {}
         Err(e) if skip_if_no_gpu(&e.to_string()) => {
             eprintln!("SKIP skip_readback_load_preserve: {e}");
@@ -2868,7 +2882,7 @@ fn skip_readback_store_then_load_from_target_preserves_content() {
     store2.load_from_target = true;
     store2.skip_readback = true;
     store2.target_rgba8 = None;
-    engine::execute_draw_request(&store2).expect("store2 LoadFromTarget");
+    engine::execute_draw_request_blocking(&store2).expect("store2 LoadFromTarget");
     let px = engine::read_target(&identity)
         .expect("read_target after progressive Stores")
         .into_rgba8();
@@ -2894,7 +2908,7 @@ fn guest_reset_evicts_resident_targets_without_destroying_context() {
     let mut draw = engine_req(&v, &f, 16, 16);
     draw.target_identity = Some(identity.clone());
     draw.skip_readback = true;
-    match engine::execute_draw_request(&draw) {
+    match engine::execute_draw_request_blocking(&draw) {
         Ok(_) => {}
         Err(e) if skip_if_no_gpu(&e.to_string()) => {
             eprintln!("SKIP guest_reset_evicts_resident: {e}");
@@ -2917,7 +2931,7 @@ fn chain_load_from_target_byte_parity_vs_cpu_seed() {
     let (v, f) = triangle_spirv();
     // CPU-seed chain: draw1 clear → pixels → draw2 LoadSeed(pixels) → pixels2
     let d1 = engine_req(&v, &f, 16, 16);
-    let p1 = match engine::execute_draw_request(&d1) {
+    let p1 = match engine::execute_draw_request_blocking(&d1) {
         Ok(o) => semantic_rgba(&o),
         Err(e) if skip_if_no_gpu(&e.to_string()) => {
             eprintln!("SKIP chain: {e}");
@@ -2927,7 +2941,7 @@ fn chain_load_from_target_byte_parity_vs_cpu_seed() {
     };
     let mut d2_cpu = engine_req(&v, &f, 16, 16);
     d2_cpu.target_rgba8 = Some(std::sync::Arc::new(p1.clone()));
-    let p2_cpu = semantic_rgba(&engine::execute_draw_request(&d2_cpu).expect("cpu seed chain"));
+    let p2_cpu = semantic_rgba(&engine::execute_draw_request_blocking(&d2_cpu).expect("cpu seed chain"));
 
     // GPU-resident chain: same identity LoadFromTarget.
     engine::test_reset_engine();
@@ -2941,12 +2955,12 @@ fn chain_load_from_target_byte_parity_vs_cpu_seed() {
     let mut g1 = engine_req(&v, &f, 16, 16);
     g1.target_identity = Some(identity.clone());
     g1.skip_readback = true;
-    engine::execute_draw_request(&g1).expect("gpu chain d1");
+    engine::execute_draw_request_blocking(&g1).expect("gpu chain d1");
     let mut g2 = engine_req(&v, &f, 16, 16);
     g2.target_identity = Some(identity.clone());
     g2.load_from_target = true;
     g2.skip_readback = false; // read back for compare
-    let p2_gpu = semantic_rgba(&engine::execute_draw_request(&g2).expect("gpu chain d2"));
+    let p2_gpu = semantic_rgba(&engine::execute_draw_request_blocking(&g2).expect("gpu chain d2"));
     assert_eq!(
         p2_gpu, p2_cpu,
         "LoadFromTarget chain must match CPU-seed chain"
@@ -2997,7 +3011,7 @@ fn load_from_target_after_a_readback_matches_the_cpu_seed_chain() {
     let mut d1 = engine_req(&v, &f, w, h);
     d1.target_rgba8 = Some(std::sync::Arc::new(prior.clone()));
     d1.scissors = vec![dot(0, 0)];
-    let p1 = match engine::execute_draw_request(&d1) {
+    let p1 = match engine::execute_draw_request_blocking(&d1) {
         Ok(o) => semantic_rgba(&o),
         Err(e) if skip_if_no_gpu(&e.to_string()) => {
             eprintln!("SKIP load_from_target_after_readback: {e}");
@@ -3009,7 +3023,7 @@ fn load_from_target_after_a_readback_matches_the_cpu_seed_chain() {
     d2_cpu.target_rgba8 = Some(std::sync::Arc::new(p1.clone()));
     d2_cpu.scissors = vec![dot(8, 8)];
     let p2_cpu =
-        semantic_rgba(&engine::execute_draw_request(&d2_cpu).expect("cpu seed after readback"));
+        semantic_rgba(&engine::execute_draw_request_blocking(&d2_cpu).expect("cpu seed after readback"));
 
     // The two arms are only comparable if the seed actually survives the draw.
     let untouched = ((h / 2) * w + 2) as usize * 4;
@@ -3036,7 +3050,7 @@ fn load_from_target_after_a_readback_matches_the_cpu_seed_chain() {
     g1.scissors = vec![dot(0, 0)];
     g1.skip_readback = false;
     let p1_resident =
-        semantic_rgba(&engine::execute_draw_request(&g1).expect("resident store with readback"));
+        semantic_rgba(&engine::execute_draw_request_blocking(&g1).expect("resident store with readback"));
     assert_eq!(
         p1_resident, p1,
         "the resident pass must read back the same pixels as the pooled one, \
@@ -3050,7 +3064,7 @@ fn load_from_target_after_a_readback_matches_the_cpu_seed_chain() {
     g2.scissors = vec![dot(8, 8)];
     g2.skip_readback = false;
     let p2_gpu = semantic_rgba(
-        &engine::execute_draw_request(&g2).expect("load from a target that was read back"),
+        &engine::execute_draw_request_blocking(&g2).expect("load from a target that was read back"),
     );
 
     assert_eq!(
@@ -3072,7 +3086,7 @@ fn gva_chain_resident_single_readback_matches_cpu_seed_chain() {
     // CPU round-trip reference chain: every record reads back, next record
     // re-uploads the pixels as its seed (the legacy GVA chain rail).
     let d1 = engine_req(&v, &f, 16, 16);
-    let p1 = match engine::execute_draw_request(&d1) {
+    let p1 = match engine::execute_draw_request_blocking(&d1) {
         Ok(o) => o.pixels,
         Err(e) if skip_if_no_gpu(&e.to_string()) => {
             eprintln!("SKIP gva_chain: {e}");
@@ -3082,10 +3096,10 @@ fn gva_chain_resident_single_readback_matches_cpu_seed_chain() {
     };
     let mut d2 = engine_req(&v, &f, 16, 16);
     d2.target_rgba8 = Some(std::sync::Arc::new(p1));
-    let p2 = engine::execute_draw_request(&d2).expect("cpu d2").pixels;
+    let p2 = engine::execute_draw_request_blocking(&d2).expect("cpu d2").pixels;
     let mut d3 = engine_req(&v, &f, 16, 16);
     d3.target_rgba8 = Some(std::sync::Arc::new(p2));
-    let p3_cpu = engine::execute_draw_request(&d3).expect("cpu d3").pixels;
+    let p3_cpu = engine::execute_draw_request_blocking(&d3).expect("cpu d3").pixels;
 
     // Resident chain on a Gva identity: intermediates never touch the CPU.
     engine::test_reset_engine();
@@ -3101,17 +3115,17 @@ fn gva_chain_resident_single_readback_matches_cpu_seed_chain() {
     let mut g1 = engine_req(&v, &f, 16, 16);
     g1.target_identity = Some(identity.clone());
     g1.skip_readback = true;
-    engine::execute_draw_request(&g1).expect("gva chain g1");
+    engine::execute_draw_request_blocking(&g1).expect("gva chain g1");
     let mut g2 = engine_req(&v, &f, 16, 16);
     g2.target_identity = Some(identity.clone());
     g2.load_from_target = true;
     g2.skip_readback = true;
-    engine::execute_draw_request(&g2).expect("gva chain g2");
+    engine::execute_draw_request_blocking(&g2).expect("gva chain g2");
     let mut g3 = engine_req(&v, &f, 16, 16);
     g3.target_identity = Some(identity.clone());
     g3.load_from_target = true;
     g3.skip_readback = false; // final record: contract Store readback
-    let p3_gpu = engine::execute_draw_request(&g3)
+    let p3_gpu = engine::execute_draw_request_blocking(&g3)
         .expect("gva chain g3")
         .pixels;
     let d = engine::counter_snapshot().delta_since(&before);
@@ -3140,7 +3154,7 @@ fn gva_deferred_store_flush_read_matches_sync_store() {
     let (v, f) = triangle_spirv();
     // Sync reference: the legacy Store readback.
     let d_sync = engine_req(&v, &f, 16, 16);
-    let p_sync = match engine::execute_draw_request(&d_sync) {
+    let p_sync = match engine::execute_draw_request_blocking(&d_sync) {
         Ok(o) => o.pixels,
         Err(e) if skip_if_no_gpu(&e.to_string()) => {
             eprintln!("SKIP gva_deferred_store: {e}");
@@ -3163,7 +3177,7 @@ fn gva_deferred_store_flush_read_matches_sync_store() {
     let mut g = engine_req(&v, &f, 16, 16);
     g.target_identity = Some(identity.clone());
     g.skip_readback = true;
-    engine::execute_draw_request(&g).expect("deferred store draw");
+    engine::execute_draw_request_blocking(&g).expect("deferred store draw");
     let d = engine::counter_snapshot().delta_since(&before);
     assert_eq!(d.readbacks, 0, "deferred Store must not read back: {d:?}");
     assert_eq!(
@@ -3202,7 +3216,7 @@ fn device_loss_named_and_recreate_bounded() {
     let _g = engine_test_session();
     let (v, f) = triangle_spirv();
     let req = engine_req(&v, &f, 8, 8);
-    match engine::execute_draw_request(&req) {
+    match engine::execute_draw_request_blocking(&req) {
         Ok(_) => {}
         Err(e) if skip_if_no_gpu(&e.to_string()) => {
             eprintln!("SKIP device_loss: {e}");
@@ -3211,7 +3225,7 @@ fn device_loss_named_and_recreate_bounded() {
         Err(e) => panic!("{e}"),
     }
     engine::test_force_device_lost_once();
-    let err = engine::execute_draw_request(&req).expect_err("forced loss");
+    let err = engine::execute_draw_request_blocking(&req).expect_err("forced loss");
     let s = err.to_string();
     assert!(
         s.contains("reason=vk_device_lost_forced_draw"),
@@ -3220,7 +3234,7 @@ fn device_loss_named_and_recreate_bounded() {
     let mut saw_named = true;
     for _ in 0..MAX_DEVICE_RECREATES + 2 {
         engine::test_poison_and_flush();
-        match engine::execute_draw_request(&req) {
+        match engine::execute_draw_request_blocking(&req) {
             Ok(_) => {}
             Err(e) => {
                 let es = e.to_string();
@@ -3263,7 +3277,7 @@ fn device_loss_named_and_recreate_bounded() {
         0,
         "reset must clear the recreate budget"
     );
-    match engine::execute_draw_request(&req) {
+    match engine::execute_draw_request_blocking(&req) {
         Ok(_) => {}
         Err(e) if skip_if_no_gpu(&e.to_string()) => {}
         Err(e) => panic!("engine must draw again after a reset from an exhausted cap: {e}"),
@@ -3304,7 +3318,7 @@ fn alternating_target_no_readback_draws_stay_in_flight_and_read_back_exact() {
     for (label, identity) in [("ring_cold_a", &id_a), ("ring_cold_b", &id_b)] {
         let mut cold = engine_req(&v, &f, 16, 16);
         cold.target_identity = Some((*identity).clone());
-        match engine::execute_draw_request(&cold) {
+        match engine::execute_draw_request_blocking(&cold) {
             Ok(o) => assert_fullscreen_fragment_color(label, &semantic_rgba(&o), 16, 16),
             Err(e) if skip_if_no_gpu(&e.to_string()) => {
                 eprintln!("SKIP ring_overlaps: {e}");
@@ -3319,7 +3333,7 @@ fn alternating_target_no_readback_draws_stay_in_flight_and_read_back_exact() {
         warm.target_identity = Some((*identity).clone());
         warm.load_from_target = true;
         warm.skip_readback = true;
-        engine::execute_draw_request(&warm).expect("ring warm-up");
+        engine::execute_draw_request_blocking(&warm).expect("ring warm-up");
     }
     engine::read_target(&id_a).expect("ring quiesce");
     engine::reset_draw_counters();
@@ -3330,7 +3344,7 @@ fn alternating_target_no_readback_draws_stay_in_flight_and_read_back_exact() {
         warm.target_identity = Some((*identity).clone());
         warm.load_from_target = true;
         warm.skip_readback = true;
-        engine::execute_draw_request(&warm).unwrap_or_else(|e| panic!("ring async #{n}: {e}"));
+        engine::execute_draw_request_blocking(&warm).unwrap_or_else(|e| panic!("ring async #{n}: {e}"));
     }
     let d = engine::counter_snapshot().delta_since(&before);
     assert_eq!(
@@ -3383,7 +3397,7 @@ fn seed_from_target_gpu_copies_front_frame() {
     // Render known content into the "front frame" resident.
     let mut cold = engine_req(&v, &f, 16, 16);
     cold.target_identity = Some(front.clone());
-    let front_pixels = match engine::execute_draw_request(&cold) {
+    let front_pixels = match engine::execute_draw_request_blocking(&cold) {
         Ok(o) => {
             assert_fullscreen_fragment_color("gpu_seed_front", &semantic_rgba(&o), 16, 16);
             o.pixels
@@ -3403,7 +3417,7 @@ fn seed_from_target_gpu_copies_front_frame() {
     seeded.vertex_count = 0;
     seeded.target_identity = Some(back.clone());
     seeded.seed_from_target = Some(front.clone());
-    let out = engine::execute_draw_request(&seeded).expect("gpu-seeded draw");
+    let out = engine::execute_draw_request_blocking(&seeded).expect("gpu-seeded draw");
     assert_eq!(
         out.pixels, front_pixels,
         "GPU seed copy must reproduce the front content byte-exactly"
@@ -3415,7 +3429,7 @@ fn seed_from_target_gpu_copies_front_frame() {
     let mut self_seed = engine_req(&v, &f, 16, 16);
     self_seed.target_identity = Some(back.clone());
     self_seed.seed_from_target = Some(back.clone());
-    assert!(engine::execute_draw_request(&self_seed).is_err());
+    assert!(engine::execute_draw_request_blocking(&self_seed).is_err());
     let absent = TargetIdentity::Surface {
         id: 73,
         width: 16,
@@ -3426,7 +3440,7 @@ fn seed_from_target_gpu_copies_front_frame() {
     let mut missing = engine_req(&v, &f, 16, 16);
     missing.target_identity = Some(back.clone());
     missing.seed_from_target = Some(absent);
-    assert!(engine::execute_draw_request(&missing).is_err());
+    assert!(engine::execute_draw_request_blocking(&missing).is_err());
 }
 
 /// True N-attachment MRT: a draw with a secondary color attachment renders the
@@ -3467,7 +3481,7 @@ fn mrt_secondary_attachment_becomes_sampleable_resident() {
         blend: None,
         color_write_mask: Default::default(),
     });
-    match engine::execute_draw_request(&mrt) {
+    match engine::execute_draw_request_blocking(&mrt) {
         // Slot 0 (primary) still receives the shader's location-0 output.
         Ok(o) => assert_fullscreen_fragment_color("mrt_primary", &semantic_rgba(&o), 16, 16),
         Err(e) if skip_if_no_gpu(&e.to_string()) => {
@@ -3501,6 +3515,7 @@ fn mrt_secondary_attachment_becomes_sampleable_resident() {
         width: 16,
         height: 16,
         layers: 1,
+        mip_levels: 1,
         arrayed: false,
         volume: false,
         cube: false,
@@ -3514,7 +3529,7 @@ fn mrt_secondary_attachment_becomes_sampleable_resident() {
     });
     engine::reset_draw_counters();
     let before = engine::counter_snapshot();
-    engine::execute_draw_request(&consume).expect("bind MRT secondary as sampled resident");
+    engine::execute_draw_request_blocking(&consume).expect("bind MRT secondary as sampled resident");
     let delta = engine::counter_snapshot().delta_since(&before);
     assert_eq!(
         delta.sampled_gpu_binds, 1,
@@ -3559,7 +3574,7 @@ fn mrt_rg16float_secondary_builds_and_renders() {
         blend: None,
         color_write_mask: Default::default(),
     });
-    match engine::execute_draw_request(&mrt) {
+    match engine::execute_draw_request_blocking(&mrt) {
         Ok(o) => assert_fullscreen_fragment_color("mrt_rg16f_primary", &semantic_rgba(&o), 32, 32),
         Err(e) if skip_if_no_gpu(&e.to_string()) => {
             eprintln!("SKIP mrt_rg16float: {e}");
@@ -3635,7 +3650,7 @@ fn depth_and_mrt_secondary_render_in_one_pass() {
             load: false,
             stencil: None,
         });
-        match engine::execute_draw_request(&req) {
+        match engine::execute_draw_request_blocking(&req) {
             Ok(o) => Some((triangle_covered(&semantic_rgba(&o), w, h), secondary)),
             Err(e) if skip_if_no_gpu(&e.to_string()) => {
                 eprintln!("SKIP depth+mrt: {e}");
@@ -3676,7 +3691,7 @@ fn single_rt_draw_unaffected_by_mrt_path() {
     let mut req = engine_req(&v, &f, 16, 16);
     req.target_identity = Some(target.clone());
     assert!(req.secondary_targets.is_empty());
-    match engine::execute_draw_request(&req) {
+    match engine::execute_draw_request_blocking(&req) {
         Ok(o) => assert_fullscreen_fragment_color("single_rt_guard", &semantic_rgba(&o), 16, 16),
         Err(e) if skip_if_no_gpu(&e.to_string()) => {
             eprintln!("SKIP single_rt_guard: {e}");
@@ -3710,7 +3725,7 @@ fn framebuffer_fetch_reads_destination_via_input_attachment() {
     let f = translate_words("render_frag_fetch.air", Stage::Fragment);
     let (w, h) = (16u32, 16u32);
     let mut req = engine_req(&v, &f, w, h);
-    req.color_input = true;
+    req.color_inputs = 1;
     // Seed (64, 128, 191, 255) → expect ~(191, 127, 64, 255).
     req.target_rgba8 = Some(std::sync::Arc::new(
         [64, 128, 191, 255].repeat((w * h) as usize),
@@ -3802,7 +3817,7 @@ fn measure_draw_cost_against_pass_size() {
         let req = engine_req(&v, &f, w, h);
         let start = std::time::Instant::now();
         for _ in 0..RUNS {
-            engine::execute_draw_request(&req).expect("timed draw");
+            engine::execute_draw_request_blocking(&req).expect("timed draw");
         }
         let us = start.elapsed().as_micros() as f64 / f64::from(RUNS);
         let mb = f64::from(w) * f64::from(h) * 4.0 / 1e6;
@@ -3858,7 +3873,7 @@ fn resident_content_state_separates_an_absent_slot_from_an_unstamped_one() {
     };
     let mut make = engine_req(&v, &f, 16, 16);
     make.target_identity = Some(live.clone());
-    match engine::execute_draw_request(&make) {
+    match engine::execute_draw_request_blocking(&make) {
         Ok(_) => {}
         Err(e) if skip_if_no_gpu(&e.to_string()) => {
             eprintln!("SKIP resident_content_state: {e}");
@@ -3886,10 +3901,170 @@ fn resident_content_state_separates_an_absent_slot_from_an_unstamped_one() {
 
     // A second draw into the same target is what a window's flush must decline
     // on, and it must be reported as the cleared case rather than the absent one.
-    engine::execute_draw_request(&make).expect("second target draw");
+    engine::execute_draw_request_blocking(&make).expect("second target draw");
     assert_eq!(
         engine::resident_content_state(&live),
         ResidentContent::Unstamped,
         "a draw since the stamp clears it — the slot is still there"
     );
+}
+
+/// Multi-draw MRT + `color_inputs` (`dest_1` subpass fetch) across a pass-key
+/// transition (`color_inputs: 0 -> 0b10`) followed by an in-pass continuation
+/// (`color_inputs: 0b10 -> 0b10`) on a `448x192` `R16G16B16A16_SFLOAT`
+/// transient `TargetIdentity::Texture` secondary (the exact Notification Banner
+/// and Liquid Glass `WindowServer` / `RenderBox` shape).
+///
+/// Verifies three contracts on real GPU compression (NVIDIA DCC / tile memory):
+/// 1. Transitioning from an un-fetched MRT draw into a `color_fetched` MRT draw
+///    keeps `initialLayout == COLOR_ATTACHMENT_OPTIMAL` instead of emitting an
+///    outside-pass `GENERAL` barrier that disagrees with `VkRenderPass`.
+/// 2. Consecutive `color_fetched` MRT draws keep the `VkRenderPass` open
+///    (`render_pass_continuations` increments) and order `OpImageRead` via the
+///    intra-subpass `BY_REGION` barrier.
+/// 3. Ending the encoder (`render_pass_continues = false`) discards transient
+///    `TargetIdentity::Texture` content (`!resident_content_ready`) so the next
+///    encoder cannot inherit stale scratch pixels.
+#[test]
+fn mrt_color_input_secondary_preserves_dcc_continues_pass_and_discards_transient() {
+    const MRT_INIT_FRAG: &[u32] = &[
+        0x07230203, 0x00010300, 0x00070000, 0x0000000f, 0x00000000, 0x00020011, 0x00000001,
+        0x0003000e, 0x00000000, 0x00000001, 0x0007000f, 0x00000004, 0x00000001, 0x6e69616d,
+        0x00000000, 0x00000002, 0x00000003, 0x00030010, 0x00000001, 0x00000007, 0x00040047,
+        0x00000002, 0x0000001e, 0x00000000, 0x00040047, 0x00000003, 0x0000001e, 0x00000001,
+        0x00020013, 0x00000004, 0x00030021, 0x00000005, 0x00000004, 0x00030016, 0x00000006,
+        0x00000020, 0x00040017, 0x00000007, 0x00000006, 0x00000004, 0x00040020, 0x00000008,
+        0x00000003, 0x00000007, 0x0004003b, 0x00000008, 0x00000002, 0x00000003, 0x0004003b,
+        0x00000008, 0x00000003, 0x00000003, 0x0004002b, 0x00000006, 0x00000009, 0x3e800000,
+        0x0004002b, 0x00000006, 0x0000000a, 0x3f000000, 0x0004002b, 0x00000006, 0x0000000b,
+        0x3f400000, 0x0004002b, 0x00000006, 0x0000000c, 0x3f800000, 0x0007002c, 0x00000007,
+        0x0000000d, 0x00000009, 0x0000000a, 0x0000000b, 0x0000000c, 0x00050036, 0x00000004,
+        0x00000001, 0x00000000, 0x00000005, 0x000200f8, 0x0000000e, 0x0003003e, 0x00000002,
+        0x0000000d, 0x0003003e, 0x00000003, 0x0000000d, 0x000100fd, 0x00010038,
+    ];
+    const MRT_ACCUM_FRAG: &[u32] = &[
+        0x07230203, 0x00010300, 0x00070000, 0x00000017, 0x00000000, 0x00020011, 0x00000001,
+        0x00020011, 0x00000028, 0x0003000e, 0x00000000, 0x00000001, 0x0007000f, 0x00000004,
+        0x00000001, 0x6e69616d, 0x00000000, 0x00000002, 0x00000003, 0x00030010, 0x00000001,
+        0x00000007, 0x00040047, 0x00000004, 0x00000022, 0x00000000, 0x00040047, 0x00000004,
+        0x00000021, 0x000000c1, 0x00040047, 0x00000004, 0x0000002b, 0x00000001, 0x00040047,
+        0x00000002, 0x0000001e, 0x00000000, 0x00040047, 0x00000003, 0x0000001e, 0x00000001,
+        0x00020013, 0x00000005, 0x00030021, 0x00000006, 0x00000005, 0x00030016, 0x00000007,
+        0x00000020, 0x00040015, 0x00000008, 0x00000020, 0x00000001, 0x00040017, 0x00000009,
+        0x00000007, 0x00000004, 0x00040017, 0x0000000a, 0x00000008, 0x00000002, 0x00090019,
+        0x0000000b, 0x00000007, 0x00000006, 0x00000000, 0x00000000, 0x00000000, 0x00000002,
+        0x00000000, 0x00040020, 0x0000000c, 0x00000000, 0x0000000b, 0x00040020, 0x0000000d,
+        0x00000003, 0x00000009, 0x0004003b, 0x0000000c, 0x00000004, 0x00000000, 0x0004003b,
+        0x0000000d, 0x00000002, 0x00000003, 0x0004003b, 0x0000000d, 0x00000003, 0x00000003,
+        0x0004002b, 0x00000008, 0x0000000e, 0x00000000, 0x0005002c, 0x0000000a, 0x0000000f,
+        0x0000000e, 0x0000000e, 0x0004002b, 0x00000007, 0x00000010, 0x3e800000, 0x0004002b,
+        0x00000007, 0x00000011, 0x00000000, 0x0007002c, 0x00000009, 0x00000012, 0x00000010,
+        0x00000011, 0x00000011, 0x00000011, 0x00050036, 0x00000005, 0x00000001, 0x00000000,
+        0x00000006, 0x000200f8, 0x00000013, 0x0004003d, 0x0000000b, 0x00000014, 0x00000004,
+        0x00050062, 0x00000009, 0x00000015, 0x00000014, 0x0000000f, 0x00050081, 0x00000009,
+        0x00000016, 0x00000015, 0x00000012, 0x0003003e, 0x00000002, 0x00000016, 0x0003003e,
+        0x00000003, 0x00000016, 0x000100fd, 0x00010038,
+    ];
+
+    let _g = engine_test_session();
+    let (v, _) = triangle_spirv();
+    let (w, h) = (448u32, 192u32);
+    let primary = TargetIdentity::Surface {
+        id: 0x9B01,
+        width: w,
+        height: h,
+        generation: 1,
+        format: SURFACE_TEST_FORMAT,
+    };
+    let secondary = TargetIdentity::Texture {
+        ref_: 246,
+        width: w,
+        height: h,
+        generation: 7,
+        stencil: false,
+    };
+
+    // Draw 0: color_inputs == 0, clears & writes (0.25, 0.50, 0.75, 1.0) into s0 & s1.
+    let mut draw0 = engine_req(&v, MRT_INIT_FRAG, w, h);
+    draw0.target_identity = Some(primary.clone());
+    draw0.skip_readback = true;
+    draw0.render_pass_continues = true;
+    draw0.secondary_targets.push(SecondaryColorTarget {
+        identity: secondary.clone(),
+        width: w,
+        height: h,
+        format: ash::vk::Format::R16G16B16A16_SFLOAT,
+        clear: [0.0, 0.0, 0.0, 0.0],
+        load: false,
+        blend: None,
+        color_write_mask: Default::default(),
+    });
+    match engine::execute_draw_request_blocking(&draw0) {
+        Ok(_) => {}
+        Err(e) if skip_if_no_gpu(&e.to_string()) => {
+            eprintln!("SKIP mrt_color_input_secondary: {e}");
+            return;
+        }
+        Err(e) => panic!("draw0 failed: {e}"),
+    }
+    assert!(
+        engine::resident_content_ready(&secondary),
+        "intra-encoder secondary must stay content_ready while render_pass_continues is true"
+    );
+
+    // Draw 1: color_inputs == 0b10 (slot 1), loads s1 -> writes (0.50, 0.50, 0.75, 1.0).
+    let mut draw1 = engine_req(&v, MRT_ACCUM_FRAG, w, h);
+    draw1.target_identity = Some(primary.clone());
+    draw1.load_from_target = true;
+    draw1.color_inputs = 0b10;
+    draw1.continues_render_pass = true;
+    draw1.render_pass_continues = true;
+    draw1.skip_readback = true;
+    draw1.secondary_targets.push(SecondaryColorTarget {
+        identity: secondary.clone(),
+        width: w,
+        height: h,
+        format: ash::vk::Format::R16G16B16A16_SFLOAT,
+        clear: [0.0, 0.0, 0.0, 0.0],
+        load: true,
+        blend: None,
+        color_write_mask: Default::default(),
+    });
+    engine::execute_draw_request_blocking(&draw1).expect("draw1 failed");
+
+    // Draw 2: same pass compatibility (color_inputs == 0b10), reads (0.50, 0.50, 0.75, 1.0),
+    // outputs (0.75, 0.50, 0.75, 1.0) without corrupting DCC compression, and discards
+    // transient Texture content_ready at encoder end.
+    let mut draw2 = engine_req(&v, MRT_ACCUM_FRAG, w, h);
+    draw2.target_identity = Some(primary.clone());
+    draw2.load_from_target = true;
+    draw2.color_inputs = 0b10;
+    draw2.continues_render_pass = true;
+    draw2.render_pass_continues = false;
+    draw2.skip_readback = false;
+    draw2.secondary_targets.push(SecondaryColorTarget {
+        identity: secondary.clone(),
+        width: w,
+        height: h,
+        format: ash::vk::Format::R16G16B16A16_SFLOAT,
+        clear: [0.0, 0.0, 0.0, 0.0],
+        load: true,
+        blend: None,
+        color_write_mask: Default::default(),
+    });
+    let out = engine::execute_draw_request_blocking(&draw2).expect("draw2 failed");
+    assert!(
+        !engine::resident_content_ready(&secondary),
+        "transient Texture secondary must discard content_ready when encoder ends"
+    );
+
+    let px = semantic_rgba(&out);
+    assert_eq!(px.len(), (w * h * 4) as usize, "readback size");
+    for p in 0..(w * h) as usize {
+        let (r, g, b, a) = (px[p * 4], px[p * 4 + 1], px[p * 4 + 2], px[p * 4 + 3]);
+        assert!(
+            near(r, 191) && near(g, 128) && near(b, 191) && near(a, 255),
+            "pixel {p} RGBA=({r},{g},{b},{a}); expected ~(191,128,191,255)"
+        );
+    }
 }

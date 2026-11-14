@@ -332,6 +332,32 @@ fn decode_texture_view_hop_reasoned<M: HostMemory + HostOps>(
     Ok((view.base_texture_ref, level, swizzle, pixel_format))
 }
 
+/// Whether a type-8 object is a texture of its own, buffer-backed (opcode 9 or
+/// its wide form) or placed in a heap, rather than a view. Those share the
+/// tag, and end a view chain as its base.
+fn is_own_texture<M: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    texture_ref: u32,
+) -> bool {
+    use crate::runtime::decode::resource::{
+        texture_type8_opcode, HEAP_TEXTURE_OPCODE, HEAP_TEXTURE_WIDE_OPCODE,
+        TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE, TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE_WIDE,
+    };
+    objects::resolve_resource(state, host, task_id, texture_ref)
+        .ok()
+        .is_some_and(|resource| {
+            matches!(
+                texture_type8_opcode(&resource.descriptor),
+                Some(TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE)
+                    | Some(TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE_WIDE)
+                    | Some(HEAP_TEXTURE_OPCODE)
+                    | Some(HEAP_TEXTURE_WIDE_OPCODE)
+            )
+        })
+}
+
 /// Resolve type-8 view to non-view base + mip + format override + swizzle.
 ///
 /// The `Result` carries a specific failure slug (`reason=view_resolve` sub-case)
@@ -359,7 +385,9 @@ pub(crate) fn resolve_texture_view_reasoned<M: HostMemory + HostOps>(
             // visibly (same as a one-hop miss on an unmapped base).
             break;
         };
-        if entry.object_type != OBJECT_TYPE_TEXTURE_VIEW {
+        if entry.object_type != OBJECT_TYPE_TEXTURE_VIEW
+            || is_own_texture(state, host, task_id, base)
+        {
             break;
         }
         depth += 1;
@@ -372,7 +400,9 @@ pub(crate) fn resolve_texture_view_reasoned<M: HostMemory + HostOps>(
 
     // Final base must not still be a type-8 view past the chain cap.
     if let Some(entry) = objects::lookup_list_entry(state, host, task_id, base) {
-        if entry.object_type == OBJECT_TYPE_TEXTURE_VIEW {
+        if entry.object_type == OBJECT_TYPE_TEXTURE_VIEW
+            && !is_own_texture(state, host, task_id, base)
+        {
             return Err(TextureViewDecline::ChainOverflow { base, depth });
         }
     }
@@ -391,7 +421,7 @@ pub(crate) fn resolve_texture_view_reasoned<M: HostMemory + HostOps>(
 /// the chain exceeds the max depth without a non-view base, a base ref is zero,
 /// or swizzle selectors are malformed. See [`resolve_texture_view_reasoned`] for
 /// the specific reason on the fail path.
-pub(super) fn resolve_texture_view<M: HostMemory + HostOps>(
+pub(crate) fn resolve_texture_view<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &M,
     task_id: u32,
@@ -667,6 +697,15 @@ pub(crate) struct NativeUploads {
     /// `f16_to_unorm8_lut`, which clamps to `[0, 1]` and quantizes to 256
     /// levels; see [`pixel_format::TexelLayout::cpu_loader_arm_is_lossy`].
     pub float16: bool,
+    /// Upload guest packed ten-bit colour (`RGB10A2Unorm`, `BGR10A2Unorm`) as
+    /// the identical `A2B10G10R10` / `A2R10G10B10` `_UNORM_PACK32` word. The
+    /// only exact path, for `float16`'s reason: the CPU arm keeps eight of each
+    /// channel's ten bits.
+    pub ten_bit: bool,
+    /// Upload guest 16-bit normalized colour (`RGBA16Unorm`) natively.
+    pub unorm16: bool,
+    /// Upload guest integer and float32 layouts (`Rg16Uint`, `Rg32Float`, `R32Float`) natively.
+    pub integer_and_float32: bool,
 }
 
 impl NativeUploads {
@@ -675,6 +714,9 @@ impl NativeUploads {
     pub const NONE: Self = Self {
         bgra8: false,
         float16: false,
+        ten_bit: false,
+        unorm16: false,
+        integer_and_float32: false,
     };
 
     /// Native BGRA8 only — the answer this parameter carried when it was a
@@ -689,6 +731,9 @@ impl NativeUploads {
     pub const BGRA8: Self = Self {
         bgra8: true,
         float16: false,
+        ten_bit: false,
+        unorm16: false,
+        integer_and_float32: false,
     };
 
     /// Every native layout the loaders can produce.
@@ -701,6 +746,9 @@ impl NativeUploads {
     pub const ALL: Self = Self {
         bgra8: true,
         float16: true,
+        ten_bit: true,
+        unorm16: true,
+        integer_and_float32: true,
     };
 }
 
@@ -730,6 +778,13 @@ pub(crate) fn linear_native_upload_format(
         SampledClass::Bgra8Unorm if native.bgra8 => TexelLayout::Bgra8,
         SampledClass::Rgba16Float if native.float16 => TexelLayout::Rgba16Float,
         SampledClass::Rg16Float if native.float16 => TexelLayout::Rg16Float,
+        SampledClass::R16Float if native.float16 => TexelLayout::R16Float,
+        SampledClass::Rgba16Unorm if native.unorm16 => TexelLayout::Rgba16Unorm,
+        SampledClass::Rg16Uint if native.integer_and_float32 => TexelLayout::Rg16Uint,
+        SampledClass::Rg32Float if native.integer_and_float32 => TexelLayout::Rg32Float,
+        SampledClass::R32Float if native.integer_and_float32 => TexelLayout::R32Float,
+        SampledClass::Rgb10a2Unorm if native.ten_bit => TexelLayout::Rgb10a2Unorm,
+        SampledClass::Bgr10a2Unorm if native.ten_bit => TexelLayout::Bgr10a2Unorm,
         _ => return None,
     })
 }
@@ -824,6 +879,122 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
     crate::runtime::writeback_debt::settle_for_texture(
         state, host, task_id, texture_ref, gva, span, site,
     );
+    if pixel_format::is_xr10(sample_fmt) {
+        let alpha_plane = (level == 0 && pixel_format::is_two_plane_xr10(sample_fmt))
+            .then(|| tex.alpha_plane_gva(state.page_shift))
+            .flatten();
+        if let Some((alpha_gva, alpha_layout)) = alpha_plane {
+            if alpha_gva == 0
+                || alpha_layout.width != w
+                || alpha_layout.height != h
+                || alpha_layout.planes() != planes
+                || alpha_layout.row_stride > u64::from(u32::MAX)
+            {
+                return Err(R::SizeOverflow);
+            }
+            if alpha_layout.row_stride < u64::from(w) {
+                return Err(R::RowStrideBelowTight {
+                    stride: alpha_layout.row_stride,
+                    tight: w,
+                });
+            }
+            let alpha_span = alpha_layout.slice_read_span(w).ok_or(R::SizeOverflow)?;
+            let alpha_end = alpha_layout.offset.saturating_add(alpha_span);
+            if tex.allocation_size != 0 && alpha_end > tex.allocation_size {
+                return Err(R::SpanExceedsAllocation {
+                    end: alpha_end,
+                    allocation: tex.allocation_size,
+                });
+            }
+            crate::runtime::writeback_debt::settle_for_texture(
+                state,
+                host,
+                task_id,
+                texture_ref,
+                alpha_gva,
+                alpha_span,
+                site,
+            );
+        }
+        let (out_layout, out_bpp) = if native.float16 {
+            (TexelLayout::Rgba16Float, pixel_format::RGBA16F_BPP as usize)
+        } else {
+            (TexelLayout::Rgba8, RGBA8_BPP as usize)
+        };
+        let rows = (h as usize)
+            .checked_mul(planes as usize)
+            .ok_or(R::SizeOverflow)?;
+        let out_row = (w as usize).checked_mul(out_bpp).ok_or(R::SizeOverflow)?;
+        let out_len = out_row.checked_mul(rows).ok_or(R::SizeOverflow)?;
+        let mut out = vec![0u8; out_len];
+        let mut row_p0 = vec![0u8; tight as usize];
+        let mut row_p1 = alpha_plane.map(|_| vec![0u8; w as usize]);
+        for row_index in 0..rows {
+            let p0_gva = (row_index as u64)
+                .checked_mul(bpr)
+                .and_then(|off| gva.checked_add(off))
+                .ok_or(R::SizeOverflow)?;
+            gva_mem::read_task_gva_by_id(
+                host,
+                &state.tasks,
+                task_id,
+                p0_gva,
+                &mut row_p0,
+                state.page_shift,
+            )
+            .map_err(|_| {
+                if bpr_u32 == tight {
+                    R::TightImageUnreadable
+                } else {
+                    R::PaddedRowUnreadable {
+                        row: u32::try_from(row_index).unwrap_or(u32::MAX),
+                    }
+                }
+            })?;
+            if let (Some((alpha_gva, alpha_layout)), Some(p1)) =
+                (alpha_plane, row_p1.as_deref_mut())
+            {
+                let p1_gva = (row_index as u64)
+                    .checked_mul(alpha_layout.row_stride)
+                    .and_then(|off| alpha_gva.checked_add(off))
+                    .ok_or(R::SizeOverflow)?;
+                gva_mem::read_task_gva_by_id(
+                    host,
+                    &state.tasks,
+                    task_id,
+                    p1_gva,
+                    p1,
+                    state.page_shift,
+                )
+                .map_err(|_| R::PaddedRowUnreadable {
+                    row: u32::try_from(row_index).unwrap_or(u32::MAX),
+                })?;
+            }
+            let dst = &mut out[row_index * out_row..(row_index + 1) * out_row];
+            let ok = if native.float16 {
+                pixel_format::decode_xr10_row_to_rgba16f(
+                    sample_fmt,
+                    w,
+                    &row_p0,
+                    row_p1.as_deref(),
+                    dst,
+                )
+            } else {
+                crate::runtime::draw::note_sampled_narrowing(site.route(), 0, sample_fmt, w, h);
+                pixel_format::decode_xr10_row_to_rgba8(
+                    sample_fmt,
+                    w,
+                    &row_p0,
+                    row_p1.as_deref(),
+                    dst,
+                )
+            };
+            if !ok {
+                return Err(R::RowConvertUnsupported { format: sample_fmt });
+            }
+        }
+        return Ok((out, SampledByteFormat::from_source(out_layout, sample_fmt)));
+    }
     // Tight display textures are the common compositor source. Read the whole
     // image with one task-root/cache lifetime: the row loop below otherwise
     // rebuilds the GVA walker cache once per row (1,080 times for the live

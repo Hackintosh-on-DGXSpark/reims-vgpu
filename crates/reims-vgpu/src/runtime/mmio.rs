@@ -140,7 +140,13 @@ pub fn gfx_write<H: HostMemory + HostOps>(
                 .interrupt_status_gpu
                 .fetch_and(!val, std::sync::atomic::Ordering::AcqRel);
         }
-        GFX_REG_ROOT_PAGE => state.gfx.root_page = val,
+        GFX_REG_ROOT_PAGE => {
+            state.gfx.root_page = val;
+            state
+                .gfx
+                .root_page_live
+                .store(val, std::sync::atomic::Ordering::Release);
+        }
         GFX_REG_CHILD_DOORBELL | GFX_REG_CHILD_REPLAY_DOORBELL => {
             if crate::model::accept_child_channel(val, "mmio_child_doorbell") {
                 state.active_child_mask |= 1u32 << val;
@@ -174,6 +180,12 @@ pub fn gfx_write<H: HostMemory + HostOps>(
                 ));
             }
             state.gfx.version = negotiated;
+            // `device_gfx_write` has already published it for a write from a
+            // vCPU; this covers every other writer.
+            state
+                .gfx
+                .version_live
+                .store(negotiated, std::sync::atomic::Ordering::Release);
             // Take the guest-RAM import here rather than letting the first
             // gather take it. This handshake is the guest driver's first act
             // and its display pipe does not exist yet, so the seconds the
@@ -240,16 +252,11 @@ pub fn gfx_write<H: HostMemory + HostOps>(
     }
 }
 
-/// Iosfc MMIO read.
-pub fn iosfc_read(state: &DeviceState, offset: u64, size: u32) -> u64 {
-    let mut val = match offset {
-        IOSFC_REG_RING_BASE => state.iosfc.ring_base,
-        IOSFC_REG_CAPACITY => state.iosfc.capacity as u64,
-        IOSFC_REG_DESC_TABLE => state.iosfc.desc_table,
-        IOSFC_REG_PRODUCER => state.iosfc.producer as u64,
-        IOSFC_REG_CONSUMER => state.iosfc.consumer as u64,
-        _ => 0,
-    };
+/// Iosfc MMIO read, from the lock-free copy every writer publishes: all five
+/// registers are plain state with no read side effect, and a vCPU reading one
+/// must not wait for the device lock. See [`crate::model::IosfcLive`].
+pub fn iosfc_read(live: &crate::model::IosfcLive, offset: u64, size: u32) -> u64 {
+    let mut val = live.register(offset);
     if size < MMIO_U64 && size > 0 {
         let bits = (size as u64).saturating_mul(8).min(64);
         if bits < 64 {
@@ -279,6 +286,9 @@ pub fn iosfc_write<H: HostMemory + HostOps>(
             let producer = data as u32;
             state.iosfc.producer = producer;
             if state.iosfc.consumer != producer {
+                // The kernel translation root, on the vCPU and before anything
+                // below reads a kernel address. See `runtime::kernel_walk`.
+                crate::runtime::kernel_walk::capture(&mut state.kernel_walk, host);
                 // Capture MappingInternal* while x19/x21/x22 still hold the
                 // publishing vCPU's directed handoff.
                 if let Some(cap) = mapper::capture_at_producer(state, host, producer) {
@@ -295,6 +305,9 @@ pub fn iosfc_write<H: HostMemory + HostOps>(
         IOSFC_REG_CONSUMER => state.iosfc.consumer = data as u32,
         _ => {}
     }
+    // Before the write returns, so the vCPU's next read sees it. A producer
+    // write that drained has published already, before its interrupt.
+    state.iosfc.publish();
 }
 
 #[cfg(test)]
@@ -313,5 +326,78 @@ mod tests {
         assert_ne!(state.pending.child_mask & (1 << 4), 0);
         assert_ne!(state.active_child_mask & (1 << 4), 0);
         assert!(host.bh_scheduled);
+    }
+
+    /// Notes what the guest would read from the consumer register, with no
+    /// lock, at the moment the mapper interrupt is queued.
+    struct ConsumerAtIrq {
+        live: std::sync::Arc<crate::model::IosfcLive>,
+        seen: Vec<u64>,
+    }
+
+    impl HostMemory for ConsumerAtIrq {
+        fn read_gpa(
+            &self,
+            _gpa: u64,
+            _buf: &mut [u8],
+        ) -> Result<(), crate::runtime::host::MemError> {
+            Err(crate::runtime::host::MemError::Unmapped)
+        }
+        fn write_gpa(
+            &mut self,
+            _gpa: u64,
+            _buf: &[u8],
+        ) -> Result<(), crate::runtime::host::MemError> {
+            Err(crate::runtime::host::MemError::Unmapped)
+        }
+    }
+
+    impl HostOps for ConsumerAtIrq {
+        fn mono_ns(&self) -> u64 {
+            0
+        }
+        fn enqueue(&mut self, action: HostAction) {
+            if action == HostAction::irq_iosfc() {
+                self.seen.push(self.live.register(IOSFC_REG_CONSUMER));
+            }
+        }
+        fn schedule_bh(&mut self) {}
+    }
+
+    /// The guest's mapper interrupt handler reads the consumer register
+    /// without the device lock, so the consumer must be published before the
+    /// interrupt is queued, not after the write returns.
+    #[test]
+    fn the_consumer_is_published_before_the_mapper_interrupt() {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = ConsumerAtIrq {
+            live: std::sync::Arc::clone(&state.iosfc.live),
+            seen: Vec::new(),
+        };
+        // No ring base: the producer write catches the consumer up, the boot
+        // handshake, and raises the interrupt.
+        iosfc_write(&mut state, &mut host, IOSFC_REG_PRODUCER, 7, MMIO_U32);
+        assert_eq!(host.seen, vec![7]);
+        assert_eq!(
+            iosfc_read(&state.iosfc.live, IOSFC_REG_PRODUCER, MMIO_U32),
+            7
+        );
+
+        iosfc_write(
+            &mut state,
+            &mut host,
+            IOSFC_REG_RING_BASE,
+            0x1_7000_0000,
+            MMIO_U64,
+        );
+        assert_eq!(
+            iosfc_read(&state.iosfc.live, IOSFC_REG_RING_BASE, MMIO_U32),
+            0x7000_0000,
+            "a 4-byte read keeps the low half"
+        );
+        assert_eq!(
+            iosfc_read(&state.iosfc.live, IOSFC_REG_RING_BASE, MMIO_U64),
+            0x1_7000_0000
+        );
     }
 }

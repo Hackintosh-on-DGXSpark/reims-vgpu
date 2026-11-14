@@ -91,8 +91,9 @@ pub enum TranslateReason {
     /// understood, this rail just does not carry it.
     NoSampledLayout(u16),
     /// The format is defined by the contract but is not one the engine can use
-    /// as a colour attachment. Distinct from [`Self::UnknownPixelFormat`] for
-    /// the same reason.
+    /// as a colour attachment: outside the renderable set, or inside it with a
+    /// Vulkan format the host published no colour-attachment support for.
+    /// Distinct from [`Self::UnknownPixelFormat`] for the same reason.
     NoColorAttachmentFormat(u16),
     /// The format is defined by the contract but the compute rail carries no
     /// storage-image layout for it. Same shape as [`Self::NoSampledLayout`]:

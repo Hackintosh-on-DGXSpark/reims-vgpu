@@ -48,6 +48,7 @@
 
 use crate::model::{DeviceState, ResourceValidity};
 use crate::runtime::decode::fifo::InvalidateValidityOps;
+use crate::runtime::host::{HostMemory, HostOps};
 
 /// Which producer delivered a quad. Only used to name the counters, so an arm
 /// can tell an exec-table statement from an invalidate-command one.
@@ -73,6 +74,43 @@ pub struct ValidityOutcome {
     pub bumped: u32,
     /// The record named no mapping this device holds.
     pub missed: bool,
+    /// The record cleared the guest's copy (byte +6): the guest is about to
+    /// read this object's pages, so any frame this device owes them must land
+    /// first.
+    pub guest_read_requested: bool,
+}
+
+/// Land every frame this device owes `object_id`'s guest pages, because the
+/// guest has said it is about to read them.
+pub fn deliver_for_guest_read<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    object_id: u32,
+) {
+    let owed_gva =
+        state
+            .pending_writebacks
+            .has_gva(crate::runtime::writeback_debt::GvaResourceKey {
+                task_id,
+                texture_ref: object_id,
+            });
+    let mappings: Vec<u32> = state
+        .mappings_named_by(task_id, object_id)
+        .iter()
+        .filter(|&id| state.pending_writebacks.get(id).is_some())
+        .collect();
+    if !owed_gva && mappings.is_empty() {
+        return;
+    }
+    crate::runtime::writeback_debt::pay_for_texture(state, host, task_id, object_id);
+    for mapping_id in mappings {
+        crate::runtime::writeback_debt::pay_for_mapping(state, host, mapping_id);
+    }
+    crate::runtime::render_writeback::settle_guest_writes(
+        crate::runtime::render_writeback::SettleSite::GuestReadRequest,
+    );
+    crate::runtime::drain::note_store_route("validity_guest_read_delivered");
 }
 
 /// Apply one record's quad to whatever mapping state the object id names.
@@ -127,6 +165,9 @@ pub fn apply(
         m.validity = next_validity(m.validity, ops);
     }
     out.missed = !hit;
+    if ops.clear_guest_valid != 0 {
+        out.guest_read_requested = true;
+    }
     if ops.clear_host_valid != 0 {
         // The statement this device used to decode and drop. A buffer has no
         // mapping, so the loop above skipped it and the guest's account of its

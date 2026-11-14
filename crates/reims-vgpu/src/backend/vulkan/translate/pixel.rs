@@ -89,6 +89,18 @@ const ALPHA_IN_RED: SwizzlePlan = SwizzlePlan {
     ],
 };
 
+/// 3-channel `BGR10_XR` / `BGR10_XR_sRGB` carry no alpha bits on the wire and
+/// sample `.a = 1.0` in Metal even when rendered into an `R16G16B16A16_SFLOAT`
+/// attachment whose shader write mask or fragment output left `.a` at `0.0`.
+const OPAQUE_ALPHA: SwizzlePlan = SwizzlePlan {
+    source: [
+        SwizzleSource::R,
+        SwizzleSource::G,
+        SwizzleSource::B,
+        SwizzleSource::One,
+    ],
+};
+
 fn linear(vk: vk::Format, bytes_per_texel: u32) -> PixelFormat {
     PixelFormat {
         vk,
@@ -132,10 +144,12 @@ pub fn translate(mtl: u16) -> Result<PixelFormat, TranslateReason> {
         p::MTL_FORMAT_RG8_UNORM => linear(vk::Format::R8G8_UNORM, 2),
         p::MTL_FORMAT_RG8_UINT => linear(vk::Format::R8G8_UINT, 2),
         p::MTL_FORMAT_RG16_UNORM => linear(vk::Format::R16G16_UNORM, 4),
+        p::MTL_FORMAT_RG16_UINT => linear(vk::Format::R16G16_UINT, 4),
         p::MTL_FORMAT_R32_UINT => linear(vk::Format::R32_UINT, 4),
         p::MTL_FORMAT_R32_SINT => linear(vk::Format::R32_SINT, 4),
         p::MTL_FORMAT_R32_FLOAT => linear(vk::Format::R32_SFLOAT, 4),
         p::MTL_FORMAT_RG16_FLOAT => linear(vk::Format::R16G16_SFLOAT, 4),
+        p::MTL_FORMAT_RG32_FLOAT => linear(vk::Format::R32G32_SFLOAT, 8),
         p::MTL_FORMAT_RGBA8_UNORM => linear(vk::Format::R8G8B8A8_UNORM, 4),
         p::MTL_FORMAT_RGBA8_UNORM_SRGB => {
             srgb(vk::Format::R8G8B8A8_SRGB, vk::Format::R8G8B8A8_UNORM, 4)
@@ -162,6 +176,16 @@ pub fn translate(mtl: u16) -> Result<PixelFormat, TranslateReason> {
         p::MTL_FORMAT_RGBA16_UNORM => linear(vk::Format::R16G16B16A16_UNORM, 8),
         p::MTL_FORMAT_RGBA16_UINT => linear(vk::Format::R16G16B16A16_UINT, 8),
         p::MTL_FORMAT_RGBA16_FLOAT => linear(vk::Format::R16G16B16A16_SFLOAT, 8),
+        p::MTL_FORMAT_RGB10A8_2P_XR10 | p::MTL_FORMAT_RGB10A8_2P_XR10_SRGB => {
+            linear(vk::Format::R16G16B16A16_SFLOAT, 4)
+        }
+        p::MTL_FORMAT_BGR10_XR | p::MTL_FORMAT_BGR10_XR_SRGB => PixelFormat {
+            components: OPAQUE_ALPHA,
+            ..linear(vk::Format::R16G16B16A16_SFLOAT, 4)
+        },
+        p::MTL_FORMAT_BGRA10_XR | p::MTL_FORMAT_BGRA10_XR_SRGB => {
+            linear(vk::Format::R16G16B16A16_SFLOAT, 8)
+        }
         p::MTL_FORMAT_RGBA32_UINT => linear(vk::Format::R32G32B32A32_UINT, 16),
         p::MTL_FORMAT_RGBA32_FLOAT => linear(vk::Format::R32G32B32A32_SFLOAT, 16),
         p::MTL_FORMAT_DEPTH16_UNORM => linear(vk::Format::D16_UNORM, 2),
@@ -213,6 +237,13 @@ pub fn sampled_pixels(
     mtl: u16,
 ) -> Result<(TexelLayout, Option<TranslateReason>, SwizzlePlan), TranslateReason> {
     let f = translate(mtl)?;
+    // XR10 guest memory stores 10-bit fixed-point (plus a separate Plane 1 alpha
+    // on 550/551), never raw IEEE binary16 texels; decline raw guest-RAM import
+    // so sampled loads decode into `Rgba16Float` on the CPU upload rail while
+    // GPU-resident targets still sample `R16G16B16A16_SFLOAT` directly.
+    if pixel_format::is_xr10(mtl) {
+        return Err(TranslateReason::NoSampledLayout(mtl));
+    }
     // A format whose Metal channels do not sit identically on its Vulkan
     // channels needs a component mapping on the view to sample correctly.
     let layout = match f.linear_vk {
@@ -234,6 +265,8 @@ pub fn sampled_pixels(
         // with mandatory linear filtering, so neither needs a capability gate.
         vk::Format::R16_UNORM => TexelLayout::R16Unorm,
         vk::Format::R16G16_UNORM => TexelLayout::Rg16Unorm,
+        vk::Format::R16G16_UINT => TexelLayout::Rg16Uint,
+        vk::Format::R32G32_SFLOAT => TexelLayout::Rg32Float,
         // The half-float colour layouts. A recent macOS window server
         // composites in `MTLPixelFormatRGBA16Float`, and every such bind used to
         // land on the CPU re-read rung and be quantized to unorm8 on the way in
@@ -283,6 +316,8 @@ pub fn vk_texel_layout(layout: TexelLayout) -> vk::Format {
         TexelLayout::R32Float => vk::Format::R32_SFLOAT,
         TexelLayout::R16Unorm => vk::Format::R16_UNORM,
         TexelLayout::Rg16Unorm => vk::Format::R16G16_UNORM,
+        TexelLayout::Rg16Uint => vk::Format::R16G16_UINT,
+        TexelLayout::Rg32Float => vk::Format::R32G32_SFLOAT,
         TexelLayout::Rgba16Unorm => vk::Format::R16G16B16A16_UNORM,
         TexelLayout::Rgba16Float => vk::Format::R16G16B16A16_SFLOAT,
         TexelLayout::Rg16Float => vk::Format::R16G16_SFLOAT,
@@ -592,6 +627,7 @@ pub fn storage_image_from_selector(selector: StorageImageSelector) -> StorageIma
         S::Rg8Unorm => StorageImageFormat::Rg8Unorm,
         S::Rgba32Uint => StorageImageFormat::Rgba32Uint,
         S::R32Uint => StorageImageFormat::R32Uint,
+        S::Rgba16Unorm => StorageImageFormat::Rgba16Unorm,
     }
 }
 
@@ -1034,8 +1070,10 @@ mod tests {
     fn a_texture_the_graphics_rail_samples_is_not_refused_by_the_compute_one() {
         const EXCEPTIONS: &[(u16, &str)] = &[
             (p::MTL_FORMAT_A8_UNORM, "needs a component mapping"),
+            (p::MTL_FORMAT_RG16_UINT, "integer: no compute storage selector yet"),
             (p::MTL_FORMAT_RGBA8_UNORM_SRGB, "would downgrade unrecorded"),
             (p::MTL_FORMAT_BGRA8_UNORM_SRGB, "would downgrade unrecorded"),
+            (p::MTL_FORMAT_RG32_FLOAT, "no compute storage selector yet"),
         ];
 
         let mut refused = Vec::new();
@@ -1072,12 +1110,9 @@ mod tests {
 
         // Sampled-only means sampled-only: none of the members this rail adds
         // over the storage one may be reached as a storage image, because Vulkan
-        // mandates none of them for `STORAGE_IMAGE`.
-        for mtl in [
-            p::MTL_FORMAT_R16_UNORM,
-            p::MTL_FORMAT_RG16_UNORM,
-            p::MTL_FORMAT_RGBA16_UNORM,
-        ] {
+        // mandates none of them for `STORAGE_IMAGE`. RGBA16Unorm is the
+        // exception macOS 26 asked for; it is an extended storage format.
+        for mtl in [p::MTL_FORMAT_R16_UNORM, p::MTL_FORMAT_RG16_UNORM] {
             assert!(
                 storage_image(mtl).is_err(),
                 "{mtl:#x} is sampled-only and must not be admitted as a storage image"
@@ -1113,6 +1148,18 @@ mod tests {
     /// derived from the table under test, so a mistranslation shows up as a
     /// diff instead of agreeing with itself.
     const EXPECTED: &[(u16, vk::Format, u32, TransferFunction)] = &[
+        (
+            p::MTL_FORMAT_RG16_UINT,
+            vk::Format::R16G16_UINT,
+            4,
+            TransferFunction::Linear,
+        ),
+        (
+            p::MTL_FORMAT_RG32_FLOAT,
+            vk::Format::R32G32_SFLOAT,
+            8,
+            TransferFunction::Linear,
+        ),
         (
             p::MTL_FORMAT_A8_UNORM,
             vk::Format::R8_UNORM,
@@ -1314,6 +1361,42 @@ mod tests {
         (
             p::MTL_FORMAT_X24_STENCIL8,
             vk::Format::D24_UNORM_S8_UINT,
+            4,
+            TransferFunction::Linear,
+        ),
+        (
+            p::MTL_FORMAT_RGB10A8_2P_XR10,
+            vk::Format::R16G16B16A16_SFLOAT,
+            4,
+            TransferFunction::Linear,
+        ),
+        (
+            p::MTL_FORMAT_RGB10A8_2P_XR10_SRGB,
+            vk::Format::R16G16B16A16_SFLOAT,
+            4,
+            TransferFunction::Linear,
+        ),
+        (
+            p::MTL_FORMAT_BGRA10_XR,
+            vk::Format::R16G16B16A16_SFLOAT,
+            8,
+            TransferFunction::Linear,
+        ),
+        (
+            p::MTL_FORMAT_BGRA10_XR_SRGB,
+            vk::Format::R16G16B16A16_SFLOAT,
+            8,
+            TransferFunction::Linear,
+        ),
+        (
+            p::MTL_FORMAT_BGR10_XR,
+            vk::Format::R16G16B16A16_SFLOAT,
+            4,
+            TransferFunction::Linear,
+        ),
+        (
+            p::MTL_FORMAT_BGR10_XR_SRGB,
+            vk::Format::R16G16B16A16_SFLOAT,
             4,
             TransferFunction::Linear,
         ),
@@ -1752,12 +1835,14 @@ mod tests {
         assert!(sampled_pixels(p::MTL_FORMAT_R8_UNORM).is_ok());
         // `R8_UNORM` is renderable as of the macos-26 coverage-layer reading, so
         // the "sampled but not a colour attachment" case is carried by a format
-        // that still is one. `R32_FLOAT` has a sampled layout (the colour-LUT
-        // rail) and no render-target width, which is the pair this asserts:
-        // having a layout is not being a colour attachment.
+        // that still is one. `R32_FLOAT` carried it until macOS 26 and 27 were
+        // seen attaching one; `RG8_UNORM` has a sampled layout and no
+        // render-target width, which is the pair this asserts: having a layout
+        // is not being a colour attachment.
+        assert!(sampled_pixels(p::MTL_FORMAT_RG8_UNORM).is_ok());
         assert_eq!(
-            color_attachment(p::MTL_FORMAT_R32_FLOAT).unwrap_err(),
-            TranslateReason::NoColorAttachmentFormat(p::MTL_FORMAT_R32_FLOAT)
+            color_attachment(p::MTL_FORMAT_RG8_UNORM).unwrap_err(),
+            TranslateReason::NoColorAttachmentFormat(p::MTL_FORMAT_RG8_UNORM)
         );
         assert_eq!(
             color_attachment(0xffff).unwrap_err(),
@@ -1825,6 +1910,8 @@ mod tests {
             (TexelLayout::R32Float, vk::Format::R32_SFLOAT, 4),
             (TexelLayout::R16Unorm, vk::Format::R16_UNORM, 2),
             (TexelLayout::Rg16Unorm, vk::Format::R16G16_UNORM, 4),
+            (TexelLayout::Rg16Uint, vk::Format::R16G16_UINT, 4),
+            (TexelLayout::Rg32Float, vk::Format::R32G32_SFLOAT, 8),
         ] {
             assert_eq!(
                 vk_texel_layout(layout),
@@ -1888,6 +1975,10 @@ mod tests {
         assert_eq!(
             sampled,
             vec![
+                // The Liquid Glass attachments macOS 26 and 27 render and then
+                // sample: RG16Uint shapes and an RG32Float companion.
+                p::MTL_FORMAT_RG16_UINT,
+                p::MTL_FORMAT_RG32_FLOAT,
                 // A8Unorm is present, and it is the one format here admitted
                 // with a non-identity plan: its byte rides in `R8_UNORM` and
                 // the plan puts it back in alpha. Binding it without the plan
@@ -1911,9 +2002,9 @@ mod tests {
                 p::MTL_FORMAT_BGRA8_UNORM,
                 p::MTL_FORMAT_BGRA8_UNORM_SRGB,
                 // The packed 32-bit colour family, whose channel boundaries are
-                // not byte boundaries — so the CPU rung could not have served
-                // them at all and the refusal was the whole loss. `BGR10A2Unorm`
-                // is the member a guest was measured binding.
+                // not byte boundaries — so the CPU rung could serve at most an
+                // eight-bit reading of them, and `RG11B10Float` not even that.
+                // `BGR10A2Unorm` is the member a guest was measured binding.
                 p::MTL_FORMAT_RGB10A2_UNORM,
                 p::MTL_FORMAT_RG11B10_FLOAT,
                 p::MTL_FORMAT_BGR10A2_UNORM,
@@ -1936,6 +2027,8 @@ mod tests {
         assert_eq!(
             color,
             vec![
+                p::MTL_FORMAT_RG16_UINT,
+                p::MTL_FORMAT_RG32_FLOAT,
                 // macOS 26 renders into a single-channel half-float linear GVA
                 // target — a blur/backdrop intermediate — and it was refused as
                 // `rt_resolve reason=rt_linear_format` three times a driven
@@ -1951,19 +2044,66 @@ mod tests {
                 // one-byte texel had never been a render target here.
                 p::MTL_FORMAT_R8_UNORM,
                 p::MTL_FORMAT_R16_FLOAT,
+                // The single-channel float32 attachment macOS 26 and 27 put
+                // beside a window pass's colour target, memoryless. Required as
+                // a colour attachment, its blending is not, so the draw asks
+                // the host.
+                p::MTL_FORMAT_R32_FLOAT,
                 p::MTL_FORMAT_RG16_FLOAT,
                 p::MTL_FORMAT_RGBA8_UNORM,
                 p::MTL_FORMAT_RGBA8_UNORM_SRGB,
                 p::MTL_FORMAT_BGRA8_UNORM,
                 p::MTL_FORMAT_BGRA8_UNORM_SRGB,
+                // The packed ten-bit pair macOS 26 and 27 render into:
+                // buffer-backed `RGB10A2Unorm` textures and `BGR10A2Unorm`
+                // IOSurfaces. `A2B10G10R10_UNORM_PACK32` is a required colour
+                // attachment; `A2R10G10B10_UNORM_PACK32` is not, so the draw
+                // asks the host before it attaches one.
+                p::MTL_FORMAT_RGB10A2_UNORM,
+                p::MTL_FORMAT_BGR10A2_UNORM,
                 // Admitted since the two arms became one answer. The contract
                 // has said a half-float render target is renderable since one
                 // could be created at that format; only this side still refused
                 // it, so a half-float secondary MRT slot was declined while a
                 // half-float primary was not.
+                p::MTL_FORMAT_RGBA16_UNORM,
                 p::MTL_FORMAT_RGBA16_FLOAT,
+                p::MTL_FORMAT_RGB10A8_2P_XR10,
+                p::MTL_FORMAT_RGB10A8_2P_XR10_SRGB,
+                p::MTL_FORMAT_BGRA10_XR,
+                p::MTL_FORMAT_BGRA10_XR_SRGB,
+                p::MTL_FORMAT_BGR10_XR,
+                p::MTL_FORMAT_BGR10_XR_SRGB,
             ]
         );
+    }
+
+    /// The packed ten-bit render targets attach, sample and land through one
+    /// Vulkan word each: `RGB10A2Unorm` through `A2B10G10R10_UNORM_PACK32` and
+    /// `BGR10A2Unorm` through `A2R10G10B10_UNORM_PACK32`, the same bits in the
+    /// same order as the guest's. A byte copy out of the resident therefore is
+    /// the guest's texel, and so is a sample of it.
+    #[test]
+    fn a_ten_bit_render_target_is_its_guest_word_on_every_rail() {
+        for (mtl, vk_format, layout) in [
+            (
+                p::MTL_FORMAT_RGB10A2_UNORM,
+                vk::Format::A2B10G10R10_UNORM_PACK32,
+                TexelLayout::Rgb10a2Unorm,
+            ),
+            (
+                p::MTL_FORMAT_BGR10A2_UNORM,
+                vk::Format::A2R10G10B10_UNORM_PACK32,
+                TexelLayout::Bgr10a2Unorm,
+            ),
+        ] {
+            assert_eq!(color_attachment(mtl), Ok((vk_format, None)), "{mtl:#x}");
+            assert_eq!(texel_layout_of(vk_format), Some(layout), "{mtl:#x}");
+            assert_eq!(sampled_pixels(mtl).unwrap().0, layout, "{mtl:#x}");
+            assert_eq!(p::store_texel_order(mtl), Some(layout), "{mtl:#x}");
+            assert_eq!(vk_texel_layout(layout), vk_format, "{mtl:#x}");
+            assert!(!has_bgra_order(vk_format), "{mtl:#x} is not an eight-bit order");
+        }
     }
 
     /// An integer texel is declared, translates, and is refused by every rail

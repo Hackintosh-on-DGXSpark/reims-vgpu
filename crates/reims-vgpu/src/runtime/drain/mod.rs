@@ -76,11 +76,33 @@ fn note_translation_order_hold(state: &mut DeviceState, held_mask: u32) {
     // that never releases is caught at `DeviceState::reset` instead, where the
     // guest's own teardown is the deadline and no age or depth has to be invented.
     crate::observe::off(format!(
-        "translation_order_hold reason=air_loading held_mask={:#x} new_mask={new_mask:#x} producer_mask={:#x} count={}",
+        "translation_order_hold reason={} held_mask={:#x} new_mask={new_mask:#x} producer_mask={:#x} count={}",
+        exec_deferral_reason(state),
         state.translation_order_hold_mask,
         state.translation_deferred_mask,
         state.translation_order_holds
     ));
+    let (held, producer) = (
+        state.translation_order_hold_mask,
+        state.translation_deferred_mask,
+    );
+    crate::runtime::mapper::wire_watch::on_hold(state, held, new_mask, producer);
+}
+
+/// What the deferred EXEC packets in `translation_deferred_mask` are waiting
+/// for: an AIR translation, a pipeline compile (the channels holding a
+/// continuation), or some of each.
+fn exec_deferral_reason(state: &DeviceState) -> &'static str {
+    let deferred = state.translation_deferred_mask;
+    let compiling = (1..MAX_CHANNELS as u32)
+        .filter(|&ch| deferred & (1u32 << ch) != 0)
+        .filter(|&ch| state.exec_continuations.holds(ch))
+        .count();
+    match (compiling, deferred.count_ones() as usize) {
+        (0, _) => "air_loading",
+        (c, d) if c == d => "pipeline_compiling",
+        _ => "air_loading_and_pipeline_compiling",
+    }
 }
 
 fn release_translation_order_holds(state: &mut DeviceState) {
@@ -91,6 +113,7 @@ fn release_translation_order_holds(state: &mut DeviceState) {
     crate::observe::off(format!(
         "translation_order_release held_mask={held_mask:#x} producer_mask=0x0"
     ));
+    crate::runtime::mapper::wire_watch::on_hold_release(state, held_mask);
 }
 
 /// Install a `DefineTask2` payload and record the page-table identity it
@@ -488,7 +511,13 @@ fn apply_set_object_list(state: &mut DeviceState, payload: &[u8], channel: Optio
     }
     let task_id = ld32(&payload[SET_OBJECT_LIST_TASK_ID..]);
     let pfn = ld32(&payload[SET_OBJECT_LIST_PFN..]);
-    let count = ld32(&payload[SET_OBJECT_LIST_COUNT..]);
+    // Wire `+0x08` carries the object-list allocation's byte length
+    // (`49_152` = 3 × 16 KiB = 4 096 × 12 B on arm64, growing to `98_304` =
+    // 8 192 × 12 B; `1_048_576` = 1 MiB = 87 381 × 12 B on x86), not an entry
+    // count. Converting to 12-byte slots bounds speculative probes to the
+    // mapped list allocation instead of walking 12× past its end.
+    let byte_len = ld32(&payload[SET_OBJECT_LIST_COUNT..]);
+    let count = byte_len / (crate::runtime::decode::resource::OBJECT_LIST_ENTRY_LEN as u32);
     // A new object list changes the construction input for references this
     // device has not constructed yet. Exact-window buffer resolutions are not
     // object states and therefore retire here. Typed objects already
@@ -506,13 +535,60 @@ fn apply_set_object_list(state: &mut DeviceState, payload: &[u8], channel: Optio
         (u64::from(task_id) << 48) ^ (u64::from(pfn) << 24) ^ u64::from(count),
     ) {
         crate::observe::off(format!(
-            "set_object_list site={} task={task_id} pfn={pfn:#x} count={count} \
+            "set_object_list site={} task={task_id} pfn={pfn:#x} bytes={byte_len} count={count} \
              applied={} plen={}",
             packet_site(channel),
             applied as u8,
             payload.len()
         ));
     }
+}
+
+/// `CmdSetObjectList2` (`0x44`), macOS 27's form of [`apply_set_object_list`].
+///
+/// The first list is the same 12-byte-entry object list, now named by its task
+/// GVA rather than its page, and is applied through the same rail. The second
+/// list (16-byte entries) is the guest's, and nothing this device decodes reads
+/// it: every object reference a 27.2 boot made resolved through the first.
+fn apply_set_object_list2(state: &mut DeviceState, payload: &[u8], channel: Option<u32>) {
+    if packet_short(
+        "set_object_list2",
+        channel,
+        payload.len(),
+        SET_OBJECT_LIST2_LEN,
+    ) {
+        return;
+    }
+    let task_id = ld32(&payload[SET_OBJECT_LIST2_TASK_ID..]);
+    let gva = ld64(&payload[SET_OBJECT_LIST2_GVA..]);
+    let byte_len = ld32(&payload[SET_OBJECT_LIST2_BYTES..]);
+    let page_mask = (1u64 << state.page_shift) - 1;
+    let Some(pfn) = (gva & page_mask == 0)
+        .then_some(gva >> state.page_shift)
+        .and_then(|pfn| u32::try_from(pfn).ok())
+    else {
+        crate::observe::fail(format!(
+            "set_object_list2 refused reason=gva_not_a_page task={task_id} gva={gva:#x} site={}",
+            packet_site(channel)
+        ));
+        return;
+    };
+    let mut legacy = [0u8; SET_OBJECT_LIST_LEN];
+    legacy[SET_OBJECT_LIST_TASK_ID..SET_OBJECT_LIST_TASK_ID + 4]
+        .copy_from_slice(&task_id.to_le_bytes());
+    legacy[SET_OBJECT_LIST_PFN..SET_OBJECT_LIST_PFN + 4].copy_from_slice(&pfn.to_le_bytes());
+    legacy[SET_OBJECT_LIST_COUNT..SET_OBJECT_LIST_COUNT + 4]
+        .copy_from_slice(&byte_len.to_le_bytes());
+    if crate::observe::first_sight("set_object_list2", u64::from(task_id) << 32 ^ gva) {
+        crate::observe::off(format!(
+            "set_object_list2 site={} task={task_id} gva={gva:#x} bytes={byte_len} \
+             second_gva={:#x} second_bytes={}",
+            packet_site(channel),
+            ld64(&payload[SET_OBJECT_LIST2_SECOND_GVA..]),
+            ld32(&payload[SET_OBJECT_LIST2_SECOND_BYTES..])
+        ));
+    }
+    apply_set_object_list(state, &legacy, channel);
 }
 
 fn apply_define_task2<H: HostMemory + HostOps>(
@@ -629,6 +705,124 @@ fn present_surface_id(opcode: u16, payload: &[u8]) -> Option<u32> {
     (payload.len() >= trailer).then(|| {
         let off = display_txn_trailer_slots(opcode).0 * 4;
         ld32(&payload[off..])
+    })
+}
+
+/// The three display present commands `process_child_packet` sends to
+/// `present_named_mapping`.
+fn is_display_present(opcode: u16) -> bool {
+    matches!(
+        opcode,
+        CHILD_OP_DISPLAY_SWAP | CHILD_OP_DISPLAY_TRANSACTION2 | CHILD_OP_DISPLAY_TRANSACTION3
+    )
+}
+
+/// Where one child FIFO stands, read from its registers.
+pub(crate) struct FifoPosition {
+    pub channel: u32,
+    pub base_pfn: u32,
+    pub head: u32,
+    pub tail: u32,
+}
+
+/// The position of each child FIFO in `mask`.
+///
+/// Heads and tails are free-running like the heads `drain_child_fifo` advances,
+/// and mean something only together with the ring they index, which is why the
+/// base page list comes with them. For [`crate::runtime::mapper::wire_watch`],
+/// which needs to tell the display presents already published when an unwire
+/// was seen from those published after.
+pub(crate) fn child_positions<M: HostMemory>(
+    state: &DeviceState,
+    mem: &M,
+    mask: u32,
+) -> Vec<FifoPosition> {
+    if state.gfx.root_page == 0 {
+        return Vec::new();
+    }
+    let root = state.pfn_gpa(state.gfx.root_page);
+    (1..MAX_CHANNELS as u32)
+        .filter(|ch| mask & (1 << ch) != 0)
+        .filter_map(|channel| {
+            let regs = root + child_reg_block_offset(channel)?;
+            let read = |off: u64| crate::runtime::host::read_u32(mem, regs + off).ok();
+            Some(FifoPosition {
+                channel,
+                base_pfn: read(CHILD_REG_BASE_PFN)?,
+                head: read(CHILD_REG_HEAD)?,
+                tail: read(CHILD_REG_TAIL)?,
+            })
+        })
+        .collect()
+}
+
+/// The packet at a child FIFO's head, read and left where it is.
+pub(crate) struct HeadPeek {
+    pub head: u32,
+    pub opcode: u16,
+    pub completion_stamp: u32,
+    /// The surface a display present names; `None` for any other command.
+    pub mapping: Option<u32>,
+}
+
+/// Read the packet a held child FIFO would run next, without running it or
+/// moving its head. Only through a ring this device has already set up; an
+/// incomplete or unreadable packet is `None`.
+///
+/// For [`crate::runtime::mapper::wire_watch`], which wants to see a display
+/// swap when it arrives behind a hold and not only when it runs.
+pub(crate) fn peek_child_head<M: HostMemory>(
+    state: &DeviceState,
+    mem: &M,
+    channel_id: u32,
+) -> Option<HeadPeek> {
+    if state.gfx.root_page == 0 {
+        return None;
+    }
+    let regs_gpa = state.pfn_gpa(state.gfx.root_page) + child_reg_block_offset(channel_id)?;
+    let ring = state.child_rings.get(channel_id as usize)?;
+    let base_pfn = crate::runtime::host::read_u32(mem, regs_gpa + CHILD_REG_BASE_PFN).ok()?;
+    if !ring.valid || ring.base_pfn != base_pfn {
+        return None;
+    }
+    let head = crate::runtime::host::read_u32(mem, regs_gpa + CHILD_REG_HEAD).ok()?;
+    let tail = crate::runtime::host::read_u32(mem, regs_gpa + CHILD_REG_TAIL).ok()?;
+    let available = published_byte_count(head, tail, ring.length)?;
+    if available < PACKET_HEADER_LEN {
+        return None;
+    }
+    let read = |len: u32| {
+        read_child_ring_bytes_inner(
+            mem,
+            &ring.page_gpas,
+            ring.length,
+            head,
+            len,
+            state.page_shift,
+        )
+        .ok()
+    };
+    let header = read(PACKET_HEADER_LEN)?;
+    let opcode = ld16(&header[PACKET_OPCODE..]);
+    let total_size = ld32(&header[PACKET_TOTAL_SIZE..]);
+    let completion_stamp = ld32(&header[PACKET_COMPLETION_STAMP..]);
+    let payload_off = PACKET_HEADER_LEN
+        .saturating_add(u32::from(ld16(&header[PACKET_STAMP_COUNT..])) * PACKET_STAMP_LEN);
+    let mapping = if is_display_present(opcode)
+        && total_size <= available
+        && total_size <= ring.length
+        && payload_off <= total_size
+    {
+        let bytes = read(total_size)?;
+        present_surface_id(opcode, &bytes[payload_off as usize..])
+    } else {
+        None
+    };
+    Some(HeadPeek {
+        head,
+        opcode,
+        completion_stamp,
+        mapping,
     })
 }
 
@@ -1883,6 +2077,7 @@ pub fn write_stamp<H: HostMemory + HostOps>(
             // fence — which is what `armed_stamp_seq` is compared against, and
             // dating it from the completion would call that window punctual.
             state.completion_stamp_seq = state.completion_stamp_seq.wrapping_add(1);
+            crate::runtime::mapper::wire_watch::on_stamp(state, &*host, index, stamp_value, true);
             return;
         }
         if order.needs_blocking_fallback() {
@@ -1918,6 +2113,7 @@ pub fn write_stamp<H: HostMemory + HostOps>(
             .interrupt_status_gpu
             .fetch_or(1u32 << (index & 0x1f), std::sync::atomic::Ordering::AcqRel);
         host.enqueue(HostAction::irq_gfx());
+        crate::runtime::mapper::wire_watch::on_stamp(state, &*host, index, stamp_value, false);
     }
 }
 
@@ -1937,6 +2133,7 @@ fn device_info_limits() -> crate::model::DeviceInfoLimits {
             max_threads_per_threadgroup: [u32::MAX; 3],
             max_threadgroup_memory_bytes: u32::MAX,
             native_fp16: true,
+            tile_memory: true,
         }
     }
     #[cfg(feature = "backend-vulkan")]
@@ -2148,7 +2345,7 @@ fn reply_device_info<H: HostMemory + HostOps>(
 /// key 2, and it is named below rather than left as a hole, because "the guest
 /// asked about five keys and we answered three" invites the wrong repair twice:
 /// there is no key 5 to add, and key 2 must not be answered the obvious way.
-const COMPUTE_INFO_KEY_MAX_TOTAL_THREADS: u32 = 1;
+pub(crate) const COMPUTE_INFO_KEY_MAX_TOTAL_THREADS: u32 = 1;
 
 /// Key 2 — `SupportsIndirectCommandBuffers`, and this device deliberately
 /// answers nothing.
@@ -2174,8 +2371,8 @@ const COMPUTE_INFO_KEY_MAX_TOTAL_THREADS: u32 = 1;
 #[allow(dead_code)] // named so a later session does not read the gap as an omission.
 const COMPUTE_INFO_KEY_SUPPORTS_ICB: u32 = 2;
 
-const COMPUTE_INFO_KEY_THREAD_EXECUTION_WIDTH: u32 = 3;
-const COMPUTE_INFO_KEY_STATIC_THREADGROUP_MEMORY: u32 = 4;
+pub(crate) const COMPUTE_INFO_KEY_THREAD_EXECUTION_WIDTH: u32 = 3;
+pub(crate) const COMPUTE_INFO_KEY_STATIC_THREADGROUP_MEMORY: u32 = 4;
 
 /// What this host answers for a compute pipeline's threadgroup limits.
 ///
@@ -2222,7 +2419,7 @@ const COMPUTE_INFO_KEY_STATIC_THREADGROUP_MEMORY: u32 = 4;
 /// open question rather than a known cost. What is established is that the 0 is
 /// wrong for any kernel that declares threadgroup memory, and that only
 /// reflection can make it right.
-fn compute_info_caps() -> [(u32, u32); 3] {
+pub(crate) fn compute_info_caps() -> [(u32, u32); 3] {
     // Apple GPUs report 1024 and 32 across every family the arm64 pathway
     // targets, and the Metal backend serves an Apple GPU to an Apple guest.
     #[cfg(not(feature = "backend-vulkan"))]
@@ -2329,6 +2526,30 @@ fn reply_compute_info<H: HostMemory + HostOps>(
     true
 }
 
+/// Answer the heap queries a vCPU found in `channel`'s ring when it rang the
+/// doorbell, ahead of the drain. Returns whether every one now has its reply;
+/// one that could not be answered here is left for the drain.
+pub(crate) fn answer_heap_queries<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    channel: u32,
+    queries: &[crate::runtime::reply_fence::Query],
+) -> bool {
+    let mut all = true;
+    for query in queries {
+        let key = (channel, query.head);
+        if state.heap_queries_answered.contains(&key) {
+            continue;
+        }
+        if reply_heap_texture_size_and_align(state, host, &query.payload) {
+            state.heap_queries_answered.insert(key);
+        } else {
+            all = false;
+        }
+    }
+    all
+}
+
 fn reply_heap_texture_size_and_align<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut H,
@@ -2343,19 +2564,85 @@ fn reply_heap_texture_size_and_align<H: HostMemory + HostOps>(
             return false;
         }
     };
-    // A live slot or nothing. `resolved_task` is gone with the arm that made the
-    // two differ: the only slot this can act on is the one the guest named.
-    let Some(task_id) = resolve_task_word(
+    // A live slot, or one the guest has defined and this device has not reached:
+    // the definition sits in another channel's ring, held behind a shader
+    // translation, while the query naming the task is answered now. The guest
+    // reads the reply as soon as its doorbell returns, so the reply is written
+    // through the queued definition's page tables, and the drain still defines
+    // the task in its own turn.
+    match resolve_task_word(
         &state.tasks,
         TaskWordSite::HeapTextureQuery,
         request.task_id,
-    ) else {
+    ) {
+        Some(task_id) => reply_heap_query_for_task(state, host, &request, task_id),
+        None => reply_heap_query_through_queued_task(state, host, &request),
+    }
+}
+
+fn reply_heap_query_through_queued_task<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    request: &crate::runtime::heap_query::Request,
+) -> bool {
+    let task_id = request.task_id;
+    let Some(entry) = queued_task_definition(state, host, task_id) else {
         Emit::decline("heap_texture_query", &QueryError::BadTask)
-            .field("task", request.task_id)
+            .field("task", task_id)
             .field("gva", format!("{:#x}", request.reply_gva))
             .fail();
         return false;
     };
+    let previous = state.tasks.get(task_id).cloned();
+    state.tasks.define(task_id, entry);
+    let answered = reply_heap_query_for_task(state, host, request, task_id);
+    match previous {
+        Some(previous) => state.tasks.define(task_id, previous),
+        None => state.tasks.remove(task_id),
+    }
+    crate::observe::off(format!(
+        "heap_texture_query queued_task task={task_id} answered={answered}"
+    ));
+    answered
+}
+
+/// The newest `DefineTask2` for `task_id` still queued in a child ring, as the
+/// entry the drain will install when it reaches it.
+fn queued_task_definition<H: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &H,
+    task_id: u32,
+) -> Option<crate::model::TaskEntry> {
+    (1..MAX_CHANNELS as u32)
+        .flat_map(|channel| {
+            crate::runtime::reply_fence::queued(
+                host,
+                state.gfx.root_page,
+                state.page_shift,
+                channel,
+                CHILD_OP_DEFINE_TASK2,
+            )
+        })
+        .filter(|packet| packet.payload.len() >= DEFINE_TASK_LEN)
+        .filter(|packet| {
+            let raw_id = ld32(&packet.payload[DEFINE_TASK_RAW_ID..]);
+            raw_id & 1 == 0 && raw_id >> DEFINE_TASK_ID_SHIFT == task_id
+        })
+        .last()
+        .map(|packet| {
+            crate::model::TaskEntry::define(
+                define_task_length(&packet.payload),
+                ld32(&packet.payload[DEFINE_TASK_DIRECTORY_PFN..]),
+            )
+        })
+}
+
+fn reply_heap_query_for_task<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    request: &crate::runtime::heap_query::Request,
+    task_id: u32,
+) -> bool {
     let requirement = match crate::runtime::heap_query::query_size_and_align(&request.descriptor) {
         Ok(requirement) => requirement,
         Err(error) => {
@@ -2419,7 +2706,7 @@ fn reply_heap_texture_size_and_align<H: HostMemory + HostOps>(
     true
 }
 
-fn process_root_packet<H: HostMemory + HostOps>(
+pub(crate) fn process_root_packet<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut H,
     packet: &Packet,
@@ -2474,11 +2761,13 @@ fn process_root_packet<H: HostMemory + HostOps>(
                 if is_child_channel(ch) {
                     let bit = 1u32 << ch;
                     state.active_child_mask |= bit;
+                    state.exec_continuations.drop_channel(ch, "fifo_redefined");
                     state.translation_deferred_mask &= !bit;
                     state.translation_order_hold_mask &= !bit;
                     state.present_translation_hold_mask &= !bit;
                     // Invalidate ring cache for this channel.
                     state.child_rings[ch as usize] = Default::default();
+                    crate::runtime::mapper::wire_watch::on_fifo_lifecycle(state, ch, "define_fifo");
                 }
             }
         }
@@ -2489,10 +2778,12 @@ fn process_root_packet<H: HostMemory + HostOps>(
                     let bit = 1u32 << ch;
                     state.active_child_mask &= !bit;
                     state.pending.child_mask &= !bit;
+                    state.exec_continuations.drop_channel(ch, "fifo_freed");
                     state.translation_deferred_mask &= !bit;
                     state.translation_order_hold_mask &= !bit;
                     state.present_translation_hold_mask &= !bit;
                     state.child_rings[ch as usize] = Default::default();
+                    crate::runtime::mapper::wire_watch::on_fifo_lifecycle(state, ch, "free_fifo");
                 }
             }
         }
@@ -3319,12 +3610,22 @@ fn present_named_mapping<H: HostMemory + HostOps>(
         if state.present_translation_hold_mask & current_bit == 0 {
             state.present_translation_holds = state.present_translation_holds.saturating_add(1);
             state.present_translation_hold_mask |= current_bit;
-            crate::observe::fail(format!(
-                "present_order_hold reason=translation_deferred ch={channel_id} mid={mapping} pending_mask={deferred_other:#x} frame_mapping={} early_front={} count={}",
+            let waiting_for = exec_deferral_reason(state);
+            let line = format!(
+                "present_order_hold reason=translation_deferred waiting_for={waiting_for} ch={channel_id} mid={mapping} pending_mask={deferred_other:#x} frame_mapping={} early_front={} count={}",
                 state.present.frame_mapping,
                 state.present.early_front_mapping,
                 state.present_translation_holds
-            ));
+            );
+            // Every cold pipeline stops its packet for the length of its
+            // compile, so a present held behind one is the scheduler working,
+            // not a fault; only a hold behind an AIR load stays on the fail
+            // channel it has always been on.
+            if waiting_for == "pipeline_compiling" {
+                crate::observe::off(line);
+            } else {
+                crate::observe::fail(line);
+            }
         }
         return ChildPacketDisposition::Deferred;
     }
@@ -4021,6 +4322,14 @@ fn apply_map_family<H: HostMemory + HostOps>(
                     if outcome.missed {
                         miss = miss.saturating_add(1);
                     }
+                    if outcome.guest_read_requested {
+                        crate::runtime::resource_validity::deliver_for_guest_read(
+                            state,
+                            host,
+                            cmd.task_id,
+                            rec.object_id,
+                        );
+                    }
                 }
                 // One counter here, two on the exec side: `pageBacking`
                 // names mapping ids, so a record this device holds no
@@ -4228,6 +4537,35 @@ fn process_child_packet<H: HostMemory + HostOps>(
     channel_id: u32,
     packet: &Packet,
 ) -> ChildPacketDisposition {
+    // macOS 27 submits through EXEC_INDIRECT3 and EXEC_INDIRECT_INFO, which are
+    // EXEC_INDIRECT2 with their resource records narrowed. Widen them here so
+    // the one exec rail — continuation and deferral included — serves all three.
+    let widened;
+    let packet = match packet.opcode {
+        CHILD_OP_EXEC_INDIRECT3 | CHILD_OP_EXEC_INDIRECT_INFO => {
+            match crate::runtime::decode::fifo::widen_exec_indirect3(&packet.payload) {
+                Some(payload) => {
+                    widened = Packet {
+                        opcode: CHILD_OP_EXEC_INDIRECT2,
+                        payload,
+                        ..packet.clone()
+                    };
+                    &widened
+                }
+                None => packet,
+            }
+        }
+        _ => packet,
+    };
+    // A packet that stopped at a draw waiting for its pipeline is this
+    // channel's head until it finishes. Something else here means the ring
+    // moved under it, and it can neither finish nor run again from the top.
+    if packet.opcode != CHILD_OP_EXEC_INDIRECT2 && state.exec_continuations.holds(channel_id) {
+        state
+            .exec_continuations
+            .drop_channel(channel_id, "head_replaced");
+        state.translation_deferred_mask &= !1u32.checked_shl(channel_id).unwrap_or(0);
+    }
     match packet.opcode {
         CHILD_OP_DEFINE_TASK2 => {
             apply_define_task2(state, host, &packet.payload, Some(channel_id));
@@ -4237,6 +4575,9 @@ fn process_child_packet<H: HostMemory + HostOps>(
         // (object_list_count==0). Never on a well-formed boot.
         CHILD_OP_SET_OBJECT_LIST => {
             apply_set_object_list(state, &packet.payload, Some(channel_id));
+        }
+        CHILD_OP_SET_OBJECT_LIST2 => {
+            apply_set_object_list2(state, &packet.payload, Some(channel_id));
         }
         CHILD_OP_DELETE_RESOURCE => {
             if !packet_short("delete_resource", Some(channel_id), packet.payload.len(), 8) {
@@ -4455,10 +4796,15 @@ fn process_child_packet<H: HostMemory + HostOps>(
                 // Process this channel's exec packet. Archive does not drain
                 // other child FIFOs here; surface RAW is render_wait_surface on
                 // the specific type-11/GVA key at sample/Load/swap sites.
+                let slot = crate::runtime::exec::ExecSlot {
+                    channel: channel_id,
+                    next_head: packet.next_head,
+                    completion_stamp: packet.completion_stamp,
+                };
                 let result =
-                    crate::runtime::exec::process_exec_indirect2(state, host, &packet.payload);
+                    crate::runtime::exec::process_exec_indirect2(state, host, slot, &packet.payload);
                 let channel_bit = 1u32.checked_shl(channel_id).unwrap_or(0);
-                if result.deferred {
+                if let Some(deferral) = result.deferred {
                     if channel_bit != 0 && state.translation_deferred_mask & channel_bit == 0 {
                         state.translation_deferred_mask |= channel_bit;
                         // Census for the same reason as `translation_order_hold`:
@@ -4467,8 +4813,10 @@ fn process_child_packet<H: HostMemory + HostOps>(
                         // `exec_translation_ready` below is already `off`. Boot 87:
                         // 55 deferrals, 56 readies.
                         crate::observe::off(format!(
-                            "exec_translation_deferred reason=air_loading ch={channel_id} task={} pending_mask={:#x}",
-                            result.task_id, state.translation_deferred_mask
+                            "exec_translation_deferred reason={} ch={channel_id} task={} pending_mask={:#x}",
+                            deferral.reason(),
+                            result.task_id,
+                            state.translation_deferred_mask
                         ));
                     }
                     return ChildPacketDisposition::Deferred;
@@ -4563,7 +4911,10 @@ fn process_child_packet<H: HostMemory + HostOps>(
             }
         }
         CHILD_OP_HEAP_TEXTURE_SIZE_AND_ALIGN => {
-            let _ = reply_heap_texture_size_and_align(state, host, &packet.payload);
+            let head = packet.next_head.wrapping_sub(packet.total_size);
+            if !state.heap_queries_answered.remove(&(channel_id, head)) {
+                let _ = reply_heap_texture_size_and_align(state, host, &packet.payload);
+            }
         }
         // The one packet that says a cached page list has gone stale, and the
         // only arm that consumes it. A second handler used to sit inside the
@@ -4986,9 +5337,66 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
                     state.pending.child_mask |= bit;
                     break;
                 }
+                if is_display_present(packet.opcode) {
+                    if let Some(mapping) = present_surface_id(packet.opcode, &packet.payload) {
+                        state.note_surface_read_by_host(mapping);
+                    }
+                }
+                let watched_present = is_display_present(packet.opcode)
+                    && crate::runtime::mapper::wire_watch::enabled();
+                let present_started_us = if watched_present {
+                    crate::runtime::mapper::wire_watch::before_swap(state, &*host);
+                    crate::observe::elapsed_us()
+                } else {
+                    0
+                };
+                // A present the wire guard refuses is consumed and stamped but not run:
+                // it names a backing the guest let go of. See
+                // `wire_watch::refuse_swap` for what that does and does not signal.
+                let refused = watched_present
+                    && crate::runtime::mapper::wire_watch::refuse_swap(
+                        state,
+                        channel_id,
+                        base_pfn,
+                        head,
+                        present_surface_id(packet.opcode, &packet.payload),
+                    );
                 let proc_started = std::time::Instant::now();
-                let disposition = process_child_packet(state, host, channel_id, &packet);
+                let disposition = if refused {
+                    ChildPacketDisposition::Complete
+                } else {
+                    process_child_packet(state, host, channel_id, &packet)
+                };
                 census::note_drain_proc(packet.opcode, proc_started.elapsed().as_nanos() as u64);
+                if watched_present {
+                    use crate::runtime::mapper::wire_watch::SwapHow;
+                    let how = match (refused, disposition) {
+                        (true, _) => SwapHow::Refused,
+                        (false, ChildPacketDisposition::Deferred) => SwapHow::Deferred,
+                        (false, _) => SwapHow::Exec,
+                    };
+                    let waits: Vec<(u32, u32)> = packet
+                        .stamp_waits
+                        .iter()
+                        .map(|w| (w.index, w.value))
+                        .collect();
+                    crate::runtime::mapper::wire_watch::after_swap(
+                        state,
+                        &*host,
+                        crate::runtime::mapper::wire_watch::SwapPacket {
+                            channel: channel_id,
+                            head,
+                            slot: stamp_index_slot,
+                            opcode: packet.opcode,
+                            stamp: packet.completion_stamp,
+                            waits: &waits,
+                            payload: &packet.payload,
+                            mapping: present_surface_id(packet.opcode, &packet.payload),
+                        },
+                        present_started_us,
+                        how,
+                    );
+                }
                 if disposition == ChildPacketDisposition::Deferred {
                     // Translation owns only immutable AIR bytes. Keep head and
                     // stamp untouched so retry cannot duplicate any packet
@@ -5104,18 +5512,41 @@ pub fn drain_iosfc<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut 
         state.pending.iosfc = false;
         return;
     }
+    note_iosfc_ring_backlog(state, producer, consumer);
 
     // Process requests between consumer and producer when ring is programmed.
-    if state.iosfc.ring_base != 0 && producer > consumer {
+    // Request `idx` lives in slot `idx % capacity`; see
+    // `iosurface_pages::mapper_request_entry_offset`. A ring with a base and no
+    // capacity has no slots to read and catches up as an unprogrammed ring does.
+    if state.iosfc.ring_base != 0 && state.iosfc.capacity == 0 && producer > consumer {
+        note_store_route("iosfc_ring_capacity_unprogrammed");
+    }
+    if state.iosfc.ring_base != 0 && state.iosfc.capacity != 0 && producer > consumer {
+        let capacity = state.iosfc.capacity;
         let start = consumer;
         let end = producer;
         for idx in start..end {
-            let entry_off = (idx as u64) * MAPPER_REQUEST_ENTRY_LEN as u64;
+            let Some(entry_off) =
+                crate::contract::iosurface_pages::mapper_request_entry_offset(idx, capacity)
+            else {
+                break;
+            };
             let mut e = [0u8; MAPPER_REQUEST_ENTRY_LEN];
             if host
                 .read_gpa(state.iosfc.ring_base + entry_off, &mut e)
                 .is_err()
             {
+                // The rest of this backlog, an UNMAP included, waits for the
+                // next publish: `pending.iosfc` is cleared below either way.
+                note_store_route("iosfc_ring_read_failed");
+                if crate::observe::first_sight("iosfc_ring_read_failed", 0) {
+                    crate::observe::fail(format!(
+                        "iosfc_ring_read_failed idx={idx} producer={producer} consumer={consumer} \
+                         gpa={:#x} (the requests from here on are read at the next publish, not \
+                         now; an UNMAP among them arrives late)",
+                        state.iosfc.ring_base + entry_off
+                    ));
+                }
                 break;
             }
             let rtype = ld32(&e[MAPPER_REQUEST_TYPE..]);
@@ -5135,6 +5566,7 @@ pub fn drain_iosfc<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut 
                             let _ = crate::runtime::mapper::resolve_mapping_backing(
                                 state, host, mapping_id,
                             );
+                            crate::runtime::mapper::wire_watch::on_map(state, &*host, mapping_id);
                         } else {
                             // Mismatched capture — put back for a later entry.
                             state.mapper_capture = Some(c);
@@ -5142,6 +5574,7 @@ pub fn drain_iosfc<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut 
                     }
                 }
                 MAPPER_REQUEST_UNMAP => {
+                    crate::runtime::mapper::wire_watch::on_unmap(state, &*host, mapping_id);
                     // Deferred-writeback: DROP, never write — same recycled-page
                     // hazard as DeleteIOSurfaceBacking2 (the unmap request
                     // trails the guest release; writing risks PTE corruption).
@@ -5182,10 +5615,72 @@ pub fn drain_iosfc<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut 
     }
 
     state.iosfc.consumer = consumer;
+    // Published before the interrupt is queued: the guest's handler reads the
+    // consumer register without the device lock, and must find it caught up.
+    state.iosfc.publish();
     if state.iosfc.consumer == state.iosfc.producer {
         host.enqueue(HostAction::irq_iosfc());
     }
     state.pending.iosfc = false;
+}
+
+/// What the mapper ring holds unread when the guest publishes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RingBacklog {
+    /// One request, the one just published: the ordinary case, since the ring
+    /// is drained at every publish.
+    One,
+    /// Several unread requests, all still in their slots.
+    Several(u32),
+    /// More unread requests than slots: the guest has overwritten `lost`
+    /// requests this device never read.
+    Overrun { lost: u32 },
+    /// The consumer is ahead of the producer. The drain catches it up without
+    /// reading anything.
+    ConsumerAhead,
+}
+
+pub(crate) fn ring_backlog(producer: u32, consumer: u32, capacity: u32) -> RingBacklog {
+    if producer < consumer {
+        return RingBacklog::ConsumerAhead;
+    }
+    match producer - consumer {
+        0 | 1 => RingBacklog::One,
+        lag if lag > capacity => RingBacklog::Overrun {
+            lost: lag - capacity,
+        },
+        lag => RingBacklog::Several(lag),
+    }
+}
+
+/// Count the mapper ring's backlog at a publish. Always on: one subtraction per
+/// publish, and a line only the first time a request is lost.
+///
+/// A lost UNMAP leaves this device holding the page list of a surface the
+/// guest has freed and writing frames into it, which is what reading past the
+/// ring did before 8a7b3334. An overrun is the other way to lose one, and so is
+/// a consumer the guest moved ahead of the producer.
+fn note_iosfc_ring_backlog(state: &DeviceState, producer: u32, consumer: u32) {
+    let capacity = state.iosfc.capacity;
+    if state.iosfc.ring_base == 0 || capacity == 0 {
+        return;
+    }
+    let (route, lost) = match ring_backlog(producer, consumer, capacity) {
+        RingBacklog::One => return,
+        RingBacklog::Several(_) => ("iosfc_ring_backlog", None),
+        RingBacklog::Overrun { lost } => ("iosfc_ring_overrun", Some(lost.to_string())),
+        RingBacklog::ConsumerAhead => ("iosfc_ring_consumer_ahead", Some("unknown".into())),
+    };
+    note_store_route(route);
+    if let Some(lost) = lost {
+        if crate::observe::first_sight(route, 0) {
+            crate::observe::fail(format!(
+                "{route} producer={producer} consumer={consumer} capacity={capacity} lost={lost} \
+                 (mapper requests the guest published and this device will not read; a lost \
+                 UNMAP leaves its pages written after the guest freed them)"
+            ));
+        }
+    }
 }
 
 /// Display-side present completion: after `presentFrame` retains the surface,
@@ -5213,6 +5708,7 @@ pub fn signal_display_present_complete<H: HostMemory + HostOps>(
     let gpa = state.display.shared_gpa;
     if gpa == 0 {
         note_display_present_signal(DISPLAY_PRESENT_NO_GPA);
+        crate::runtime::mapper::wire_watch::on_present(state, "no_gpa");
         return;
     }
     // The mask gates the pending write and not just the interrupt. It used to
@@ -5221,9 +5717,11 @@ pub fn signal_display_present_complete<H: HostMemory + HostOps>(
     // [`display_event_enabled`] for why that residue is not inert.
     if !display_event_enabled(host, gpa, DISPLAY_PRESENT_EVENT_MASK) {
         note_display_present_signal(DISPLAY_PRESENT_NOT_ENABLED);
+        crate::runtime::mapper::wire_watch::on_present(state, "not_enabled");
         return;
     }
     note_display_present_signal(DISPLAY_PRESENT_DELIVERED);
+    crate::runtime::mapper::wire_watch::on_present(state, "delivered");
     // Pending word is atomic read-and-clear (ldclral) on the guest side; OR
     // the present bit so a not-yet-consumed ONLINE event is preserved.
     let mut pending_le = [0u8; 4];
@@ -5701,6 +6199,7 @@ pub(crate) fn signal_display_refresh_classes<H: HostMemory + HostOps>(
     note_vbl(if vbl { VBL_DELIVERED } else { VBL_NOT_ENABLED }, now_ms);
     if transaction {
         note_display_present_signal(DISPLAY_PRESENT_REFRESH);
+        crate::runtime::mapper::wire_watch::note_refresh_signal();
     }
 
     let mut pending_le = [0u8; 4];
@@ -6037,6 +6536,7 @@ fn note_present_backpressure_hold(state: &mut DeviceState, channel: u32, head: u
         "THRASH present_action_starvation reason=pending_frames_cap ch={channel} head={head} tail={tail} unpainted={} episode={}",
         state.present.unpainted_presents, state.present.backpressure_hold_count
     ));
+    crate::runtime::mapper::wire_watch::swap_held(state, "backpressure", channel, head);
 }
 
 /// Publish the poll-tick/Dekker rescue to the asynchronous drain owner.
@@ -6235,6 +6735,8 @@ fn retry_stamp_held_timelines<H: HostMemory + HostOps>(state: &mut DeviceState, 
 }
 
 pub fn drain_pending<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut H) {
+    // Ahead of the yield below: a held present is exactly when it must look.
+    crate::runtime::mapper::wire_watch::tick(state, &*host);
     // A queued present action is part of the ordered device timeline. QEMU
     // cannot paint it while this worker owns the device lock, so later worker
     // wakeups must leave guest work queued until scanout consumes the action.

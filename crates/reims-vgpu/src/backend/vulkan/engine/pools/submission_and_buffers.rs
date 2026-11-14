@@ -3717,6 +3717,7 @@ impl ResourcePools {
             width,
             height,
             layers,
+            mip_levels,
             volume,
             cube,
             arrayed,
@@ -3782,11 +3783,17 @@ impl ResourcePools {
                         height,
                         depth: extent_depth,
                     })
-                    .mip_levels(1)
+                    .mip_levels(mip_levels)
                     .array_layers(array_layers)
                     .samples(vk::SampleCountFlags::TYPE_1)
                     .tiling(vk::ImageTiling::OPTIMAL)
-                    .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
+                    .usage(if mip_levels > 1 {
+                        vk::ImageUsageFlags::SAMPLED
+                            | vk::ImageUsageFlags::TRANSFER_DST
+                            | vk::ImageUsageFlags::TRANSFER_SRC
+                    } else {
+                        vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST
+                    })
                     .initial_layout(vk::ImageLayout::UNDEFINED),
                 None,
             )
@@ -3816,7 +3823,7 @@ impl ResourcePools {
                 .subresource_range(vk::ImageSubresourceRange {
                     aspect_mask: vk::ImageAspectFlags::COLOR,
                     base_mip_level: 0,
-                    level_count: 1,
+                    level_count: mip_levels,
                     base_array_layer: 0,
                     layer_count: array_layers,
                 }),
@@ -3840,6 +3847,7 @@ impl ResourcePools {
             width,
             height,
             layers,
+            mip_levels,
             volume,
             cube,
             arrayed,
@@ -4616,6 +4624,7 @@ mod recycle_tests {
             width: w,
             height: h,
             layers: 1,
+            mip_levels: 1,
             volume: false,
             cube: false,
             arrayed: false,

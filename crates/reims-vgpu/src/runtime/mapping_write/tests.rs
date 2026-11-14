@@ -2318,3 +2318,128 @@ fn rect_raw_roundtrip_subregion() {
         8
     ));
 }
+
+#[test]
+fn two_plane_xr10_iosurface_native_and_bgra8_roundtrip_both_planes() {
+    use crate::contract::endian::{st16, st32, st64};
+    use crate::contract::iosurface_pages::{
+        DEVICE_DESC_ALLOC_SIZE, DEVICE_DESC_LEN, DEVICE_DESC_PLANES, DEVICE_DESC_PLANE_COUNT,
+        DEVICE_PLANE_BPE, DEVICE_PLANE_BPR, DEVICE_PLANE_DESC_LEN, DEVICE_PLANE_DIMS,
+        DEVICE_PLANE_OFFSET, DEVICE_PLANE_SIZE,
+    };
+    use crate::contract::pixel_format::{
+        f16_to_f32, f32_to_f16, TexelLayout, MTL_FORMAT_RGB10A8_2P_XR10,
+    };
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let pfn0 = 0x40u32;
+    let pfn1 = 0x41u32;
+    let gpa0 = (pfn0 as u64) << PAGE_SHIFT_ARM64E;
+    let gpa1 = (pfn1 as u64) << PAGE_SHIFT_ARM64E;
+    host.map_range(gpa0, 0x8000, 0);
+    state.map_surface(12);
+    {
+        let m = state.mappings.get_mut(&12).unwrap();
+        m.mapped = true;
+        m.mapping_internal = 1;
+        m.page_entries = vec![
+            (pfn0 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID,
+            (pfn1 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID,
+        ];
+    }
+    let pack = |w: u32, h: u32| ((w as u64 & 0xffffff) << 8) | ((h as u64 & 0xffffff) << 40);
+    let mut desc = vec![0u8; DEVICE_DESC_LEN];
+    st32(&mut desc[DEVICE_DESC_ALLOC_SIZE..], 0x8000);
+    desc[DEVICE_DESC_PLANE_COUNT] = 2;
+    // Plane 0: 2x2 BGR10_XR @ +0x0000 (stride 128).
+    st32(&mut desc[DEVICE_DESC_PLANES + DEVICE_PLANE_OFFSET..], 0);
+    st32(&mut desc[DEVICE_DESC_PLANES + DEVICE_PLANE_SIZE..], 0x4000);
+    st64(&mut desc[DEVICE_DESC_PLANES + DEVICE_PLANE_DIMS..], pack(2, 2));
+    st32(&mut desc[DEVICE_DESC_PLANES + DEVICE_PLANE_BPR..], 128);
+    st16(&mut desc[DEVICE_DESC_PLANES + DEVICE_PLANE_BPE..], 4);
+    // Plane 1: 2x2 R8Unorm alpha @ +0x4000 (stride 128).
+    let p1 = DEVICE_DESC_PLANES + DEVICE_PLANE_DESC_LEN;
+    st32(&mut desc[p1 + DEVICE_PLANE_OFFSET..], 0x4000);
+    st32(&mut desc[p1 + DEVICE_PLANE_SIZE..], 0x4000);
+    st64(&mut desc[p1 + DEVICE_PLANE_DIMS..], pack(2, 2));
+    st32(&mut desc[p1 + DEVICE_PLANE_BPR..], 128);
+    st16(&mut desc[p1 + DEVICE_PLANE_BPE..], 1);
+    assert!(state.set_mapping_device_desc(12, &desc));
+    assert!(state.set_mapping_geom(12, 2, 2, MTL_FORMAT_RGB10A8_2P_XR10));
+    assert_eq!(
+        mapping_native_resident_layout(MTL_FORMAT_RGB10A8_2P_XR10),
+        Some(TexelLayout::Rgba16Float)
+    );
+
+    // 4 pixels: extended-range neon green, transparent black, half-alpha blue, negative red.
+    let pixels: [[f32; 4]; 4] = [
+        [0.1, 1.20, 0.2, 1.0],
+        [0.0, 0.0, 0.0, 0.0],
+        [0.0, 0.25, 0.75, 128.0 / 255.0],
+        [-0.25, 0.5, 0.5, 1.0],
+    ];
+    let mut rgba16f = Vec::with_capacity(32);
+    for px in pixels {
+        for ch in px {
+            rgba16f.extend_from_slice(&f32_to_f16(ch).to_le_bytes());
+        }
+    }
+    assert!(write_native_uncached(
+        &mut state,
+        &mut host,
+        12,
+        &rgba16f,
+        2,
+        2,
+        TexelLayout::Rgba16Float,
+    ));
+
+    // Transparent black (pixel 1) must encode 0.0 as XR10 code 384 in Plane 0 and 0x00 in Plane 1.
+    let mut p0_px1 = [0u8; 4];
+    assert!(host.read_gpa(gpa0 + 4, &mut p0_px1).is_ok());
+    let word = u32::from_le_bytes(p0_px1);
+    assert_eq!(word & 0x3ff, 384);
+    assert_eq!((word >> 10) & 0x3ff, 384);
+    assert_eq!((word >> 20) & 0x3ff, 384);
+    let mut p1_row0 = [0u8; 2];
+    let mut p1_row1 = [0u8; 2];
+    assert!(host.read_gpa(gpa1, &mut p1_row0).is_ok());
+    assert!(host.read_gpa(gpa1 + 128, &mut p1_row1).is_ok());
+    assert_eq!(p1_row0, [255, 0]);
+    assert_eq!(p1_row1, [128, 255]);
+
+    // Native Rgba16Float readback preserves extended-range channels and Plane 1 alpha.
+    let decoded = read_xr10_to_rgba16f(&mut state, &mut host, 12, 2, 2).expect("xr10 readback");
+    let ch_at = |px: usize, c: usize| -> f32 {
+        let off = px * 8 + c * 2;
+        f16_to_f32(u16::from_le_bytes([decoded[off], decoded[off + 1]]))
+    };
+    assert!((ch_at(0, 1) - 1.20).abs() < 0.004, "extended green preserved");
+    assert_eq!(ch_at(1, 3), 0.0, "transparent alpha preserved");
+    assert!((ch_at(2, 3) - 128.0 / 255.0).abs() < 0.005);
+    assert!((ch_at(3, 0) - (-0.25)).abs() < 0.004, "negative red preserved");
+
+    // Scanout / RGBA8 readback reads Plane 1 alpha rather than inventing opaque 255.
+    let mut bgra = [0u8; 16];
+    assert!(crate::runtime::scanout::read_mapping_bgra8(
+        &mut state, &mut host, 12, &mut bgra, 8, 2, 2
+    ));
+    assert_eq!(bgra[3], 255);
+    assert_eq!(bgra[7], 0, "transparent pixel must not become opaque black");
+    assert_eq!(bgra[11], 128);
+    assert_eq!(bgra[15], 255);
+
+    // BGRA8 fallback write also updates Plane 1 alpha.
+    let fallback_bgra: [u8; 16] = [
+        0, 255, 0, 200, // (0,0) a=200
+        0, 0, 0, 0, // (1,0) a=0
+        255, 0, 0, 64, // (0,1) a=64
+        0, 0, 255, 255, // (1,1) a=255
+    ];
+    assert!(write_bgra8(&mut state, &mut host, 12, &fallback_bgra, 8, 2, 2));
+    assert!(host.read_gpa(gpa1, &mut p1_row0).is_ok());
+    assert!(host.read_gpa(gpa1 + 128, &mut p1_row1).is_ok());
+    assert_eq!(p1_row0, [200, 0]);
+    assert_eq!(p1_row1, [64, 255]);
+}

@@ -2712,12 +2712,226 @@ fn exec_copy_buffer_to_texture<M: HostMemory + HostOps>(
     BlitStatus::Ok
 }
 
+/// Copy a heap texture into a buffer, or `None` when the source is not one.
+///
+/// A heap texture has no guest bytes for [`resolve_texture_backing`] to find:
+/// what a pass rendered into it lives in the engine's resident, the same one a
+/// later pass samples. It shares the view's object tag, so the copy used to
+/// decode it as a view, fail (`blit_fail reason=view_desc_decode`) and leave
+/// the buffer as it was. RenderBox on macOS 27.2 draws an icon into a heap
+/// texture and copies it out this way; iconservicesagent then found every
+/// pixel transparent and the Dock showed placeholders.
+///
+/// The resident is read back as RGBA8 and rewritten in the texture's own
+/// format, as the guest-page store's copying arm does, so a format wider than
+/// eight bits a channel keeps eight.
+#[cfg(feature = "backend-vulkan")]
+fn copy_heap_texture_to_buffer<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    cmd: &Command,
+) -> Option<BlitStatus> {
+    let entry = objects::lookup_list_entry(state, host, task_id, cmd.source)?;
+    if entry.object_type != OBJECT_TYPE_TEXTURE_VIEW {
+        return None;
+    }
+    let resolved = objects::resolve_resource(state, host, task_id, cmd.source).ok();
+    let direct = resolved
+        .as_ref()
+        .and_then(|res| {
+            draw::heap_texture_of(&res.descriptor).map(|h| (cmd.source, res.lifetime_ref().id(), h))
+        })
+        .or_else(|| {
+            objects::read_descriptor(state, host, task_id, &entry)
+                .as_deref()
+                .and_then(draw::heap_texture_of)
+                .map(|h| (cmd.source, 1, h))
+        });
+    let (base_ref, generation, heap) = match direct {
+        Some(found) => found,
+        None => {
+            let view = draw::resolve_texture_view(state, host, task_id, cmd.source)?;
+            if view.level != 0 {
+                return None;
+            }
+            let base = view.base_texture_ref;
+            let base_res = objects::resolve_resource(state, host, task_id, base).ok()?;
+            let mut heap = draw::heap_texture_of(&base_res.descriptor)?;
+            if let Some(vf) = view.pixel_format {
+                if pixel_format::bytes_per_pixel(vf) == pixel_format::bytes_per_pixel(heap.format) {
+                    heap.format = vf;
+                }
+            }
+            (base, base_res.lifetime_ref().id(), heap)
+        }
+    };
+    let target = crate::model::HeapTargetRef {
+        base_ref,
+        generation,
+        base_format: heap.format,
+    };
+    Some(copy_heap_resident_to_buffer(
+        state, host, task_id, cmd, target, heap,
+    ))
+}
+
+#[cfg(not(feature = "backend-vulkan"))]
+fn copy_heap_texture_to_buffer<M: HostMemory + HostOps>(
+    _state: &mut DeviceState,
+    _host: &mut M,
+    _task_id: u32,
+    _cmd: &Command,
+) -> Option<BlitStatus> {
+    None
+}
+
+#[cfg(feature = "backend-vulkan")]
+fn copy_heap_resident_to_buffer<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    cmd: &Command,
+    target: crate::model::HeapTargetRef,
+    heap: draw::HeapTexture,
+) -> BlitStatus {
+    use crate::backend::vulkan::engine;
+    if cmd.source_level != 0 || cmd.source_slice != 0 || cmd.source_origin.z != 0 {
+        return br(BlitStatus::Unsupported, "t2b_heap_level_slice");
+    }
+    if cmd.source_size.depth != 1 || heap.sample_count > 1 {
+        return br(BlitStatus::Unsupported, "t2b_heap_depth_or_samples");
+    }
+    let Some(bpp) = pixel_format::bytes_per_pixel(heap.format) else {
+        return br(BlitStatus::Unsupported, "t2b_heap_format");
+    };
+    let (ox, oy) = (cmd.source_origin.x, cmd.source_origin.y);
+    if ox > u64::from(heap.width) || oy > u64::from(heap.height) {
+        return br(BlitStatus::Bounds, "t2b_heap_origin_oob");
+    }
+    let (Some(copy_w), Some(copy_h)) = (
+        copy_extent(
+            "t2b",
+            "w",
+            cmd.source_size.width,
+            u64::from(heap.width) - ox,
+        ),
+        copy_extent(
+            "t2b",
+            "h",
+            cmd.source_size.height,
+            u64::from(heap.height) - oy,
+        ),
+    ) else {
+        return br(BlitStatus::Bounds, "t2b_heap_extent_oob");
+    };
+    if copy_w == 0 || copy_h == 0 {
+        return BlitStatus::ZeroExtent;
+    }
+    let dst = match resolve_buffer(state, host, task_id, cmd.destination) {
+        Ok(buffer) => buffer,
+        Err(status) => return status,
+    };
+    let row_bytes = copy_w * u64::from(bpp);
+    let dst_bpr = if cmd.destination_bytes_per_row != 0 {
+        cmd.destination_bytes_per_row
+    } else {
+        row_bytes
+    };
+    if dst_bpr < row_bytes {
+        return br(BlitStatus::Bounds, "t2b_heap_dst_bpr_lt_row");
+    }
+    let Some(span) = (copy_h - 1)
+        .checked_mul(dst_bpr)
+        .and_then(|v| v.checked_add(row_bytes))
+    else {
+        return br(BlitStatus::Bounds, "t2b_heap_dst_span_overflow");
+    };
+    let Some(dst_base) = dst.gva.checked_add(cmd.destination_offset) else {
+        return br(BlitStatus::Bounds, "t2b_heap_dst_gva_overflow");
+    };
+    if cmd
+        .destination_offset
+        .checked_add(span)
+        .is_none_or(|end| end > dst.size)
+    {
+        return br(BlitStatus::Bounds, "t2b_heap_dst_span_oob");
+    }
+    let identity = draw::heap_target_identity(task_id, target, heap.width, heap.height);
+    if !engine::resident_content_ready(&identity) {
+        return br(BlitStatus::MissingResource, "t2b_heap_unrendered");
+    }
+    if let Some(expected_layout) = pixel_format::store_texel_order(heap.format) {
+        if let Ok(rb) = engine::read_target_native(&identity) {
+            if rb.layout == expected_layout {
+                let bpp = rb.layout.bytes_per_texel() as usize;
+                let src_row = heap.width as usize * bpp;
+                if rb.pixels.len() >= src_row * heap.height as usize {
+                    let allowed = dest_window(state, host, task_id, dst_base, span);
+                    for y in 0..copy_h {
+                        let at = (oy + y) as usize * src_row + ox as usize * bpp;
+                        let slice = &rb.pixels[at..at + row_bytes as usize];
+                        if gva_mem::write_task_gva_product_within(
+                            state,
+                            host,
+                            task_id,
+                            dst_base + y * dst_bpr,
+                            slice,
+                            allowed.as_ref(),
+                        )
+                        .is_err()
+                        {
+                            return br(BlitStatus::GuestIo, "t2b_heap_write_io");
+                        }
+                    }
+                    crate::runtime::drain::note_store_route("blit_t2b_heap");
+                    return BlitStatus::Ok;
+                }
+            }
+        }
+    }
+    let Ok(readback) = engine::read_target(&identity) else {
+        return br(BlitStatus::MissingResource, "t2b_heap_read_refused");
+    };
+    let rgba = readback.into_rgba8();
+    let src_row = heap.width as usize * 4;
+    if rgba.len() < src_row * heap.height as usize {
+        return br(BlitStatus::MissingResource, "t2b_heap_read_short");
+    }
+    let allowed = dest_window(state, host, task_id, dst_base, span);
+    let mut row = vec![0u8; row_bytes as usize];
+    for y in 0..copy_h {
+        let at = (oy + y) as usize * src_row + ox as usize * 4;
+        let texels = &rgba[at..at + copy_w as usize * 4];
+        if !pixel_format::convert_rgba8_to_row(heap.format, texels, copy_w as u32, &mut row) {
+            return br(BlitStatus::Unsupported, "t2b_heap_convert");
+        }
+        if gva_mem::write_task_gva_product_within(
+            state,
+            host,
+            task_id,
+            dst_base + y * dst_bpr,
+            &row,
+            allowed.as_ref(),
+        )
+        .is_err()
+        {
+            return br(BlitStatus::GuestIo, "t2b_heap_write_io");
+        }
+    }
+    crate::runtime::drain::note_store_route("blit_t2b_heap");
+    BlitStatus::Ok
+}
+
 fn exec_copy_texture_to_buffer<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
     cmd: &Command,
 ) -> BlitStatus {
+    if let Some(status) = copy_heap_texture_to_buffer(state, host, task_id, cmd) {
+        return status;
+    }
     let src = match resolve_texture_backing(
         state,
         host,

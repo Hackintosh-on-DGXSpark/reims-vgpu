@@ -154,6 +154,11 @@ pub enum DrawReason {
     /// near and far planes, which is missing geometry rather than shifted
     /// geometry — the sibling of the fill-mode refusal above.
     DepthClampUnsupported,
+    /// The pipeline compiler thread panicked while building this pipeline, so
+    /// there is no pipeline and no driver result to report. Fieldless for the
+    /// same reason as [`Self::DriverCallQuarantined`]; the panic message rides
+    /// the fail line the compiler writes.
+    PipelineCompilerPanicked,
     /// The primary colour attachment has no faithful Vulkan format on this
     /// backend. Carries the translation reason so the refusal keeps one name.
     ColorAttachmentFormat(TranslateReason),
@@ -306,6 +311,7 @@ impl crate::observe::Decline for DrawReason {
             Self::DualSourceBlendUnsupported => "dual_source_blend_unsupported",
             Self::FillModeNonSolidUnsupported => "fill_mode_non_solid_unsupported",
             Self::DepthClampUnsupported => "depth_clamp_unsupported",
+            Self::PipelineCompilerPanicked => "pipeline_compiler_panicked",
             // Deliberately delegates: the translation layer already named the
             // exact format problem, and inventing a second slug here would make
             // the two log lines disagree about one event.
@@ -661,6 +667,7 @@ mod tests {
         DrawReason::DualSourceBlendUnsupported,
         DrawReason::FillModeNonSolidUnsupported,
         DrawReason::DepthClampUnsupported,
+        DrawReason::PipelineCompilerPanicked,
     ];
 
     /// The rule this enum exists to enforce: two checks sharing a slug means a

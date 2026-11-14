@@ -58,6 +58,7 @@ pub fn storage_image_format(selector: StorageImageSelector) -> (MTLPixelFormat, 
         S::Rg8Unorm => (MTLPixelFormat::RG8Unorm, 2),
         S::Rgba32Uint => (MTLPixelFormat::RGBA32Uint, 16),
         S::R32Uint => (MTLPixelFormat::R32Uint, 4),
+        S::Rgba16Unorm => (MTLPixelFormat::RGBA16Unorm, 8),
     }
 }
 

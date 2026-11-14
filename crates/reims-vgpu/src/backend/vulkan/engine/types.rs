@@ -371,13 +371,35 @@ impl PipelineObjectIdentity {
     }
 }
 
+/// A storage image a fragment shader writes, for a draw whose shader has no
+/// colour output. The draw binds an image of this shape, seeded with `seed`
+/// (tight rows) when given, and hands its texels back in
+/// [`DrawOutput::storage_pixels`] when `read_back` is set; the colour
+/// attachments are left as they were.
+#[derive(Clone, Debug)]
+pub struct DrawScratchStorageImage {
+    pub binding: u32,
+    pub width: u32,
+    pub height: u32,
+    pub format: StorageImageFormat,
+    pub seed: Option<std::sync::Arc<Vec<u8>>>,
+    pub read_back: bool,
+}
+
 /// Inputs for one offscreen draw. Engine receives resolved bytes + post-reloc SPIR-V only.
 #[derive(Debug, Default)]
 pub struct DrawRequest {
+    /// See [`DrawScratchStorageImage`].
+    pub scratch_storage_images: Vec<DrawScratchStorageImage>,
     /// The retained guest pipeline object this draw resolved, when the retained
     /// lifecycle is enabled. Vulkan still compares the complete variant key;
     /// this identity only chooses the object's exact front entry.
     pub pipeline_object: Option<PipelineObjectIdentity>,
+    /// The ticket this draw waited on before it was resumed, if it waited.
+    /// Read once, by the pipeline lookup: a compile that failed is this draw's
+    /// refusal rather than a reason to compile again. See
+    /// [`super::pipeline_compiler`].
+    pub pipeline_wait: Option<super::pipeline_compiler::PipelineTicket>,
     /// Shared from the runtime translation cache — the engine never mutates
     /// module words; `Arc` avoids a full-module copy per draw.
     pub vert_spirv: std::sync::Arc<Vec<u32>>,
@@ -559,13 +581,15 @@ pub struct DrawRequest {
     /// buffer, byte-identical to the pre-depth 2D path. Set only for a draw that
     /// bound a non-trivial `MTLDepthStencilState` (see `runtime::draw`).
     pub depth: Option<DepthState>,
-    /// Fragment shader reads its destination pixel (Metal framebuffer fetch:
-    /// an `air.render_target` INPUT param, translated as a `SubpassData` image
-    /// at [`COLOR_INPUT_BINDING`]). The engine then references attachment 0 as
-    /// a subpass input (GENERAL layout, BY_REGION self-dependency) and writes
-    /// an INPUT_ATTACHMENT descriptor pointing at the color target's view.
-    /// `false` (default) keeps the pass byte-identical to the pre-fetch engine.
-    pub color_input: bool,
+    /// Colour attachments the fragment shader reads its destination pixel
+    /// from (Metal framebuffer fetch: an `air.render_target` INPUT param
+    /// `dest_N`, translated as a `SubpassData` image at
+    /// [`COLOR_INPUT_BINDING`]` + N` with input attachment index N). Bit N
+    /// makes attachment N a subpass input as well (GENERAL layout, BY_REGION
+    /// self-dependency) and writes an INPUT_ATTACHMENT descriptor pointing at
+    /// that attachment's view. `0` (default) keeps the pass byte-identical to
+    /// the pre-fetch engine.
+    pub color_inputs: u8,
     /// The preceding engine request belongs to this draw's Metal render
     /// encoder. Used only when its Vulkan pass is still open and identical.
     pub continues_render_pass: bool,
@@ -682,12 +706,13 @@ pub fn viewport_slot_count(req: &DrawRequest) -> usize {
     req.viewports.len().max(req.scissors.len()).max(1)
 }
 
-/// Descriptor binding of the attachment-0 framebuffer-fetch input attachment.
+/// Descriptor binding of the attachment-0 framebuffer-fetch input attachment;
+/// attachment N reads at this plus N.
 ///
 /// This is the *device's* ColorInput band base, not the translator's: the band
 /// moved up when the texture band was widened to Metal's 128 entries
 /// (`runtime::spirv_bind::widen_sampled_bands` rewrites `dest_N` from the
-/// translator's `96+N` to `192+N`). Only `dest_0` is supported. Kept equal to
+/// translator's `96+N` to `192+N`). Kept equal to
 /// `runtime::spirv_bind::COLOR_INPUT_BINDING_BASE` by a unit test there, because
 /// the two constants live on opposite sides of the runtime/engine layering.
 /// Both fragment relocations preserve it.
@@ -729,9 +754,26 @@ pub struct SecondaryColorTarget {
     pub color_write_mask: ColorWriteMask,
 }
 
+/// What a draw request came to: drawn, or waiting for its pipeline.
+///
+/// `PipelinePending` changed nothing — no slot claimed, nothing acquired or
+/// recorded — so the caller runs the same draw again once the ticket is
+/// answered. It is not a refusal and is never logged or cached as one.
+#[derive(Debug)]
+pub enum DrawAnswer {
+    Drawn(DrawOutput),
+    PipelinePending(super::pipeline_compiler::PipelineTicket),
+}
+
 #[derive(Debug, Default)]
 pub struct DrawOutput {
     pub pixels: Vec<u8>,
+    /// Unclamped attachment-native texels when the attachment is not 4-byte
+    /// RGBA8/BGRA8 colour (`!layout.is_four_byte_color()`).
+    pub native_pixels: Option<(Vec<u8>, crate::contract::pixel_format::TexelLayout)>,
+    /// The texels of each scratch storage image with `read_back`, in request
+    /// order, tight rows.
+    pub storage_pixels: Vec<Vec<u8>>,
     /// Whether color attachment zero was rendered through the retained guest
     /// allocation supplied on this request.
     ///
@@ -806,6 +848,10 @@ pub enum PrimitiveTopology {
 impl PrimitiveTopology {
     pub(crate) fn vk(self) -> vk::PrimitiveTopology {
         translate::raster::vk_topology(self)
+    }
+
+    pub(crate) fn primitive_restart(self) -> bool {
+        translate::raster::primitive_restart(self)
     }
 }
 
@@ -1069,6 +1115,11 @@ pub struct SampledImageResource {
     pub width: u32,
     pub height: u32,
     pub layers: u32,
+    /// Mip levels the image is created with. Level 0 is uploaded and the rest
+    /// are generated from it with linear blits. 1 for every bind but a sampled
+    /// snapshot of a mipmapped heap texture, whose higher levels no kernel here
+    /// writes.
+    pub mip_levels: u32,
     pub arrayed: bool,
     pub volume: bool,
     pub cube: bool,
@@ -1702,6 +1753,15 @@ pub enum TargetIdentity {
         /// claimed `bgra = false`.
         format: vk::Format,
     },
+    /// Type-8 heap-placed texture namespace (opcode 0x15 / 0x38).
+    Heap {
+        task_id: u32,
+        ref_: u32,
+        width: u32,
+        height: u32,
+        generation: u64,
+        format: vk::Format,
+    },
     /// Anonymous / no protocol identity (oracle / one-shot draws).
     Anonymous { slot: u64 },
 }
@@ -1812,9 +1872,10 @@ impl TargetKeyDivergence {
 impl TargetIdentity {
     pub fn width(&self) -> u32 {
         match self {
-            Self::Surface { width, .. } | Self::Texture { width, .. } | Self::Gva { width, .. } => {
-                *width
-            }
+            Self::Surface { width, .. }
+            | Self::Texture { width, .. }
+            | Self::Gva { width, .. }
+            | Self::Heap { width, .. } => *width,
             Self::Anonymous { .. } => 0,
         }
     }
@@ -1823,7 +1884,8 @@ impl TargetIdentity {
         match self {
             Self::Surface { height, .. }
             | Self::Texture { height, .. }
-            | Self::Gva { height, .. } => *height,
+            | Self::Gva { height, .. }
+            | Self::Heap { height, .. } => *height,
             Self::Anonymous { .. } => 0,
         }
     }
@@ -1832,7 +1894,8 @@ impl TargetIdentity {
         match self {
             Self::Surface { generation, .. }
             | Self::Texture { generation, .. }
-            | Self::Gva { generation, .. } => *generation,
+            | Self::Gva { generation, .. }
+            | Self::Heap { generation, .. } => *generation,
             Self::Anonymous { .. } => 0,
         }
     }
@@ -1854,6 +1917,9 @@ impl TargetIdentity {
             Self::Texture { ref_, .. } => (1, u64::from(*ref_)),
             Self::Gva { gva, .. } => (2, *gva),
             Self::Anonymous { slot } => (3, *slot),
+            Self::Heap { task_id, ref_, .. } => {
+                (4, (u64::from(*task_id) << 32) | u64::from(*ref_))
+            }
         }
     }
 
@@ -1888,7 +1954,8 @@ impl TargetIdentity {
         match &mut next {
             Self::Surface { generation: g, .. }
             | Self::Texture { generation: g, .. }
-            | Self::Gva { generation: g, .. } => *g = generation,
+            | Self::Gva { generation: g, .. }
+            | Self::Heap { generation: g, .. } => *g = generation,
             Self::Anonymous { .. } => {}
         }
         next
@@ -1952,6 +2019,10 @@ impl TargetIdentity {
             (Self::Gva { gva: a, .. }, Self::Gva { gva: b, .. }) => a == b,
             (Self::Texture { ref_: a, .. }, Self::Texture { ref_: b, .. }) => a == b,
             (Self::Anonymous { slot: a }, Self::Anonymous { slot: b }) => a == b,
+            (
+                Self::Heap { task_id: ta, ref_: ra, .. },
+                Self::Heap { task_id: tb, ref_: rb, .. },
+            ) => ta == tb && ra == rb,
             _ => false,
         }
     }
@@ -1974,6 +2045,7 @@ impl TargetIdentity {
         match self {
             Self::Surface { format, .. } => *format,
             Self::Gva { format, .. } => *format,
+            Self::Heap { format, .. } => *format,
             Self::Texture { .. } | Self::Anonymous { .. } => translate::pixel::RESIDENT_RGBA_FORMAT,
         }
     }
@@ -1995,6 +2067,8 @@ pub enum SeedOrder {
     Rgba8,
     /// Guest scanout order — B, G, R, A in memory.
     Bgra8,
+    /// Attachment-native texels, staged verbatim without 8-bit expansion.
+    Native(crate::contract::pixel_format::TexelLayout),
 }
 
 /// Where a sampled image's content comes from.
@@ -2523,7 +2597,7 @@ mod tests {
         assert!(draw.target_identity.is_none());
         assert!(draw.depth.is_none());
         assert!(!draw.skip_readback);
-        assert!(!draw.color_input);
+        assert_eq!(draw.color_inputs, 0);
 
         let compute = ComputeRequest::default();
         assert_eq!(compute.grid, [0, 0, 0]);

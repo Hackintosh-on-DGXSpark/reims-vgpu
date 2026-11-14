@@ -58,6 +58,9 @@
 //! background noise.
 
 use super::*;
+use crate::runtime::decode::resource::{
+    decode_memoryless_texture_descriptor, OBJECT_TYPE_MEMORYLESS_TEXTURE,
+};
 /// The colour render target's base format for a **type-4** surface, or nothing.
 ///
 /// On this arm `m.format == 0` is not "unset", it is a decoded refusal:
@@ -354,6 +357,14 @@ pub(super) struct ResolvedRenderTarget {
     /// Vulkan encode replaces this provisional single-sample value with the
     /// bound pipeline's raster sample count before constructing an image.
     pub(super) sample_count: u32,
+    /// A type-9 texture: no mapping and no guest VA, only a host image that
+    /// lives for the pass. Metal lets such an attachment neither load nor
+    /// store, so nothing is seeded into it and nothing is written back.
+    pub(super) memoryless: bool,
+    /// A type-8 buffer-backed texture over a shared MTLBuffer: guest CPU and
+    /// buffer readers access the underlying buffer without synchronizing
+    /// `texture_ref`, so a Store must land synchronously in guest memory.
+    pub(super) buffer_backed: bool,
 }
 
 /// Why a colour attachment's `texture_ref` could not be turned into somewhere
@@ -463,6 +474,26 @@ pub(super) enum RenderTargetCause {
     NoListEntry,
     /// Something is under the ref and it is not a texture.
     WrongType { object_type: u8 },
+    /// A mip>0 view of a memoryless texture.
+    MemorylessMipView { level: u32 },
+    /// The type-9 entry's descriptor bytes could not be read.
+    MemorylessDescRead,
+    /// The type-9 descriptor is shorter than its geometry.
+    MemorylessDescDecode { len: usize },
+    /// The memoryless texture's format is not one Metal can render into.
+    MemorylessFormat { fmt: u16 },
+    /// A heap texture this device renders only at level 0 of a 2D texture.
+    HeapShape { level: u32, texture_type: u8 },
+    /// The heap texture's format is not one Metal can render into.
+    HeapFormat { fmt: u16 },
+    /// A mip>0 view of a buffer-backed texture, which has one level.
+    BufferTextureMipView { level: u32 },
+    /// The buffer-backed texture's format is not one Metal can render into.
+    BufferTextureFormat { fmt: u16 },
+    /// The buffer under a buffer-backed texture could not be resolved.
+    BufferTextureBacking { buffer_ref: u32 },
+    /// The texture's rows run past the end of its buffer.
+    BufferTextureSpan { end: u64, size: u64 },
     /// The texture entry's descriptor bytes could not be read.
     LinearDescRead,
     /// The bytes were read and are not a texture descriptor. Carries the
@@ -547,6 +578,16 @@ impl crate::observe::Decline for RenderTargetRefusal {
             C::Type4Format { .. } => "rt_type4_format",
             C::NoListEntry => crate::observe::ladder_slug!("rt", no_list_entry),
             C::WrongType { .. } => crate::observe::ladder_slug!("rt", wrong_type),
+            C::MemorylessMipView { .. } => "rt_memoryless_mip_view",
+            C::MemorylessDescRead => "rt_memoryless_desc_read",
+            C::MemorylessDescDecode { .. } => "rt_memoryless_desc_decode",
+            C::MemorylessFormat { .. } => "rt_memoryless_format",
+            C::HeapShape { .. } => "rt_heap_shape",
+            C::HeapFormat { .. } => "rt_heap_format",
+            C::BufferTextureMipView { .. } => "rt_buffer_texture_mip_view",
+            C::BufferTextureFormat { .. } => "rt_buffer_texture_format",
+            C::BufferTextureBacking { .. } => "rt_buffer_texture_backing",
+            C::BufferTextureSpan { .. } => "rt_buffer_texture_span",
             C::LinearDescRead => crate::observe::ladder_slug!("rt_linear", desc_read),
             C::LinearDescDecode { .. } => crate::observe::ladder_slug!("rt_linear", desc_decode),
             C::LinearDescIncomplete { .. } => "rt_linear_desc_incomplete",
@@ -569,7 +610,9 @@ impl crate::observe::Decline for RenderTargetRefusal {
         use RenderTargetCause as C;
         let mut v = vec![("base", self.base_ref.to_string())];
         match self.cause {
-            C::Type11MipView { level } | C::LinearLevelGva { level } => {
+            C::Type11MipView { level }
+            | C::LinearLevelGva { level }
+            | C::MemorylessMipView { level } => {
                 v.push(("level", level.to_string()))
             }
             C::LevelOverflow {
@@ -594,7 +637,9 @@ impl crate::observe::Decline for RenderTargetRefusal {
                 v.push(("mid", mapping_id.to_string()));
                 v.push(("fmt", format!("{fmt:#x}")));
             }
-            C::Type5DescDecode { len } => v.push(("desc_len", len.to_string())),
+            C::Type5DescDecode { len } | C::MemorylessDescDecode { len } => {
+                v.push(("desc_len", len.to_string()))
+            }
             C::Type4MipView { surface_id, level } => {
                 v.push(("sid", surface_id.to_string()));
                 v.push(("level", level.to_string()));
@@ -645,7 +690,23 @@ impl crate::observe::Decline for RenderTargetRefusal {
                 v.push(("dims", format!("{width}x{height}")));
                 v.push(("bpr", row_stride.to_string()));
             }
-            C::LinearFormat { fmt } => v.push(("fmt", format!("{fmt:#x}"))),
+            C::HeapShape {
+                level,
+                texture_type,
+            } => {
+                v.push(("level", level.to_string()));
+                v.push(("type", texture_type.to_string()));
+            }
+            C::HeapFormat { fmt } => v.push(("fmt", format!("{fmt:#x}"))),
+            C::BufferTextureMipView { level } => v.push(("level", level.to_string())),
+            C::BufferTextureBacking { buffer_ref } => v.push(("buf", buffer_ref.to_string())),
+            C::BufferTextureSpan { end, size } => {
+                v.push(("end", end.to_string()));
+                v.push(("size", size.to_string()));
+            }
+            C::LinearFormat { fmt }
+            | C::MemorylessFormat { fmt }
+            | C::BufferTextureFormat { fmt } => v.push(("fmt", format!("{fmt:#x}"))),
             C::LinearLevelStride { row_stride } => v.push(("bpr", row_stride.to_string())),
             C::LinearLevelSpan { row_stride, height } => {
                 v.push(("bpr", row_stride.to_string()));
@@ -691,6 +752,7 @@ impl crate::observe::Decline for RenderTargetRefusal {
             | C::Type5DescRead
             | C::Type5SurfaceZero
             | C::NoListEntry
+            | C::MemorylessDescRead
             | C::LinearDescRead => {}
         }
         v
@@ -798,6 +860,7 @@ fn resolve_render_target<M: HostMemory + HostOps>(
     //    descriptor, not prefer the latch. Preferring latch routed dual-mid
     //    full-screen desktop composites onto only one mid (mid=3 nz=6M vs
     //    mid=4 stuck logo nz=1.97M; damage rects then preserved logo via Load).
+    state.heap_texture_targets.remove(&(task_id, texture_ref));
     let live = objects::lookup_list_entry(state, host, task_id, resolved_ref);
     let live_type = live.as_ref().map(|e| e.object_type);
     if let Some(ot) = live_type {
@@ -836,6 +899,26 @@ fn resolve_render_target<M: HostMemory + HostOps>(
         }
         .ok_or(C::Type11Unresolved.at(resolved_ref))?;
         let _ = mapper::ensure_resolved_for_scanout(state, host, mapping_id);
+        let (decl_w, decl_h, decl_fmt) = if live_type == Some(OBJECT_TYPE_IOSURFACE) {
+            objects::resolve_resource(state, host, task_id, resolved_ref)
+                .ok()
+                .and_then(|res| match res.decoded().as_ref().ok() {
+                    Some(crate::runtime::decode::resource::Descriptor::IOSurfaceTexture {
+                        width,
+                        height,
+                        pixel_format,
+                        ..
+                    }) => Some((*width, *height, *pixel_format)),
+                    _ => crate::contract::iosurface_pages::decode_texture_descriptor(
+                        &res.descriptor,
+                    )
+                    .ok()
+                    .map(|t| (t.width, t.height, t.pixel_format)),
+                })
+                .unwrap_or((0, 0, 0))
+        } else {
+            (0, 0, 0)
+        };
         // This rung is terminal either way, and both directions were already
         // true before it said so. A live type-11 that fails geometry must not
         // be decoded as type-2/3 — that is the sticky-latch bug above. And in
@@ -847,20 +930,35 @@ fn resolve_render_target<M: HostMemory + HostOps>(
             .mappings
             .get(&mapping_id)
             .ok_or(C::Type11NoMapping { mapping_id }.at(resolved_ref))?;
-        if !m.has_geom || m.width == 0 || m.height == 0 {
+        let rt_w = if decl_w != 0 && decl_h != 0 {
+            decl_w
+        } else {
+            m.width
+        };
+        let rt_h = if decl_w != 0 && decl_h != 0 {
+            decl_h
+        } else {
+            m.height
+        };
+        if (!m.has_geom && (rt_w == 0 || rt_h == 0)) || rt_w == 0 || rt_h == 0 {
             return Err(C::Type11Geometry {
                 mapping_id,
                 has_geom: m.has_geom,
-                width: m.width,
-                height: m.height,
+                width: rt_w,
+                height: rt_h,
             }
             .at(resolved_ref));
         }
         // Not `rt_type4_base_format`: a type-11 mapping's format has
         // writers other than the type-4 decoder, so 0 here can mean "not
         // latched yet" rather than "refused", and BGRA8 is the display
-        // contract's default for that case. See that function.
-        let base_fmt = if m.format != 0 {
+        // contract's default for that case. When the live type-11 texture
+        // descriptor names a per-plane format (e.g. BGR10_XR on plane 0 or
+        // R8Unorm on plane 1 of a 'b3a8' surface), honour its declared format
+        // rather than the whole-surface mapping format.
+        let base_fmt = if decl_fmt != 0 {
+            decl_fmt
+        } else if m.format != 0 {
             m.format
         } else {
             MTL_FORMAT_BGRA8_UNORM
@@ -872,11 +970,13 @@ fn resolve_render_target<M: HostMemory + HostOps>(
         return Ok(ResolvedRenderTarget {
             mapping_id,
             target_gva: 0,
-            width: m.width,
-            height: m.height,
+            width: rt_w,
+            height: rt_h,
             row_stride: 0,
             format: fmt,
             sample_count: 1,
+            memoryless: false,
+            buffer_backed: false,
         });
     }
     // x86 Ventura/Tahoe type-4 surface/backing (present IOSurface). Object-list
@@ -957,10 +1057,185 @@ fn resolve_render_target<M: HostMemory + HostOps>(
             row_stride: 0,
             format: fmt,
             sample_count: 1,
+            memoryless: false,
+            buffer_backed: false,
         });
     }
-    // type-2/3 linear GVA (wallpaper/background layers, UI intermediate RTs).
     let entry = live.ok_or(C::NoListEntry.at(resolved_ref))?;
+    // Type-9 memoryless: geometry and format only, rendered into a host image
+    // that exists for the pass.
+    if entry.object_type == OBJECT_TYPE_MEMORYLESS_TEXTURE {
+        if level != 0 {
+            return Err(C::MemorylessMipView { level }.at(resolved_ref));
+        }
+        let desc_bytes = objects::read_descriptor(state, host, task_id, &entry)
+            .ok_or(C::MemorylessDescRead.at(resolved_ref))?;
+        let tex = decode_memoryless_texture_descriptor(&desc_bytes).map_err(|_| {
+            C::MemorylessDescDecode {
+                len: desc_bytes.len(),
+            }
+            .at(resolved_ref)
+        })?;
+        let fmt = effective_view_sample_format(tex.pixel_format, view_fmt_override)
+            .unwrap_or(tex.pixel_format);
+        if pixel_format::render_target_bpp(fmt).is_none() {
+            return Err(C::MemorylessFormat { fmt }.at(resolved_ref));
+        }
+        if tex.width == 0 || tex.height == 0 {
+            return Err(C::ZeroExtent {
+                width: tex.width,
+                height: tex.height,
+            }
+            .at(resolved_ref));
+        }
+        let row_stride = pixel_format::tight_row_bytes(tex.width, fmt).ok_or(
+            C::RowTight {
+                width: tex.width,
+                fmt,
+            }
+            .at(resolved_ref),
+        )?;
+        return Ok(ResolvedRenderTarget {
+            mapping_id: 0,
+            target_gva: 0,
+            width: tex.width,
+            height: tex.height,
+            row_stride,
+            format: fmt,
+            sample_count: tex.sample_count,
+            memoryless: true,
+            buffer_backed: false,
+        });
+    }
+    // Type-8 heap texture: no guest storage at all, so it renders into an engine
+    // resident that later passes load from and sample. 26 and 27 place their
+    // Liquid Glass shapes and shadows in heaps.
+    if entry.object_type == OBJECT_TYPE_TEXTURE_VIEW {
+        let resolved_res = objects::resolve_resource(state, host, task_id, resolved_ref).ok();
+        let heap_info = resolved_res
+            .as_ref()
+            .and_then(|res| {
+                super::heap_texture_of(&res.descriptor).map(|h| (h, res.lifetime_ref().id()))
+            })
+            .or_else(|| {
+                objects::read_descriptor(state, host, task_id, &entry)
+                    .as_deref()
+                    .and_then(super::heap_texture_of)
+                    .map(|h| (h, 1))
+            });
+        if let Some((heap, generation)) = heap_info {
+            if level != 0 || heap.texture_type != 2 {
+                return Err(C::HeapShape {
+                    level,
+                    texture_type: heap.texture_type,
+                }
+                .at(resolved_ref));
+            }
+            let fmt = effective_view_sample_format(heap.format, view_fmt_override)
+                .unwrap_or(heap.format);
+            if pixel_format::render_target_bpp(fmt).is_none() {
+                return Err(C::HeapFormat { fmt }.at(resolved_ref));
+            }
+            if heap.width == 0 || heap.height == 0 {
+                return Err(C::ZeroExtent {
+                    width: heap.width,
+                    height: heap.height,
+                }
+                .at(resolved_ref));
+            }
+            let row_stride = pixel_format::tight_row_bytes(heap.width, fmt).ok_or(
+                C::LinearTightRow {
+                    width: heap.width,
+                    fmt,
+                }
+                .at(resolved_ref),
+            )?;
+            state.heap_texture_targets.insert(
+                (task_id, texture_ref),
+                crate::model::HeapTargetRef {
+                    base_ref: resolved_ref,
+                    generation,
+                    base_format: heap.format,
+                },
+            );
+            return Ok(ResolvedRenderTarget {
+                mapping_id: 0,
+                target_gva: 0,
+                width: heap.width,
+                height: heap.height,
+                row_stride,
+                format: fmt,
+                sample_count: heap.sample_count,
+                memoryless: false,
+                buffer_backed: false,
+            });
+        }
+    }
+    // Type-8 buffer-backed texture: rows of a type-1 buffer from an offset, so a
+    // linear GVA target at the buffer's address. macOS 27's Setup Assistant
+    // renders its panels into these.
+    if entry.object_type == OBJECT_TYPE_TEXTURE_VIEW {
+        if let Some(bt) = super::buffer_texture_descriptor(state, host, task_id, resolved_ref, None)
+        {
+            if level != 0 {
+                return Err(C::BufferTextureMipView { level }.at(resolved_ref));
+            }
+            let base_fmt = if bt.desc.pixel_format != 0 {
+                bt.desc.pixel_format
+            } else {
+                MTL_FORMAT_BGRA8_UNORM
+            };
+            let fmt = effective_view_sample_format(base_fmt, view_fmt_override).unwrap_or(base_fmt);
+            if pixel_format::render_target_bpp(fmt).is_none() {
+                return Err(C::BufferTextureFormat { fmt }.at(resolved_ref));
+            }
+            let (width, height) = (bt.desc.width, bt.desc.height);
+            if width == 0 || height == 0 {
+                return Err(C::ZeroExtent { width, height }.at(resolved_ref));
+            }
+            let tight = pixel_format::tight_row_bytes(width, fmt)
+                .ok_or(C::LinearTightRow { width, fmt }.at(resolved_ref))?;
+            let bpr = if bt.bytes_per_row == 0 {
+                u64::from(tight)
+            } else {
+                bt.bytes_per_row
+            };
+            if bpr < u64::from(tight) || bpr > u64::from(u32::MAX) {
+                return Err(C::RowStride {
+                    bpr: bpr.min(u64::from(u32::MAX)) as u32,
+                    tight,
+                }
+                .at(resolved_ref));
+            }
+            let (gva, size) = objects::resolve_buffer_span(state, host, task_id, bt.buffer_ref)
+                .map_err(|_| {
+                    C::BufferTextureBacking {
+                        buffer_ref: bt.buffer_ref,
+                    }
+                    .at(resolved_ref)
+                })?;
+            let end = bpr
+                .checked_mul(u64::from(height - 1))
+                .and_then(|n| n.checked_add(u64::from(tight)))
+                .and_then(|n| n.checked_add(bt.offset))
+                .unwrap_or(u64::MAX);
+            if end > size {
+                return Err(C::BufferTextureSpan { end, size }.at(resolved_ref));
+            }
+            return Ok(ResolvedRenderTarget {
+                mapping_id: 0,
+                target_gva: gva + bt.offset,
+                width,
+                height,
+                row_stride: bpr as u32,
+                format: fmt,
+                sample_count: 1,
+                memoryless: false,
+                buffer_backed: true,
+            });
+        }
+    }
+    // type-2/3 linear GVA (wallpaper/background layers, UI intermediate RTs).
     if entry.object_type != OBJECT_TYPE_TEXTURE && entry.object_type != OBJECT_TYPE_TEXTURE_VARIANT
     {
         return Err(C::WrongType {
@@ -1104,6 +1379,8 @@ fn resolve_render_target<M: HostMemory + HostOps>(
         row_stride: bpr,
         format: fmt,
         sample_count: 1,
+        memoryless: false,
+        buffer_backed: false,
     })
 }
 
@@ -1400,6 +1677,56 @@ mod tests {
         crate::runtime::decode::render::ColorAttachment {
             texture_ref,
             ..Default::default()
+        }
+    }
+
+    /// A type-11 surface declared in either packed ten-bit order is a render
+    /// target at that format, and its integer twin is still refused by name.
+    ///
+    /// macOS 26 and 27 render WindowServer surfaces in `BGR10A2Unorm`; each pass
+    /// was refused as `rt_type11_format fmt=0x5e`, and the pass that sampled the
+    /// surface afterwards found no bytes anywhere (`texture_resolve_missing`).
+    #[test]
+    fn a_type11_surface_in_either_ten_bit_order_is_a_render_target() {
+        use crate::contract::pixel_format::{
+            MTL_FORMAT_BGR10A2_UNORM, MTL_FORMAT_RGB10A2_UINT, MTL_FORMAT_RGB10A2_UNORM,
+        };
+        for (mid, tex_ref, format) in [
+            (91, 0x5d0u32, MTL_FORMAT_BGR10A2_UNORM),
+            (92, 0x5d1, MTL_FORMAT_RGB10A2_UNORM),
+            (93, 0x5d2, MTL_FORMAT_RGB10A2_UINT),
+        ] {
+            let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+            let host = FakeHost::new();
+            assert!(state.map_surface(mid));
+            {
+                let m = state.mappings.get_mut(&mid).unwrap();
+                m.has_geom = true;
+                m.width = 276;
+                m.height = 115;
+                m.format = format;
+            }
+            state.texture_to_mapping.insert((3, tex_ref), mid);
+
+            let cap = crate::observe::FailCapture::start();
+            let rt = lookup_render_target(&mut state, &host, 3, attach(tex_ref));
+            if format == MTL_FORMAT_RGB10A2_UINT {
+                assert!(rt.is_none(), "an integer word has no unorm converter");
+                let line = cap.one("rt_resolve");
+                assert!(line.starts_with("rt_resolve reason=rt_type11_format "), "{line}");
+                continue;
+            }
+            let rt = rt.unwrap_or_else(|| panic!("{format:#x}: {:?}", cap.lines()));
+            assert_eq!(
+                (rt.mapping_id, rt.width, rt.height, rt.format),
+                (mid, 276, 115, format),
+                "{format:#x}"
+            );
+            assert!(
+                !cap.lines().iter().any(|l| l.starts_with("rt_resolve")),
+                "{format:#x}: {:?}",
+                cap.lines()
+            );
         }
     }
 

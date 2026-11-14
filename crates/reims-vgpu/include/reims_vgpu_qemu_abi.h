@@ -238,13 +238,26 @@ typedef struct ReimsVgpuHostOps {
     uint32_t abi_version;
     uint32_t struct_size;
     void *ctx;
-    /* 0 = success. */
+    /*
+     * Guest physical memory, ordinary RAM only and never through the BQL:
+     * Rust calls these holding its device lock, which the BQL's holder may
+     * wait for. Every byte of the range must be RAM the CPU could access
+     * directly, writable RAM for a write; nothing is dispatched to a device,
+     * and the whole range is checked before any byte moves.
+     * 0 = success; -1 = some byte is not (writable) RAM; -3 = the range wraps
+     * the address space, or no buffer. On an error nothing was copied.
+     */
     int (*read_gpa)(void *ctx, uint64_t gpa, uint8_t *buf, size_t len);
     int (*write_gpa)(void *ctx, uint64_t gpa, const uint8_t *buf, size_t len);
     uint64_t (*mono_ns)(void *ctx);
     /* Safe from any thread; schedules a oneshot main-loop BH. */
     void (*schedule_bh)(void *ctx);
-    /* Guest kernel VA read (cpu_memory_rw_debug). 0 = success. */
+    /*
+     * Guest kernel VA read through the calling vCPU's MMU, under the same
+     * rules as read_gpa: the leaf and every page-table read of the walk must
+     * be RAM. 0 = success; -1 = no translation, or not RAM; -2 = no current
+     * vCPU; -3 as for read_gpa.
+     */
     int (*read_kva)(void *ctx, uint64_t kva, uint8_t *buf, size_t len);
     /* Guest CPU X-register read (iosfc mapper directed handoff). 0 = success. */
     int (*read_xreg)(void *ctx, uint32_t index, uint64_t *out);

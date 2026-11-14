@@ -42,9 +42,6 @@ use crate::observe::Decline;
 // longer downgrade at all: they carry the source format through to the bind.
 #[cfg(feature = "backend-vulkan")]
 use crate::runtime::census::srgb_census;
-// Only `vulkan` and the tests read it, through this module's `use super::*`;
-// the Metal arm tests the band instead (`load_action_in_contract`).
-#[cfg(any(test, feature = "backend-vulkan"))]
 use crate::contract::pass_action::MTL_LOAD_ACTION_DONT_CARE;
 #[cfg(any(
     feature = "backend-vulkan",
@@ -65,6 +62,9 @@ use crate::runtime::decode::resource::{
     BufferTextureDescriptor, DecodeStatus, RenderPipelineDescriptor, OBJECT_TYPE_IOSURFACE,
     OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_VARIANT, OBJECT_TYPE_TEXTURE_VIEW, OBJECT_TYPE_TYPE7,
     TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE, TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE_WIDE,
+};
+use crate::runtime::decode::resource::{
+    decode_heap_texture, HEAP_TEXTURE_OPCODE, HEAP_TEXTURE_WIDE_OPCODE,
 };
 use crate::runtime::gva_mem;
 use crate::runtime::host::{HostMemory, HostOps};
@@ -812,9 +812,19 @@ pub struct ColorRtRequest {
     pub store_action: u16,
     pub clear_color: [f64; 4],
     pub target_seed_rgba: Option<Vec<u8>>,
+    /// `Some(layout)` when `target_seed_rgba` holds attachment-native texels
+    /// rather than RGBA8.
+    pub target_seed_layout: Option<crate::contract::pixel_format::TexelLayout>,
     /// Multisample attachment discarded into this request's single-sample
     /// target at pass end. Zero for an ordinary colour attachment.
     pub multisample_source_ref: u32,
+    /// A type-9 memoryless texture: `mapping_id` and `target_gva` are both
+    /// zero, and the attachment is a host image keyed by `texture_ref` that is
+    /// never seeded from or written back to the guest.
+    pub memoryless: bool,
+    /// A type-8 buffer-backed texture whose Store writes directly to its
+    /// shared `MTLBuffer` pages rather than arming a texture-keyed GVA debt.
+    pub buffer_backed: bool,
 }
 
 /// One `setVisibilityResultMode:offset:`, as the encoder state it is.
@@ -954,6 +964,13 @@ pub struct DrawEncodeRequest {
     /// 0 means "no allocation named": color0 is not a GVA target, or the span
     /// does not fully walk. Vulkan rail only; the Metal arm never reads it.
     pub gva_alloc_gen: u64,
+    /// The pipeline ticket this draw waits on, both ways: set by the Vulkan rail
+    /// when the encode answers `EncodeStatus::PipelinePending`, and handed back
+    /// in when the draw is resumed, so the engine can give the draw the answer
+    /// its wait ended in exactly once. See
+    /// `backend::vulkan::engine::pipeline_compiler`.
+    #[cfg(feature = "backend-vulkan")]
+    pub pipeline_wait: Option<crate::backend::vulkan::engine::PipelineTicket>,
 }
 
 /// Compact command-level MRT census for the always-on draw proxy.
@@ -1186,6 +1203,11 @@ fn degrade_log_first(pipeline_ref: u32, slug: &'static str) -> bool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EncodeStatus {
     Ok,
+    /// Nothing was encoded because the draw's pipeline is still being built
+    /// (Vulkan only). Not a refusal: the draw's request carries the ticket in
+    /// `pipeline_wait`, and the caller runs the same draw again once the ticket
+    /// is answered. See `backend::vulkan::engine::pipeline_compiler`.
+    PipelinePending,
     #[cfg(all(feature = "backend-metal", target_os = "macos"))]
     MetalBackend(crate::backend::metal::error::Status),
     MissingPipeline(&'static str),
@@ -1206,9 +1228,10 @@ pub enum EncodeStatus {
 impl crate::observe::Refusal for EncodeStatus {
     fn refusal(&self) -> Option<&'static str> {
         match self {
-            // The only non-refusal, and the reason this is a `Refusal` rather
-            // than a `Decline`: `Emit::refusal` cannot render a line for it.
-            Self::Ok => None,
+            // The two non-refusals, and the reason this is a `Refusal` rather
+            // than a `Decline`: `Emit::refusal` cannot render a line for them.
+            // A pending pipeline has not run yet, which is not a loss.
+            Self::Ok | Self::PipelinePending => None,
             #[cfg(all(feature = "backend-metal", target_os = "macos"))]
             Self::MetalBackend(status) => status.refusal(),
             Self::MissingPipeline(slug)
@@ -1241,6 +1264,7 @@ impl EncodeStatus {
     pub fn class(&self) -> &'static str {
         match self {
             Self::Ok => "ok",
+            Self::PipelinePending => "pipeline_pending",
             #[cfg(all(feature = "backend-metal", target_os = "macos"))]
             Self::MetalBackend(status) => {
                 if status.is_args() {
@@ -1370,15 +1394,11 @@ pub(crate) fn load_render_pipeline<M: HostMemory + HostOps>(
         );
         return None;
     };
-    // Both stages are required to build a pipeline, and the two are reported
-    // apart because they are different guest mistakes — the compute sibling
-    // names its one stage the same way, as `kernel_func_zero`.
+    // A vertex function is required. A fragment function is not: Metal runs a
+    // pipeline without one for its depth and stencil, and
+    // `pipeline_resolve` gives it a fragment stage that writes nothing.
     if p.vertex_func_ref == 0 {
         report.reason(task_id, pipeline_ref, "vertex_func_zero", "");
-        return None;
-    }
-    if p.fragment_func_ref == 0 {
-        report.reason(task_id, pipeline_ref, "fragment_func_zero", "");
         return None;
     }
     Some(p)
@@ -1424,7 +1444,7 @@ pub(crate) fn load_render_mtlb_pair<M: HostMemory + HostOps>(
     host: &M,
     task_id: u32,
     pipeline_ref: u32,
-) -> Result<(Vec<u8>, Vec<u8>), DrawPreparationDecline> {
+) -> Result<(Vec<u8>, Option<Vec<u8>>), DrawPreparationDecline> {
     let pd = load_render_pipeline(state, host, task_id, pipeline_ref).ok_or(
         DrawPreparationDecline::PipelineMissing {
             task_id,
@@ -1437,17 +1457,23 @@ pub(crate) fn load_render_mtlb_pair<M: HostMemory + HostOps>(
             function_ref: pd.vertex_func_ref,
         },
     )?;
-    let f_mtlb = load_mtlb(
-        state,
-        host,
-        task_id,
-        pd.fragment_func_ref,
-        AirLoadRail::Draw,
-    )
-    .ok_or(DrawPreparationDecline::FragmentMtlbMissing {
-        task_id,
-        function_ref: pd.fragment_func_ref,
-    })?;
+    let f_mtlb = if pd.fragment_func_ref == 0 {
+        None
+    } else {
+        Some(
+            load_mtlb(
+                state,
+                host,
+                task_id,
+                pd.fragment_func_ref,
+                AirLoadRail::Draw,
+            )
+            .ok_or(DrawPreparationDecline::FragmentMtlbMissing {
+                task_id,
+                function_ref: pd.fragment_func_ref,
+            })?,
+        )
+    };
     Ok((v_mtlb, f_mtlb))
 }
 
@@ -1665,6 +1691,44 @@ fn load_buffer_bytes<M: HostMemory + HostOps>(
     read_buffer_bytes_resolved(state, host, task_id, buffer_ref, &backing, offset, None)
 }
 
+/// A texture placed in a heap (type 8, opcode 0x15 or 0x38).
+///
+/// Heaps are host memory the guest never maps, so such a texture has no bytes
+/// this device can read: it lives only in an engine resident, rendered into and
+/// sampled by passes (see `vulkan::heap_target_identity`).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct HeapTexture {
+    pub width: u32,
+    pub height: u32,
+    pub format: u16,
+    pub sample_count: u32,
+    pub texture_type: u8,
+    pub mip_levels: u32,
+}
+
+/// The heap texture a type-8 descriptor creates, or `None` for any other record.
+pub(crate) fn heap_texture_of(desc: &[u8]) -> Option<HeapTexture> {
+    let opcode = texture_type8_opcode(desc)?;
+    if opcode != HEAP_TEXTURE_OPCODE && opcode != HEAP_TEXTURE_WIDE_OPCODE {
+        return None;
+    }
+    let record = decode_heap_texture(desc).ok()?;
+    let body = if record.wide {
+        crate::runtime::heap_query::decode_wide_serialized_texture_descriptor(record.descriptor)
+    } else {
+        crate::runtime::heap_query::decode_serialized_texture_descriptor(record.descriptor)
+    }
+    .ok()?;
+    Some(HeapTexture {
+        width: body.width,
+        height: body.height,
+        format: body.pixel_format,
+        sample_count: u32::from(body.sample_count.max(1)),
+        texture_type: body.texture_type,
+        mip_levels: u32::from(body.mipmap_level_count).max(1),
+    })
+}
+
 /// If `texture_ref` is a type-8 object whose descriptor is a buffer-backed
 /// texture (view_opcode 9, `newTextureWithDescriptor:offset:bytesPerRow:`, or
 /// its `TextureDescriptor2` form), return its decoded descriptor. `None` for a
@@ -1739,9 +1803,18 @@ pub(crate) fn note_sampled_narrowing(
     if !crate::observe::first_sight(site, key) {
         return;
     }
+    // A ten-bit unorm channel always fits; only its low two bits go.
+    let lost = match fmt {
+        pixel_format::MTL_FORMAT_RGB10A2_UNORM
+        | pixel_format::MTL_FORMAT_BGR10A2_UNORM
+        | pixel_format::MTL_FORMAT_RGBA16_UNORM => {
+            "256_levels"
+        }
+        _ => "clamp_to_unit_and_256_levels",
+    };
     crate::observe::fail(format!(
         "sampled_texture_narrowed reason={site} ref={texture_ref} fmt={fmt:#x} {w}x{h} \
-         to=rgba8 lost=clamp_to_unit_and_256_levels"
+         to=rgba8 lost={lost}"
     ));
 }
 
@@ -1753,13 +1826,14 @@ pub(crate) fn note_sampled_narrowing(
 /// every early-return here logs a fail-visible reason (the buffer is unresolved,
 /// the format is unknown, or the span overruns the buffer) — those are real
 /// dropped-draw causes, not speculative "not ready yet" polls.
-fn load_buffer_texture_rgba<M: HostMemory + HostOps>(
+fn load_buffer_texture_sampled<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
     texture_ref: u32,
     bt: &BufferTextureDescriptor,
-) -> Option<(u32, u32, Vec<u8>)> {
+    native: NativeUploads,
+) -> Option<(u32, u32, Vec<u8>, SampledByteFormat)> {
     let (w, h) = (bt.desc.width, bt.desc.height);
     if w == 0 || h == 0 {
         crate::observe::fail(format!(
@@ -1780,7 +1854,6 @@ fn load_buffer_texture_rgba<M: HostMemory + HostOps>(
         ));
         return None;
     };
-    // A guest bytesPerRow of 0 means tight rows (single-row / API default).
     let bpr = if bt.bytes_per_row == 0 {
         tight as u64
     } else {
@@ -1794,13 +1867,6 @@ fn load_buffer_texture_rgba<M: HostMemory + HostOps>(
         return None;
     }
     let span = bpr.checked_mul(h as u64)?;
-    // A buffer-backed texture is two contract references over one allocation:
-    // the type-8 texture object the guest binds and samples, and the type-1
-    // buffer that owns the storage. A synchronize names the former and a debt
-    // may be armed under either, so both are paid. `load_buffer_bytes` below
-    // pays for `bt.buffer_ref`; this is the sibling call every other sampled
-    // rail makes, and its absence here is what let a rendered frame stay in a
-    // host resident while this read served the guest the frame before it.
     crate::runtime::writeback_debt::pay_for_texture(state, host, task_id, texture_ref);
     let raw = load_buffer_bytes(state, host, task_id, bt.buffer_ref, bt.offset)?;
     if (raw.len() as u64) < span {
@@ -1811,6 +1877,24 @@ fn load_buffer_texture_rgba<M: HostMemory + HostOps>(
             raw.len()
         ));
         return None;
+    }
+    if let Some(layout) = linear_native_upload_format(fmt, native).filter(|layout| {
+        (tight as u64) == (w as u64).saturating_mul(layout.bytes_per_texel() as u64)
+    }) {
+        let tight_usize = tight as usize;
+        let bpr_usize = bpr as usize;
+        let out_len = tight_usize.checked_mul(h as usize)?;
+        let out = if bpr_usize == tight_usize && raw.len() == out_len {
+            raw
+        } else {
+            let mut packed = vec![0u8; out_len];
+            for y in 0..h as usize {
+                packed[y * tight_usize..(y + 1) * tight_usize]
+                    .copy_from_slice(&raw[y * bpr_usize..y * bpr_usize + tight_usize]);
+            }
+            packed
+        };
+        return Some((w, h, out, SampledByteFormat::from_source(layout, fmt)));
     }
     note_sampled_narrowing("buftex_narrowed", texture_ref, fmt, w, h);
     let row_pixels = w as usize;
@@ -1829,7 +1913,24 @@ fn load_buffer_texture_rgba<M: HostMemory + HostOps>(
             return None;
         }
     }
-    Some((w, h, rgba))
+    Some((
+        w,
+        h,
+        rgba,
+        SampledByteFormat::from_source(TexelLayout::Rgba8, fmt),
+    ))
+}
+
+#[cfg_attr(feature = "backend-vulkan", allow(dead_code))]
+fn load_buffer_texture_rgba<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    texture_ref: u32,
+    bt: &BufferTextureDescriptor,
+) -> Option<(u32, u32, Vec<u8>)> {
+    load_buffer_texture_sampled(state, host, task_id, texture_ref, bt, NativeUploads::NONE)
+        .map(|(w, h, r, _)| (w, h, r))
 }
 
 fn index_elem_size(index_type: u32) -> Option<usize> {
@@ -4332,6 +4433,8 @@ pub fn writeback_chain_rgba<M: HostMemory + HostOps>(
         row_stride: bpr,
         format: fmt,
         sample_count: _,
+        memoryless: _,
+        buffer_backed: _,
     }) = lookup_render_target(state, host, task_id, *att)
     else {
         return lost("render_target_unresolved");
@@ -4360,6 +4463,10 @@ pub fn writeback_chain_rgba<M: HostMemory + HostOps>(
                 false
             }
         };
+    }
+    if mapping_id == 0 && state.heap_texture_targets.contains_key(&(task_id, att.texture_ref)) {
+        // A heap texture's frame is its resident; there is nothing to land.
+        return true;
     }
     if mapping_id == 0 {
         return lost("no_mapping_and_no_gva");
@@ -4451,7 +4558,10 @@ pub fn color_target_request<M: HostMemory + HostOps>(
         store_action: MTL_STORE_ACTION_STORE,
         clear_color: [0.0; 4],
         target_seed_rgba: None,
+        target_seed_layout: None,
         multisample_source_ref: 0,
+        memoryless: rt.memoryless,
+        buffer_backed: rt.buffer_backed,
     };
     Some(DrawEncodeRequest {
         task_id,
@@ -4588,6 +4698,8 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
             row_stride: bpr,
             format: mfmt,
             sample_count: target_sample_count,
+            memoryless,
+            buffer_backed,
         } = target;
         #[cfg(feature = "backend-vulkan")]
         let attachment_sample_count = pipeline_sample_count.unwrap_or(target_sample_count);
@@ -4596,7 +4708,16 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
         if base_w == 0 {
             base_w = mw;
             base_h = mh;
-        } else if mw != base_w || mh != base_h {
+        } else if {
+            #[cfg(feature = "backend-vulkan")]
+            {
+                mw < base_w || mh < base_h
+            }
+            #[cfg(not(feature = "backend-vulkan"))]
+            {
+                mw != base_w || mh != base_h
+            }
+        } {
             // An attachment whose geometry differs from the first one is
             // dropped, and the draw goes on with the rest. **This is a loss the
             // guest is not told about**: the shader still writes that
@@ -4630,7 +4751,35 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
         let mut load_action = att.load_action;
         let mut clear_color = att.clear_color;
         let mut seed = None;
-        if let Some(cl) = clears.iter().find(|a| a.texture_ref == att.texture_ref) {
+        let heap = mapping_id == 0
+            && gva == 0
+            && !memoryless
+            && state.heap_texture_targets.contains_key(&(task_id, target_ref));
+        if heap {
+            // A heap texture's content lives in its engine resident. On Vulkan,
+            // both colour0 (`encode_draw_chain`) and secondary slots
+            // (`build_secondary_targets`) load from that resident when ready
+            // and start cleared when unrendered; on Metal a secondary has no
+            // resident rail and starts undefined.
+            if let Some(cl) = clears.iter().find(|a| a.texture_ref == att.texture_ref) {
+                load_action = MTL_LOAD_ACTION_CLEAR;
+                clear_color = cl.clear_color;
+            } else if load_action == MTL_LOAD_ACTION_LOAD && !colors.is_empty() {
+                #[cfg(not(feature = "backend-vulkan"))]
+                {
+                    load_action = MTL_LOAD_ACTION_DONT_CARE;
+                }
+            }
+        } else if memoryless {
+            // Nothing to seed from: a memoryless attachment starts cleared or
+            // undefined, and Metal refuses a LOAD on one.
+            if let Some(cl) = clears.iter().find(|a| a.texture_ref == att.texture_ref) {
+                load_action = MTL_LOAD_ACTION_CLEAR;
+                clear_color = cl.clear_color;
+            } else if load_action != MTL_LOAD_ACTION_CLEAR {
+                load_action = MTL_LOAD_ACTION_DONT_CARE;
+            }
+        } else if let Some(cl) = clears.iter().find(|a| a.texture_ref == att.texture_ref) {
             // Clear-only stream record for this attachment: real Metal Clear.
             load_action = MTL_LOAD_ACTION_CLEAR;
             clear_color = cl.clear_color;
@@ -4684,8 +4833,30 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
                 // slot number, which is the guest's and need not start at zero.
                 let elided = elided && colors.is_empty();
                 gva_load_from_resident = elided;
+                let mut seed_layout = None;
                 if !elided {
-                    seed = seed_color_load(state, host, task_id, att.texture_ref, gva, mw, mh);
+                    #[cfg(feature = "backend-vulkan")]
+                    {
+                        if let Some((bytes, layout)) = seed_color_load_native(
+                            state,
+                            host,
+                            task_id,
+                            att.texture_ref,
+                            gva,
+                            mw,
+                            mh,
+                            mfmt,
+                        ) {
+                            seed = Some(bytes);
+                            if layout != TexelLayout::Rgba8 {
+                                seed_layout = Some(layout);
+                            }
+                        }
+                    }
+                    #[cfg(not(feature = "backend-vulkan"))]
+                    {
+                        seed = seed_color_load(state, host, task_id, att.texture_ref, gva, mw, mh);
+                    }
                     if seed.is_none() {
                         crate::observe::fail(format!(
                             "color LOAD seed miss ref={} {}x{} fmt={:#x} gva={:#x} (archive: still encode)",
@@ -4693,6 +4864,26 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
                         ));
                     }
                 }
+                colors.push(ColorRtRequest {
+                    slot,
+                    texture_ref: target_ref,
+                    mapping_id,
+                    target_gva: gva,
+                    row_stride: bpr,
+                    width: mw,
+                    height: mh,
+                    format: mfmt,
+                    sample_count: attachment_sample_count,
+                    load_action,
+                    store_action: att.store_action,
+                    clear_color,
+                    target_seed_rgba: seed,
+                    target_seed_layout: seed_layout,
+                    multisample_source_ref,
+                    memoryless,
+                    buffer_backed,
+                });
+                continue;
             }
         }
         colors.push(ColorRtRequest {
@@ -4709,7 +4900,10 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
             store_action: att.store_action,
             clear_color,
             target_seed_rgba: seed,
+            target_seed_layout: None,
             multisample_source_ref,
+            memoryless,
+            buffer_backed,
         });
     }
     if colors.is_empty() {
@@ -4812,6 +5006,77 @@ pub(crate) fn write_gva_rgba8<M: HostMemory + HostOps>(
 /// closed on its own terms, and refusing on an empty capture would drop live
 /// Stores whenever the capture failed for an unrelated reason. If that counter
 /// stays at zero it can be tightened with evidence.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "matches resolved colour target fields without widening ColorRtRequest"
+)]
+pub(crate) fn resolve_alpha_plane_for_target<M: HostMemory>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    texture_ref: u32,
+    target_gva: u64,
+    width: u32,
+    height: u32,
+    format: u16,
+) -> Option<(u64, u32)> {
+    if !pixel_format::is_two_plane_xr10(format)
+        || texture_ref == 0
+        || target_gva == 0
+        || width == 0
+        || height == 0
+    {
+        return None;
+    }
+    let mut cur = texture_ref;
+    for _ in 0..MAX_TEXTURE_VIEW_CHAIN {
+        let entry = objects::lookup_list_entry(state, host, task_id, cur)?;
+        if entry.object_type != OBJECT_TYPE_TEXTURE_VIEW {
+            break;
+        }
+        let (_, desc) =
+            objects::resolve_descriptor(state, host, task_id, cur, &[OBJECT_TYPE_TEXTURE_VIEW])
+                .ok()?;
+        let view = crate::runtime::decode::resource::decode_texture_view_descriptor(&desc).ok()?;
+        if view.carries_range() && (view.level_base != 0 || view.slice_base != 0) {
+            return None;
+        }
+        if view.base_texture_ref == 0 || view.base_texture_ref == cur {
+            return None;
+        }
+        cur = view.base_texture_ref;
+    }
+    let (_, desc_bytes) = objects::resolve_descriptor(
+        state,
+        host,
+        task_id,
+        cur,
+        &[OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_VARIANT],
+    )
+    .ok()?;
+    let tex = decode_texture_descriptor(&desc_bytes).ok()?;
+    let (p0_gva, _) = tex.level_gva(0, state.page_shift)?;
+    if p0_gva != target_gva {
+        return None;
+    }
+    let (alpha_gva, alpha) = tex.alpha_plane_gva(state.page_shift)?;
+    if alpha_gva == 0
+        || alpha.width != width
+        || alpha.height != height
+        || alpha.row_stride < u64::from(width)
+        || alpha.row_stride > u64::from(u32::MAX)
+    {
+        return None;
+    }
+    if tex.allocation_size != 0 {
+        let end = alpha.offset.saturating_add(alpha.slice_read_span(width)?);
+        if end > tex.allocation_size {
+            return None;
+        }
+    }
+    Some((alpha_gva, alpha.row_stride as u32))
+}
+
 pub(crate) fn sync_store_target_pages<M: HostMemory>(
     state: &DeviceState,
     host: &M,
@@ -4838,12 +5103,30 @@ pub(crate) fn sync_store_target_pages<M: HostMemory>(
         crate::runtime::drain::note_store_route("sync_store_unbounded");
         return None;
     }
+    let mut set: std::collections::HashSet<u64> = ordered.iter().copied().collect();
+    if let Some((alpha_gva, alpha_bpr)) = resolve_alpha_plane_for_target(
+        state,
+        host,
+        task_id,
+        c.texture_ref,
+        c.target_gva,
+        c.width,
+        c.height,
+        c.format,
+    ) {
+        if let Some(alpha_span) = (alpha_bpr as u64).checked_mul(c.height as u64) {
+            set.extend(crate::runtime::gva_mem::task_gva_page_gpas(
+                host,
+                &state.tasks,
+                task_id,
+                alpha_gva,
+                alpha_span,
+                state.page_shift,
+            ));
+        }
+    }
     crate::runtime::drain::note_store_route("sync_store_bound");
-    Some(StoreTargetPages {
-        set: ordered.iter().copied().collect(),
-        ordered,
-        span,
-    })
+    Some(StoreTargetPages { set, ordered, span })
 }
 
 /// The guest pages a synchronous GVA render Store may write, from one walk
@@ -4948,6 +5231,218 @@ pub(crate) fn write_gva_rgba8_within<M: HostMemory + HostOps>(
     )
 }
 
+#[cfg(feature = "backend-vulkan")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the archive writer mirrors the target GVA and native row geometry"
+)]
+pub(crate) fn write_gva_native_within<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    gva: u64,
+    width: u32,
+    height: u32,
+    bpr: u32,
+    format: u16,
+    native: &[u8],
+    allowed: crate::runtime::gva_view::WindowPages<'_>,
+) -> Result<(), crate::runtime::host::MemError> {
+    use crate::runtime::host::MemError;
+    if gva == 0 || width == 0 || height == 0 || bpr == 0 {
+        return Err(MemError::BadArgs);
+    }
+    let Some(tight) = pixel_format::tight_row_bytes(width, format) else {
+        return Err(MemError::BadArgs);
+    };
+    if bpr < tight {
+        return Err(MemError::BadArgs);
+    }
+    let tight_usize = tight as usize;
+    let need = tight_usize.saturating_mul(height as usize);
+    if native.len() < need {
+        return Err(MemError::BadArgs);
+    }
+    let span = (height as u64).saturating_mul(bpr as u64);
+    if let Some(span_map) =
+        crate::runtime::gva_view::map_fresh_span_within(state, host, task_id, gva, span, allowed)
+    {
+        let (base, avail) = (span_map.ptr, span_map.avail);
+        let mut res = Ok(());
+        for y in 0..height as usize {
+            let src = &native[y * tight_usize..(y + 1) * tight_usize];
+            let off = y.saturating_mul(bpr as usize);
+            if off + tight_usize > avail {
+                res = Err(MemError::RunOutOfRange);
+                break;
+            }
+            unsafe {
+                std::ptr::copy_nonoverlapping(src.as_ptr(), base.add(off), tight_usize);
+            }
+        }
+        crate::runtime::gva_view::unmap_fresh_span(host, span_map);
+        return res;
+    }
+    for y in 0..height as usize {
+        let src = &native[y * tight_usize..(y + 1) * tight_usize];
+        let row_gva = gva.saturating_add((y as u64).saturating_mul(bpr as u64));
+        if let Err(err) = crate::runtime::gva_view::write_span_within(
+            state, host, task_id, row_gva, src, allowed,
+        ) {
+            let reason = crate::observe::Decline::slug(&err);
+            crate::observe::fail(format!(
+                "gva_write fail reason={reason} task={task_id} gva={row_gva:#x} span={span:#x} \
+                 row={y} rowlen={:#x} (native multi)",
+                src.len()
+            ));
+            return Err(err);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "backend-vulkan")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors the target GVA, optional Plane 1 alpha GVA, and row geometry"
+)]
+pub(crate) fn write_gva_xr10_from_rgba16f_within<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    gva: u64,
+    width: u32,
+    height: u32,
+    bpr: u32,
+    format: u16,
+    alpha_plane: Option<(u64, u32)>,
+    rgba16f: &[u8],
+    allowed: crate::runtime::gva_view::WindowPages<'_>,
+) -> Result<(), crate::runtime::host::MemError> {
+    use crate::runtime::host::MemError;
+    if gva == 0 || width == 0 || height == 0 || bpr == 0 || !pixel_format::is_xr10(format) {
+        return Err(MemError::BadArgs);
+    }
+    let Some(tight) = pixel_format::tight_row_bytes(width, format) else {
+        return Err(MemError::BadArgs);
+    };
+    if bpr < tight {
+        return Err(MemError::BadArgs);
+    }
+    if let Some((agva, abpr)) = alpha_plane {
+        if agva == 0 || abpr < width {
+            return Err(MemError::BadArgs);
+        }
+    }
+    let src_row_bytes = (width as usize)
+        .checked_mul(pixel_format::RGBA16F_BPP as usize)
+        .ok_or(MemError::BadArgs)?;
+    let need = src_row_bytes
+        .checked_mul(height as usize)
+        .ok_or(MemError::BadArgs)?;
+    if rgba16f.len() < need {
+        return Err(MemError::BadArgs);
+    }
+    let mut row_p0 = vec![0u8; tight as usize];
+    let mut row_p1 = alpha_plane.map(|_| vec![0u8; width as usize]);
+    for y in 0..height as usize {
+        let src = &rgba16f[y * src_row_bytes..(y + 1) * src_row_bytes];
+        if !pixel_format::encode_xr10_row_from_rgba16f(
+            format,
+            width,
+            src,
+            &mut row_p0,
+            row_p1.as_deref_mut(),
+        ) {
+            return Err(MemError::BadArgs);
+        }
+        let p0_row_gva = gva.saturating_add((y as u64).saturating_mul(bpr as u64));
+        crate::runtime::gva_view::write_span_within(
+            state, host, task_id, p0_row_gva, &row_p0, allowed,
+        )?;
+        if let (Some((agva, abpr)), Some(p1)) = (alpha_plane, row_p1.as_deref()) {
+            let p1_row_gva = agva.saturating_add((y as u64).saturating_mul(abpr as u64));
+            crate::runtime::gva_view::write_span_within(
+                state, host, task_id, p1_row_gva, p1, allowed,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "backend-vulkan")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors Plane 1 alpha GVA and row geometry"
+)]
+pub(crate) fn write_gva_xr10_alpha_from_rgba8_within<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    alpha_gva: u64,
+    width: u32,
+    height: u32,
+    alpha_bpr: u32,
+    rgba: &[u8],
+    allowed: crate::runtime::gva_view::WindowPages<'_>,
+) -> Result<(), crate::runtime::host::MemError> {
+    use crate::runtime::host::MemError;
+    if alpha_gva == 0 || width == 0 || height == 0 || alpha_bpr < width {
+        return Err(MemError::BadArgs);
+    }
+    let src_row_bytes = (width as usize)
+        .checked_mul(RGBA8_BPP as usize)
+        .ok_or(MemError::BadArgs)?;
+    let need = src_row_bytes
+        .checked_mul(height as usize)
+        .ok_or(MemError::BadArgs)?;
+    if rgba.len() < need {
+        return Err(MemError::BadArgs);
+    }
+    let mut row_p1 = vec![0u8; width as usize];
+    for y in 0..height as usize {
+        let src = &rgba[y * src_row_bytes..(y + 1) * src_row_bytes];
+        for (x, dst) in row_p1.iter_mut().enumerate() {
+            *dst = src[x * 4 + 3];
+        }
+        let p1_row_gva = alpha_gva.saturating_add((y as u64).saturating_mul(alpha_bpr as u64));
+        crate::runtime::gva_view::write_span_within(
+            state, host, task_id, p1_row_gva, &row_p1, allowed,
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "backend-vulkan")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors Plane 1 alpha GVA and row geometry"
+)]
+pub(crate) fn write_gva_solid_alpha_plane_within<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    alpha_gva: u64,
+    width: u32,
+    height: u32,
+    alpha_bpr: u32,
+    clear_alpha: f64,
+    allowed: crate::runtime::gva_view::WindowPages<'_>,
+) -> Result<(), crate::runtime::host::MemError> {
+    use crate::runtime::host::MemError;
+    if alpha_gva == 0 || width == 0 || height == 0 || alpha_bpr < width {
+        return Err(MemError::BadArgs);
+    }
+    let row_p1 = vec![pixel_format::f64_to_unorm8(clear_alpha); width as usize];
+    for y in 0..height as usize {
+        let p1_row_gva = alpha_gva.saturating_add((y as u64).saturating_mul(alpha_bpr as u64));
+        crate::runtime::gva_view::write_span_within(
+            state, host, task_id, p1_row_gva, &row_p1, allowed,
+        )?;
+    }
+    Ok(())
+}
+
 /// Land a solid colour into a GVA render target.
 ///
 /// One tight RGBA8 row is built and handed to the same writer every full-image
@@ -4964,9 +5459,7 @@ pub(crate) fn write_gva_rgba8_within<M: HostMemory + HostOps>(
     clippy::too_many_arguments,
     reason = "the same target GVA and native row geometry every GVA writer takes"
 )]
-// The CLEAR seed at the head of a draw chain is the only caller, and it is the
-// Vulkan rail's; the Metal rail seeds through its own encoder.
-#[cfg_attr(not(feature = "backend-vulkan"), allow(dead_code))]
+#[allow(dead_code)]
 pub(crate) fn write_gva_solid8<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -4978,20 +5471,74 @@ pub(crate) fn write_gva_solid8<M: HostMemory + HostOps>(
     format: u16,
     clear: &[f64; 4],
 ) -> Result<(), crate::runtime::host::MemError> {
-    let row = pixel_format::solid_rgba8(width, 1, clear);
-    write_gva_rows_within(
-        state,
-        host,
-        task_id,
-        gva,
-        width,
-        height,
-        bpr,
-        format,
-        &row,
-        SourceRows::Repeated,
-        None,
-    )
+    write_gva_solid_native_within(state, host, task_id, gva, width, height, bpr, format, clear, None)
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors the target GVA and native row geometry every GVA writer takes"
+)]
+pub(crate) fn write_gva_solid_native_within<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    gva: u64,
+    width: u32,
+    height: u32,
+    bpr: u32,
+    format: u16,
+    clear: &[f64; 4],
+    allowed: crate::runtime::gva_view::WindowPages<'_>,
+) -> Result<(), crate::runtime::host::MemError> {
+    use crate::runtime::host::MemError;
+    if gva == 0 || width == 0 || height == 0 || bpr == 0 {
+        return Err(MemError::BadArgs);
+    }
+    let Some(tight) = pixel_format::tight_row_bytes(width, format) else {
+        return Err(MemError::BadArgs);
+    };
+    if bpr < tight {
+        return Err(MemError::BadArgs);
+    }
+    let tight_usize = tight as usize;
+    let mut row = vec![0u8; tight_usize];
+    if !pixel_format::encode_solid_native_row(format, width, clear, &mut row) {
+        return Err(MemError::BadArgs);
+    }
+    let span = (height as u64).saturating_mul(bpr as u64);
+    if let Some(span_map) =
+        crate::runtime::gva_view::map_fresh_span_within(state, host, task_id, gva, span, allowed)
+    {
+        let (base, avail) = (span_map.ptr, span_map.avail);
+        let mut res = Ok(());
+        for y in 0..height as usize {
+            let off = y.saturating_mul(bpr as usize);
+            if off + tight_usize > avail {
+                res = Err(MemError::RunOutOfRange);
+                break;
+            }
+            unsafe {
+                std::ptr::copy_nonoverlapping(row.as_ptr(), base.add(off), tight_usize);
+            }
+        }
+        crate::runtime::gva_view::unmap_fresh_span(host, span_map);
+        return res;
+    }
+    for y in 0..height as usize {
+        let row_gva = gva.saturating_add((y as u64).saturating_mul(bpr as u64));
+        if let Err(err) =
+            crate::runtime::gva_view::write_span_within(state, host, task_id, row_gva, &row, allowed)
+        {
+            let reason = crate::observe::Decline::slug(&err);
+            crate::observe::fail(format!(
+                "gva_write fail reason={reason} task={task_id} gva={row_gva:#x} span={span:#x} 
+                 row={y} rowlen={:#x} (solid native multi)",
+                row.len()
+            ));
+            return Err(err);
+        }
+    }
+    Ok(())
 }
 
 /// Whether the source buffer holds one row per destination row, or a single row
@@ -5011,7 +5558,7 @@ pub(crate) enum SourceRows {
     ///
     /// Constructed only by [`write_gva_solid8`], which the Metal rail does not
     /// reach — the two arms seed a CLEAR through different encoders.
-    #[cfg_attr(not(feature = "backend-vulkan"), allow(dead_code))]
+    #[allow(dead_code)]
     Repeated,
 }
 
@@ -5550,6 +6097,47 @@ fn seed_color_load<M: HostMemory + HostOps>(
     Some(rgba)
 }
 
+/// [`seed_color_load`] for the Vulkan backend, keeping wide / half-float /
+/// ten-bit / integer guest texels native instead of clamping through the 8-bit
+/// `surface_cache` or RGBA8 row converter.
+#[cfg(feature = "backend-vulkan")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn seed_color_load_native<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    texture_ref: u32,
+    target_gva: u64,
+    width: u32,
+    height: u32,
+    target_format: u16,
+) -> Option<(Vec<u8>, TexelLayout)> {
+    let want_native = pixel_format::is_xr10(target_format)
+        || pixel_format::store_texel_order(target_format)
+            .is_some_and(|layout| !layout.is_four_byte_color());
+    if want_native {
+        let native = NativeUploads {
+            bgra8: false,
+            float16: true,
+            ten_bit: true,
+            unorm16: true,
+            integer_and_float32: true,
+        };
+        if let Some((bytes, fmt)) = load_sampled_rgba_static(
+            state,
+            host,
+            task_id,
+            texture_ref,
+            native,
+            crate::runtime::render_writeback::SettleSite::LinearTextureSeed,
+        ) {
+            return Some((bytes, fmt.layout()));
+        }
+    }
+    seed_color_load(state, host, task_id, texture_ref, target_gva, width, height)
+        .map(|rgba| (rgba, TexelLayout::Rgba8))
+}
+
 /// Resolve sampled texture RGBA without requiring Metal feature (color LOAD seed path).
 ///
 /// Type-8 views with a non-identity swizzle are rejected here: RT materialization does not
@@ -5565,13 +6153,30 @@ fn load_sampled_rgba_static<M: HostMemory + HostOps>(
 ) -> Option<(Vec<u8>, SampledByteFormat)> {
     // Opcode-9 buffer-backed texture (type-8): sample the source buffer directly.
     if let Some(bt) = buffer_texture_descriptor(state, host, task_id, texture_ref, None) {
-        let source = bt.desc.pixel_format;
-        return load_buffer_texture_rgba(state, host, task_id, texture_ref, &bt)
-            .map(|(_, _, r)| (r, SampledByteFormat::from_source(TexelLayout::Rgba8, source)));
+        return load_buffer_texture_sampled(state, host, task_id, texture_ref, &bt, native)
+            .map(|(_, _, r, fmt)| (r, fmt));
     }
     // Type-11 path via resolve.
     if let Some(mid) = objects::resolve_type11_ref(state, host, task_id, texture_ref) {
         let source = mapping_declared_format(state, mid, None);
+        if native.float16 && pixel_format::is_xr10(source) {
+            let _ = mapper::ensure_resolved_for_scanout(state, host, mid);
+            let geom = state
+                .mappings
+                .get(&mid)
+                .filter(|m| m.has_geom && m.width > 0 && m.height > 0)
+                .map(|m| (m.width, m.height));
+            if let Some((w, h)) = geom {
+                if let Some(bytes) =
+                    crate::runtime::mapping_write::read_xr10_to_rgba16f(state, host, mid, w, h)
+                {
+                    return Some((
+                        bytes,
+                        SampledByteFormat::from_source(TexelLayout::Rgba16Float, source),
+                    ));
+                }
+            }
+        }
         return load_type11_mapping_rgba(state, host, mid, None)
             .map(|(_, _, r)| (r, SampledByteFormat::from_source(TexelLayout::Rgba8, source)));
     }
@@ -5648,23 +6253,248 @@ fn load_type11_rgba_memoized<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     mid: u32,
-) -> Option<(std::sync::Arc<Vec<u8>>, LinearSampleIdentity)> {
-    let (w, h) = {
+    native_uploads: NativeUploads,
+) -> Option<(
+    std::sync::Arc<Vec<u8>>,
+    LinearSampleIdentity,
+    crate::contract::pixel_format::TexelLayout,
+)> {
+    let (w, h, declared_fmt) = {
         let m = state.mappings.get(&mid)?;
         if !m.has_geom || m.width == 0 || m.height == 0 {
             return None;
         }
-        (m.width, m.height)
+        (
+            m.width,
+            m.height,
+            crate::runtime::mapping_write::mapping_store_format(m),
+        )
     };
+    let identity_key = (1u64 << 63) | (1u64 << 62) | mid as u64;
+    let key = (mid, w, h);
+    if native_uploads.float16 && pixel_format::is_xr10(declared_fmt) {
+        if crate::runtime::mapper::ensure_resolved_for_scanout(state, host, mid) {
+            let windows = state.mappings.get(&mid).and_then(|m| {
+                let p0 = crate::runtime::mapping_write::type11_sample_window(
+                    m,
+                    w,
+                    h,
+                    declared_fmt,
+                )?;
+                let p1 = if pixel_format::is_two_plane_xr10(declared_fmt) {
+                    let win = crate::runtime::mapping_write::two_plane_xr10_alpha_window(m, w, h);
+                    if m.device_desc_complete().is_some() && win.is_none() {
+                        return None;
+                    }
+                    win
+                } else {
+                    None
+                };
+                Some((p0, p1))
+            });
+            if let Some(((base_off, surface_bpr, span_end), alpha_window)) = windows {
+                let p0_bpp = pixel_format::bytes_per_pixel(declared_fmt)?;
+                let p0_tight = w.checked_mul(p0_bpp)?;
+                let p0_len = host_alloc_len((p0_tight as u64).checked_mul(h as u64)?)?;
+                let p1_len = if alpha_window.is_some() {
+                    host_alloc_len((w as u64).checked_mul(h as u64)?)?
+                } else {
+                    0
+                };
+                let total_native = p0_len.checked_add(p1_len)?;
+                if p0_len > 0 {
+                    let mut scratch = std::mem::take(&mut state.type11_memo_scratch);
+                    prepare_memo_scratch(&mut scratch, total_native, total_native);
+                    let mut read_ok = crate::runtime::mapping_write::read_rect_raw_at(
+                        state,
+                        host,
+                        mid,
+                        crate::runtime::mapping_write::SurfaceWindow {
+                            base_off,
+                            bpr: surface_bpr,
+                            span_end,
+                            bpp: p0_bpp,
+                        },
+                        crate::runtime::mapping_write::Rect {
+                            origin_x: 0,
+                            origin_y: 0,
+                            width: w,
+                            height: h,
+                        },
+                        &mut scratch[..p0_len],
+                        p0_tight,
+                    );
+                    if read_ok {
+                        if let Some((a_off, a_bpr, a_end)) = alpha_window {
+                            read_ok = crate::runtime::mapping_write::read_rect_raw_at(
+                                state,
+                                host,
+                                mid,
+                                crate::runtime::mapping_write::SurfaceWindow {
+                                    base_off: a_off,
+                                    bpr: a_bpr,
+                                    span_end: a_end,
+                                    bpp: 1,
+                                },
+                                crate::runtime::mapping_write::Rect {
+                                    origin_x: 0,
+                                    origin_y: 0,
+                                    width: w,
+                                    height: h,
+                                },
+                                &mut scratch[p0_len..total_native],
+                                w,
+                            );
+                        }
+                    }
+                    if read_ok {
+                        if let Some(m) = state.type11_memo.get_touch(&key) {
+                            if m.layout == crate::contract::pixel_format::TexelLayout::Rgba16Float
+                                && m.native == scratch
+                            {
+                                let rgba = m.rgba.clone();
+                                let generation = m.generation;
+                                state.type11_memo_scratch = scratch;
+                                return Some((
+                                    rgba,
+                                    LinearSampleIdentity {
+                                        key: identity_key,
+                                        generation,
+                                    },
+                                    crate::contract::pixel_format::TexelLayout::Rgba16Float,
+                                ));
+                            }
+                        }
+                        let out_row =
+                            (w as usize).checked_mul(pixel_format::RGBA16F_BPP as usize)?;
+                        let out_len = out_row.checked_mul(h as usize)?;
+                        let mut decoded = vec![0u8; out_len];
+                        let p0_row = p0_tight as usize;
+                        let decode_ok = (0..h as usize).all(|y| {
+                            let s0 = &scratch[y * p0_row..(y + 1) * p0_row];
+                            let s1 = alpha_window.map(|_| {
+                                &scratch[p0_len + y * (w as usize)..p0_len + (y + 1) * (w as usize)]
+                            });
+                            let dst = &mut decoded[y * out_row..(y + 1) * out_row];
+                            pixel_format::decode_xr10_row_to_rgba16f(
+                                declared_fmt,
+                                w,
+                                s0,
+                                s1,
+                                dst,
+                            )
+                        });
+                        if decode_ok {
+                            let payload = std::sync::Arc::new(decoded);
+                            let generation = state.next_sampled_content_generation();
+                            let entry_bytes = scratch.len() + payload.len();
+                            state.type11_memo.insert(
+                                key,
+                                crate::model::GuestLinearMemo {
+                                    native: scratch,
+                                    rgba: payload.clone(),
+                                    layout: crate::contract::pixel_format::TexelLayout::Rgba16Float,
+                                    generation,
+                                },
+                                entry_bytes,
+                            );
+                            return Some((
+                                payload,
+                                LinearSampleIdentity {
+                                    key: identity_key,
+                                    generation,
+                                },
+                                crate::contract::pixel_format::TexelLayout::Rgba16Float,
+                            ));
+                        }
+                    }
+                    state.type11_memo_scratch = scratch;
+                }
+            }
+        }
+    }
+    if let Some(native_layout) = linear_native_upload_format(declared_fmt, native_uploads)
+        .filter(|layout| !layout.is_four_byte_color())
+    {
+        if crate::runtime::mapper::ensure_resolved_for_scanout(state, host, mid) {
+            let window = state
+                .mappings
+                .get(&mid)
+                .and_then(|m| crate::runtime::mapping_write::type11_sample_window(m, w, h, declared_fmt));
+            if let Some((base_off, surface_bpr, span_end)) = window {
+                let bpp = native_layout.bytes_per_texel();
+                let tight = w.checked_mul(bpp)?;
+                let span = host_alloc_len((tight as u64).checked_mul(h as u64)?)?;
+                if span > 0 {
+                    let mut scratch = std::mem::take(&mut state.type11_memo_scratch);
+                    prepare_memo_scratch(&mut scratch, span, span);
+                    if crate::runtime::mapping_write::read_rect_raw_at(
+                        state,
+                        host,
+                        mid,
+                        crate::runtime::mapping_write::SurfaceWindow {
+                            base_off,
+                            bpr: surface_bpr,
+                            span_end,
+                            bpp,
+                        },
+                        crate::runtime::mapping_write::Rect {
+                            origin_x: 0,
+                            origin_y: 0,
+                            width: w,
+                            height: h,
+                        },
+                        &mut scratch,
+                        tight,
+                    ) {
+                        if let Some(m) = state.type11_memo.get_touch(&key) {
+                            if m.layout == native_layout && m.native == scratch {
+                                let rgba = m.rgba.clone();
+                                let generation = m.generation;
+                                state.type11_memo_scratch = scratch;
+                                return Some((
+                                    rgba,
+                                    LinearSampleIdentity {
+                                        key: identity_key,
+                                        generation,
+                                    },
+                                    native_layout,
+                                ));
+                            }
+                        }
+                        let payload = std::sync::Arc::new(scratch.clone());
+                        let generation = state.next_sampled_content_generation();
+                        let entry_bytes = scratch.len() + payload.len();
+                        state.type11_memo.insert(
+                            key,
+                            crate::model::GuestLinearMemo {
+                                native: scratch,
+                                rgba: payload.clone(),
+                                layout: native_layout,
+                                generation,
+                            },
+                            entry_bytes,
+                        );
+                        return Some((
+                            payload,
+                            LinearSampleIdentity {
+                                key: identity_key,
+                                generation,
+                            },
+                            native_layout,
+                        ));
+                    }
+                    state.type11_memo_scratch = scratch;
+                }
+            }
+        }
+    }
     let sample_fmt = effective_view_sample_format(MTL_FORMAT_BGRA8_UNORM, None)?;
     let stride = w.saturating_mul(RGBA8_BPP);
     let span = host_alloc_len((stride as u64).checked_mul(h as u64)?)?;
     if span == 0 {
         return None;
     }
-    // Coherence re-read: land any resident-authoritative writeback and read the
-    // current native BGRA (read_mapping_bgra8 runs ensure_resolved_for_scanout +
-    // flush internally). Reuse the scratch so a memo hit costs no allocation.
     let mut scratch = std::mem::take(&mut state.type11_memo_scratch);
     prepare_memo_scratch(
         &mut scratch,
@@ -5677,15 +6507,8 @@ fn load_type11_rgba_memoized<M: HostMemory + HostOps>(
         state.type11_memo_scratch = scratch;
         return None;
     }
-    // Identity key namespace: bits 63+62 mark type-11 memo content, distinct from
-    // raw-GVA keys (bit 63 clear) and type-5 view keys (bit 63 set, bit 62 clear).
-    // Every producer draws its generation from
-    // `DeviceState::next_sampled_content_generation`, so a (key, generation)
-    // pair is unique device-wide and content can never alias on a collision.
-    let identity_key = (1u64 << 63) | (1u64 << 62) | mid as u64;
-    let key = (mid, w, h);
     if let Some(m) = state.type11_memo.get_touch(&key) {
-        if m.native == scratch {
+        if m.layout == crate::contract::pixel_format::TexelLayout::Rgba8 && m.native == scratch {
             let rgba = m.rgba.clone();
             let generation = m.generation;
             state.type11_memo_scratch = scratch;
@@ -5695,10 +6518,10 @@ fn load_type11_rgba_memoized<M: HostMemory + HostOps>(
                     key: identity_key,
                     generation,
                 },
+                crate::contract::pixel_format::TexelLayout::Rgba8,
             ));
         }
     }
-    // First sight or the native bytes changed: convert BGRA→RGBA fresh.
     let mut rgba = vec![0u8; span];
     let converted = (0..h as usize).all(|y| {
         let off = y * (stride as usize);
@@ -5721,9 +6544,195 @@ fn load_type11_rgba_memoized<M: HostMemory + HostOps>(
         crate::model::GuestLinearMemo {
             native: scratch,
             rgba: rgba.clone(),
-            // This rail converts every format to RGBA8 unconditionally — the
-            // loop above is `convert_row_to_rgba8` with no native arm — so the
-            // layout is fixed rather than chosen.
+            layout: crate::contract::pixel_format::TexelLayout::Rgba8,
+            generation,
+        },
+        entry_bytes,
+    );
+    Some((
+        rgba,
+        LinearSampleIdentity {
+            key: identity_key,
+            generation,
+        },
+        crate::contract::pixel_format::TexelLayout::Rgba8,
+    ))
+}
+
+/// A biplanar YCbCr surface bound whole, as macOS 14 and later bind their
+/// background video, expanded to RGBA8 on the CPU. The planes are re-read on
+/// every bind and memoized the way [`load_type11_rgba_memoized`] memoizes, so a
+/// paused frame costs a read and a compare, not a conversion and an upload.
+/// See [`crate::runtime::ycbcr`] for the two families, the matrix and the range.
+#[cfg(feature = "backend-vulkan")]
+fn load_type11_ycbcr_memoized<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mid: u32,
+    sampling: crate::runtime::ycbcr::Sampling,
+) -> Option<(std::sync::Arc<Vec<u8>>, LinearSampleIdentity)> {
+    use crate::contract::iosurface_pages::{
+        decode_device_surface, device_desc_plane, sample_window_from_device_plane,
+    };
+    use crate::contract::pixel_format::{
+        MTL_FORMAT_R16_UNORM, MTL_FORMAT_R8_UNORM, MTL_FORMAT_RG16_UNORM, MTL_FORMAT_RG8_UNORM,
+    };
+    use crate::runtime::ycbcr::{self, Biplanar};
+
+    let decline = |reason: &str, detail: String| {
+        if crate::observe::first_sight("ycbcr_sample_declined", u64::from(mid)) {
+            crate::observe::fail(format!("ycbcr_sample reason={reason} mid={mid} {detail}"));
+        }
+        None
+    };
+    let (layout, luma_window, chroma_window, fourcc) = {
+        let m = state.mappings.get(&mid)?;
+        let Some(desc) = m.device_desc_complete() else {
+            return decline("no_device_desc", format!("fmt={}", m.format));
+        };
+        let surface = decode_device_surface(desc)?;
+        let (Some((luma, _)), Some((chroma, _))) =
+            (device_desc_plane(desc, 0), device_desc_plane(desc, 1))
+        else {
+            return decline("planes", format!("planes={}", surface.plane_count));
+        };
+        let fourcc = surface.pixel_format;
+        let Some(layout) = Biplanar::from_planes(
+            surface.pixel_format,
+            (luma.width, luma.height, luma.bytes_per_element),
+            (chroma.width, chroma.height, chroma.bytes_per_element),
+        ) else {
+            return decline(
+                "layout",
+                format!(
+                    "fourcc={:#x} luma={}x{}x{} chroma={}x{}x{}",
+                    surface.pixel_format,
+                    luma.width,
+                    luma.height,
+                    luma.bytes_per_element,
+                    chroma.width,
+                    chroma.height,
+                    chroma.bytes_per_element
+                ),
+            );
+        };
+        let luma_window = sample_window_from_device_plane(
+            &luma,
+            if layout.sample_bytes == 2 {
+                MTL_FORMAT_R16_UNORM
+            } else {
+                MTL_FORMAT_R8_UNORM
+            },
+            layout.width,
+            layout.height,
+        );
+        let chroma_window = sample_window_from_device_plane(
+            &chroma,
+            if layout.sample_bytes == 2 {
+                MTL_FORMAT_RG16_UNORM
+            } else {
+                MTL_FORMAT_RG8_UNORM
+            },
+            layout.chroma_width(),
+            layout.chroma_height(),
+        );
+        let (Some(luma_window), Some(chroma_window)) = (luma_window, chroma_window) else {
+            return decline("window", format!("{layout:?}"));
+        };
+        (layout, luma_window, chroma_window, fourcc)
+    };
+    if !mapper::ensure_resolved_for_scanout(state, host, mid) {
+        return decline("unresolved", String::new());
+    }
+    let (w, h) = (layout.width, layout.height);
+    let (cw, ch) = (layout.chroma_width(), layout.chroma_height());
+    let s = layout.sample_bytes;
+    let luma_len = (w as usize) * (h as usize) * s as usize;
+    let chroma_len = (cw as usize) * 2 * (ch as usize) * s as usize;
+    let mut scratch = std::mem::take(&mut state.type11_memo_scratch);
+    scratch.resize(luma_len + chroma_len, 0);
+    let (luma, chroma) = scratch.split_at_mut(luma_len);
+    let read = |state: &mut DeviceState,
+                host: &mut M,
+                (base_off, bpr, span_end): (u64, u32, u64),
+                bpp: u32,
+                width: u32,
+                height: u32,
+                dst: &mut [u8]| {
+        mapping_write::read_rect_raw_at(
+            state,
+            host,
+            mid,
+            mapping_write::SurfaceWindow {
+                base_off,
+                bpr,
+                span_end,
+                bpp,
+            },
+            mapping_write::Rect {
+                origin_x: 0,
+                origin_y: 0,
+                width,
+                height,
+            },
+            dst,
+            width * bpp,
+        )
+    };
+    if !read(state, host, luma_window, s, w, h, luma)
+        || !read(state, host, chroma_window, 2 * s, cw, ch, chroma)
+    {
+        state.type11_memo_scratch = scratch;
+        return decline("read", format!("{layout:?}"));
+    }
+    // Each family's texels of one surface are a different image, so the family
+    // is part of both keys.
+    let family = sampling as u32;
+    let identity_key = (1u64 << 63) | (1u64 << 62) | (u64::from(family) << 40) | mid as u64;
+    let key = (mid, w | family << 30, h);
+    if let Some(m) = state.type11_memo.get_touch(&key) {
+        if m.native == scratch {
+            let rgba = m.rgba.clone();
+            let generation = m.generation;
+            state.type11_memo_scratch = scratch;
+            return Some((
+                rgba,
+                LinearSampleIdentity {
+                    key: identity_key,
+                    generation,
+                },
+            ));
+        }
+    }
+    let mut rgba = vec![0u8; (w as usize) * (h as usize) * 4];
+    let (luma, chroma) = scratch.split_at(luma_len);
+    if !ycbcr::to_rgba8(
+        layout,
+        sampling,
+        luma,
+        (w * s) as usize,
+        chroma,
+        (cw * 2 * s) as usize,
+        &mut rgba,
+    ) {
+        state.type11_memo_scratch = scratch;
+        return decline("convert", format!("{layout:?}"));
+    }
+    if crate::observe::first_sight("ycbcr_sample_converted", u64::from(mid)) {
+        let format = state.mappings.get(&mid).map_or(0, |m| m.format);
+        crate::observe::fail(format!(
+            "ycbcr_sample converted mid={mid} fmt={format} fourcc={fourcc:#x} {sampling:?} \
+             {layout:?} luma={luma_window:?} chroma={chroma_window:?}"
+        ));
+    }
+    let rgba = std::sync::Arc::new(rgba);
+    let generation = state.next_sampled_content_generation();
+    let entry_bytes = scratch.len() + rgba.len();
+    state.type11_memo.insert(
+        key,
+        crate::model::GuestLinearMemo {
+            native: scratch,
+            rgba: rgba.clone(),
             layout: crate::contract::pixel_format::TexelLayout::Rgba8,
             generation,
         },
@@ -5736,6 +6745,16 @@ fn load_type11_rgba_memoized<M: HostMemory + HostOps>(
             generation,
         },
     ))
+}
+/// [`load_type11_ycbcr_memoized`]'s texels alone, for compute staging.
+#[cfg(feature = "backend-vulkan")]
+pub(crate) fn load_ycbcr_rgba<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mid: u32,
+    sampling: crate::runtime::ycbcr::Sampling,
+) -> Option<std::sync::Arc<Vec<u8>>> {
+    load_type11_ycbcr_memoized(state, host, mid, sampling).map(|(rgba, _)| rgba)
 }
 
 #[cfg(test)]

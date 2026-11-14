@@ -107,17 +107,37 @@ fn prefix() -> String {
     format!("reims-vgpu-driver-test-{}", std::process::id())
 }
 
-/// One path per stage. Fixed rather than per-pipeline so a crash leaves exactly
-/// one set of files to look at, and so a previous boot's leftovers cannot
-/// accumulate.
-fn path(stage: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("{}-breadcrumb-{stage}.spv", prefix()))
+/// The thread making the call. Each has its own files and its own watch slot,
+/// because the drain thread and the pipeline compiler can be inside the driver
+/// at the same time; see [`crate::observe::driver_watch`].
+pub(crate) use crate::observe::driver_watch::WatchLane as DriverLane;
+
+/// The file-name infix that keeps one lane's breadcrumb out of the other's.
+///
+/// The drain lane keeps the names this module always used, so a breadcrumb a
+/// previous build left behind is still found.
+fn lane_infix(lane: DriverLane) -> &'static str {
+    match lane {
+        DriverLane::Drain => "",
+        DriverLane::Compiler => "-compiler",
+    }
+}
+
+/// One path per lane and stage. Fixed rather than per-pipeline so a crash
+/// leaves exactly one set of files per lane to look at, and so a previous
+/// boot's leftovers cannot accumulate.
+fn path(lane: DriverLane, stage: &str) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "{}{}-breadcrumb-{stage}.spv",
+        prefix(),
+        lane_infix(lane)
+    ))
 }
 
 /// The metadata file beside them, so a reader knows what the modules were for
 /// without disassembling anything.
-fn meta_path() -> PathBuf {
-    std::env::temp_dir().join(format!("{}-breadcrumb.txt", prefix()))
+fn meta_path(lane: DriverLane) -> PathBuf {
+    std::env::temp_dir().join(format!("{}{}-breadcrumb.txt", prefix(), lane_infix(lane)))
 }
 
 /// Live for the duration of a driver call that could take the process down or
@@ -126,6 +146,7 @@ fn meta_path() -> PathBuf {
 /// Dropping it removes the files and stops the watch, so a crash is the only way
 /// the files survive and a return is the only way the watch stops.
 pub(crate) struct DriverBreadcrumb {
+    lane: DriverLane,
     /// The stage tags whose files this guard owns, empty when nothing was
     /// written.
     stages: Vec<&'static str>,
@@ -149,13 +170,14 @@ impl DriverBreadcrumb {
     /// guest asked for. The clock watch is armed regardless, because it needs
     /// nothing from the filesystem.
     pub(crate) fn arm(
+        lane: DriverLane,
         what: &str,
         modules: &[(&'static str, &[u32])],
     ) -> Result<Self, quarantine::Quarantined> {
         if let Some(hit) = quarantine::check(modules) {
             return Err(hit);
         }
-        let watching = crate::observe::driver_watch::enter(what.to_string());
+        let watching = crate::observe::driver_watch::enter(lane, what.to_string());
         let mut stages = Vec::with_capacity(modules.len());
         let mut meta = format!("what={what}\n");
         for (stage, spirv) in modules {
@@ -163,10 +185,12 @@ impl DriverBreadcrumb {
             for word in *spirv {
                 bytes.extend_from_slice(&word.to_le_bytes());
             }
-            match std::fs::write(path(stage), &bytes) {
+            match std::fs::write(path(lane, stage), &bytes) {
                 Ok(()) => stages.push(*stage),
                 Err(e) => crate::observe::fail(format!(
-                    "driver_breadcrumb reason=write_failed what={what} stage={stage} err={e}"
+                    "driver_breadcrumb reason=write_failed lane={} what={what} stage={stage} \
+                     err={e}",
+                    lane.name()
                 )),
             }
             meta.push_str(&format!(
@@ -179,8 +203,12 @@ impl DriverBreadcrumb {
         // what the next process needs to recognise this call, and it costs
         // nothing that a failed `.spv` write should be allowed to take away.
         meta.push_str(&format!("key={}\n", quarantine::key_of(modules)));
-        let _ = std::fs::write(meta_path(), meta);
-        Ok(Self { stages, watching })
+        let _ = std::fs::write(meta_path(lane), meta);
+        Ok(Self {
+            lane,
+            stages,
+            watching,
+        })
     }
 
     /// The call returned, so the input is not the one that kills the process and
@@ -192,15 +220,15 @@ impl DriverBreadcrumb {
     fn clear(&mut self) {
         if self.watching {
             self.watching = false;
-            crate::observe::driver_watch::leave();
+            crate::observe::driver_watch::leave(self.lane);
         }
         if self.stages.is_empty() {
             return;
         }
         for stage in std::mem::take(&mut self.stages) {
-            let _ = std::fs::remove_file(path(stage));
+            let _ = std::fs::remove_file(path(self.lane, stage));
         }
-        let _ = std::fs::remove_file(meta_path());
+        let _ = std::fs::remove_file(meta_path(self.lane));
     }
 }
 
@@ -262,11 +290,16 @@ mod tests {
     fn both_stages_of_a_graphics_compile_reach_disk_and_are_taken_back() {
         let vert = [0x0723_0203u32, 0x0001_0000, 1];
         let frag = [0x0723_0203u32, 0x0001_0000, 2, 3];
-        let crumb = super::DriverBreadcrumb::arm("test_graphics", &[("vert", &vert), ("frag", &frag)])
-            .expect("a module nothing has crashed on is not quarantined");
+        let lane = super::DriverLane::Drain;
+        let crumb = super::DriverBreadcrumb::arm(
+            lane,
+            "test_graphics",
+            &[("vert", &vert), ("frag", &frag)],
+        )
+        .expect("a module nothing has crashed on is not quarantined");
 
-        let vert_path = super::path("vert");
-        let frag_path = super::path("frag");
+        let vert_path = super::path(lane, "vert");
+        let frag_path = super::path(lane, "frag");
         assert_eq!(
             std::fs::read(&vert_path).expect("the vertex module is on disk"),
             vert.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<_>>()
@@ -275,7 +308,8 @@ mod tests {
             std::fs::read(&frag_path).expect("the fragment module is on disk"),
             frag.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<_>>()
         );
-        let meta = std::fs::read_to_string(super::meta_path()).expect("the meta line is on disk");
+        let meta =
+            std::fs::read_to_string(super::meta_path(lane)).expect("the meta line is on disk");
         assert!(meta.contains("vert words=3"), "{meta}");
         assert!(meta.contains("frag words=4"), "{meta}");
 
@@ -293,21 +327,75 @@ mod tests {
     /// the arming site knows where the call is.
     #[test]
     fn an_armed_breadcrumb_puts_the_call_under_the_clock_watch() {
-        crate::observe::driver_watch::leave();
+        let lane = super::DriverLane::Drain;
+        crate::observe::driver_watch::leave(lane);
         let words = [0x0723_0203u32, 0x0001_0000];
-        let crumb = super::DriverBreadcrumb::arm("test_watched", &[("module", &words)])
+        let crumb = super::DriverBreadcrumb::arm(lane, "test_watched", &[("module", &words)])
             .expect("a module nothing has crashed on is not quarantined");
         assert_eq!(
-            crate::observe::driver_watch::watching().as_deref(),
+            crate::observe::driver_watch::watching(lane).as_deref(),
             Some("test_watched"),
             "the watch names the call this breadcrumb is bracketing"
         );
         crumb.disarm();
         assert_eq!(
-            crate::observe::driver_watch::watching(),
+            crate::observe::driver_watch::watching(lane),
             None,
             "a returned call is no longer outstanding"
         );
+    }
+
+    /// A compile on the pipeline compiler and a call on the drain thread can be
+    /// inside the driver together. Each lane's files are its own: arming one
+    /// does not overwrite the other's modules, and disarming one leaves the
+    /// other's evidence and watch in place.
+    #[test]
+    fn the_compiler_and_the_drain_keep_separate_breadcrumbs() {
+        use super::DriverLane;
+        for lane in DriverLane::ALL {
+            crate::observe::driver_watch::leave(lane);
+        }
+        let frag = [0x0723_0203u32, 0x0001_0000, 7, 7, 7];
+        let kernel = [0x0723_0203u32, 0x0001_0000, 9];
+        let compile = super::DriverBreadcrumb::arm(
+            DriverLane::Compiler,
+            "create_graphics_pipelines",
+            &[("frag", &frag)],
+        )
+        .expect("not quarantined");
+        let dispatch = super::DriverBreadcrumb::arm(
+            DriverLane::Drain,
+            "create_compute_pipelines",
+            &[("kernel", &kernel)],
+        )
+        .expect("not quarantined");
+
+        let compiler_frag = super::path(DriverLane::Compiler, "frag");
+        let drain_kernel = super::path(DriverLane::Drain, "kernel");
+        assert_ne!(super::meta_path(DriverLane::Compiler), super::meta_path(DriverLane::Drain));
+        assert!(compiler_frag.exists() && drain_kernel.exists());
+        assert_eq!(
+            crate::observe::driver_watch::watching(DriverLane::Compiler).as_deref(),
+            Some("create_graphics_pipelines")
+        );
+        assert_eq!(
+            crate::observe::driver_watch::watching(DriverLane::Drain).as_deref(),
+            Some("create_compute_pipelines")
+        );
+
+        dispatch.disarm();
+        assert!(!drain_kernel.exists());
+        assert!(
+            compiler_frag.exists() && super::meta_path(DriverLane::Compiler).exists(),
+            "the drain call returning must not take the compiler's evidence away"
+        );
+        assert_eq!(
+            crate::observe::driver_watch::watching(DriverLane::Compiler).as_deref(),
+            Some("create_graphics_pipelines")
+        );
+        compile.disarm();
+        assert!(!compiler_frag.exists());
+        assert_eq!(crate::observe::driver_watch::watching(DriverLane::Compiler), None);
     }
 
     /// The module reaches disk, little-endian and whole.

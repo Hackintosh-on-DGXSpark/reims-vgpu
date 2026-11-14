@@ -387,6 +387,83 @@ pub fn decode_exec_resource_table(payload: &[u8]) -> Option<Vec<ExecResourceDesc
     Some(descs)
 }
 
+/// Length of one resource record in an `EXEC_INDIRECT3` (`0x43`) payload: the
+/// object id and one flag word, and nothing else.
+pub const CHILD_EXEC3_RESOURCE_DESC_LEN: u32 = 8;
+
+/// The validity quad an `EXEC_INDIRECT3` flag word packs into its low nibble:
+/// clear host, set host, clear guest, set guest, from bit 0.
+///
+/// `0x37` spends a byte on each op. `0x43` packs them into one byte and sets
+/// the high nibble as well, which this device does not read. Read as a quad,
+/// that high nibble said "clear host valid" for nearly every resource of every
+/// submission: a 27.2 boot sends `0x40`, `0x20`, `0x10` and `0xa0` far more
+/// often than anything else, and each one abandoned the frame a pass had just
+/// stored, so a kernel that blurred it read the guest's zeros. The low nibble
+/// agrees with what `0x37` says: render targets and kernel outputs carry
+/// `0x02`, set host valid, and `0x01` alone is rare.
+pub fn exec3_validity_ops(flags: u32) -> InvalidateValidityOps {
+    let nibble = flags as u8;
+    InvalidateValidityOps {
+        clear_host_valid: nibble & 1,
+        set_host_valid: (nibble >> 1) & 1,
+        clear_guest_valid: (nibble >> 2) & 1,
+        set_guest_valid: (nibble >> 3) & 1,
+    }
+}
+
+/// Rewrite an `EXEC_INDIRECT3` (`0x43`) payload as the `EXEC_INDIRECT2`
+/// (`0x37`) payload it carries the same submission as.
+///
+/// The guest switches to `0x43` from protocol 200, the first rung of the
+/// ladder macOS 27 adds above 62. The two differ in one thing: each resource
+/// record is eight bytes, `{object_id, flags}`, where `0x37`'s is twenty-four:
+/// the id, four validity-op bytes, and sixteen that the guest has always
+/// zeroed. The 12-byte header (`task, resource_count, cmdbuf_count`) and the
+/// 16-byte command-buffer records (`gva, length`) are unchanged. So the rewrite
+/// unpacks each record's flags with [`exec3_validity_ops`], pads it, and copies
+/// the rest, and the submission then runs through every
+/// rail `0x37` already has, deferral and continuation included.
+///
+/// `EXEC_INDIRECT_INFO` (`0x45`) has the same layout and is widened the same
+/// way. Its command buffers carry info-segment records, which the exec walk
+/// already routes to the info handler.
+///
+/// `None` when the payload is shorter than the counts it declares.
+pub fn widen_exec_indirect3(payload: &[u8]) -> Option<Vec<u8>> {
+    let header = CHILD_EXEC_INDIRECT_HEADER_LEN as usize;
+    if payload.len() < header {
+        return None;
+    }
+    let count = ld32(&payload[CHILD_EXEC_INDIRECT_RESOURCE_COUNT as usize..]) as usize;
+    let records_len = count.checked_mul(CHILD_EXEC3_RESOURCE_DESC_LEN as usize)?;
+    let records_end = header.checked_add(records_len)?;
+    if records_end > payload.len() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(
+        payload.len()
+            + count
+                * (CHILD_EXEC_INDIRECT_RESOURCE_DESC_LEN - CHILD_EXEC3_RESOURCE_DESC_LEN) as usize,
+    );
+    out.extend_from_slice(&payload[..header]);
+    let (records, _) =
+        payload[header..records_end].as_chunks::<{ CHILD_EXEC3_RESOURCE_DESC_LEN as usize }>();
+    for record in records {
+        let ops = exec3_validity_ops(ld32(&record[4..]));
+        out.extend_from_slice(&record[..4]);
+        out.extend_from_slice(&[
+            ops.clear_host_valid,
+            ops.set_host_valid,
+            ops.clear_guest_valid,
+            ops.set_guest_valid,
+        ]);
+        out.extend_from_slice(&[0u8; CHILD_EXEC_RESOURCE_TAIL_LEN as usize]);
+    }
+    out.extend_from_slice(&payload[records_end..]);
+    Some(out)
+}
+
 /// Decode CmdReplacePhysical (`0x3c`): `{task_id, object_id}`, 8 bytes.
 ///
 /// The guest emits this once per attached resource at the tail of a re-commit
@@ -563,6 +640,76 @@ mod tests {
         assert_eq!(descs[1].ops.clear_host_valid, 0);
         assert_eq!(descs[1].ops.set_host_valid, 1);
         assert_eq!(descs[1].tail_nonzero_bytes(), 2);
+    }
+
+    #[test]
+    fn an_exec_indirect3_payload_widens_to_the_exec_indirect2_it_carries() {
+        // task 1, two resources, one command buffer at 0x108000 of 0x3c4 bytes —
+        // the shape a 27.2 guest at protocol 200 sends.
+        let mut narrow = Vec::new();
+        for word in [1u32, 2, 1, 0xa, 0x22, 0xf, 0x20] {
+            narrow.extend_from_slice(&word.to_le_bytes());
+        }
+        narrow.extend_from_slice(&0x108000u64.to_le_bytes());
+        narrow.extend_from_slice(&0x3c4u64.to_le_bytes());
+
+        let wide = widen_exec_indirect3(&narrow).expect("well-formed");
+        assert_eq!(wide.len(), 12 + 2 * 24 + 16);
+        let table = decode_exec_resource_table(&wide).expect("table decodes");
+        assert_eq!(table.len(), 2);
+        assert_eq!(table[0].object_id, 0xa);
+        assert_eq!(table[1].object_id, 0xf);
+        assert_eq!(table[0].tail_nonzero_bytes(), 0);
+        // 0x22 sets host valid; 0x20's high nibble is not a validity op.
+        assert_eq!(
+            table[0].ops,
+            InvalidateValidityOps {
+                set_host_valid: 1,
+                ..Default::default()
+            }
+        );
+        assert_eq!(table[1].ops, InvalidateValidityOps::default());
+        let cbuf = 12 + 2 * 24;
+        assert_eq!(
+            u64::from_le_bytes(wide[cbuf..cbuf + 8].try_into().unwrap()),
+            0x108000
+        );
+        assert_eq!(
+            u64::from_le_bytes(wide[cbuf + 8..cbuf + 16].try_into().unwrap()),
+            0x3c4
+        );
+    }
+
+    /// The flag words a 27.2 boot sends most, and the ops each one carries.
+    #[test]
+    fn an_exec_indirect3_flag_word_carries_its_ops_in_the_low_nibble() {
+        let ops = |flags| {
+            let o = exec3_validity_ops(flags);
+            [
+                o.clear_host_valid,
+                o.set_host_valid,
+                o.clear_guest_valid,
+                o.set_guest_valid,
+            ]
+        };
+        for flags in [0x40, 0x20, 0x10, 0xa0, 0xd0, 0x80, 0x00] {
+            assert_eq!(ops(flags), [0, 0, 0, 0], "{flags:#x}");
+        }
+        assert_eq!(ops(0x42), [0, 1, 0, 0]);
+        assert_eq!(ops(0x12), [0, 1, 0, 0]);
+        assert_eq!(ops(0xa8), [0, 0, 0, 1]);
+        assert_eq!(ops(0xaa), [0, 1, 0, 1]);
+        assert_eq!(ops(0x41), [1, 0, 0, 0]);
+        assert_eq!(ops(0x01), [1, 0, 0, 0]);
+    }
+
+    #[test]
+    fn a_short_exec_indirect3_payload_is_refused() {
+        let mut narrow = Vec::new();
+        for word in [1u32, 4, 1, 0xa] {
+            narrow.extend_from_slice(&word.to_le_bytes());
+        }
+        assert!(widen_exec_indirect3(&narrow).is_none());
     }
 
     /// The quad decoder is shared with `CmdInvalidateResources`; only the record

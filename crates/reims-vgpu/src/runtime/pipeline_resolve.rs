@@ -344,17 +344,30 @@ pub fn attachment_sample_count<M: HostMemory + HostOps>(
 /// This is the only place a draw's pipeline resolution can fail, and each of its
 /// seven refusals keeps the `DrawPreparationDecline` variant it always had — the
 /// memo in front of it neither adds a failure nor renames one.
+/// Apply Metal's meaning of `fragmentFunction == nil` to a decoded descriptor,
+/// and say whether it applied.
+pub(crate) fn settle_absent_fragment(desc: &mut RenderPipelineDescriptor) -> bool {
+    if desc.fragment_func_ref != 0 {
+        return false;
+    }
+    for attachment in &mut desc.color_attachments {
+        attachment.write_mask = crate::runtime::decode::resource::ColorWriteMask::NONE;
+    }
+    true
+}
+
 fn resolve_uncached<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &M,
     task_id: u32,
     pipeline_ref: u32,
 ) -> Result<ResolvedRenderPipeline, DrawPreparationDecline> {
-    let desc = crate::runtime::draw::load_render_pipeline(state, host, task_id, pipeline_ref)
+    let mut desc = crate::runtime::draw::load_render_pipeline(state, host, task_id, pipeline_ref)
         .ok_or(DrawPreparationDecline::PipelineMissing {
             task_id,
             pipeline_ref,
         })?;
+    let fragment_absent = settle_absent_fragment(&mut desc);
     // The same three sub-phases the call site used to open around this work,
     // moved in with it. They are inert outside a live `ChainTimer`, so the two
     // non-draw callers of the loaders below are unaffected — and on the draw
@@ -373,17 +386,23 @@ fn resolve_uncached<M: HostMemory + HostOps>(
         task_id,
         function_ref: desc.vertex_func_ref,
     })?;
-    let f_mtlb = load_mtlb(
-        state,
-        host,
-        task_id,
-        desc.fragment_func_ref,
-        AirLoadRail::Draw,
-    )
-    .ok_or(DrawPreparationDecline::FragmentMtlbMissing {
-        task_id,
-        function_ref: desc.fragment_func_ref,
-    })?;
+    let f_mtlb = if fragment_absent {
+        None
+    } else {
+        Some(
+            load_mtlb(
+                state,
+                host,
+                task_id,
+                desc.fragment_func_ref,
+                AirLoadRail::Draw,
+            )
+            .ok_or(DrawPreparationDecline::FragmentMtlbMissing {
+                task_id,
+                function_ref: desc.fragment_func_ref,
+            })?,
+        )
+    };
     enter(Phase::PipelineAir);
     let v_air = crate::runtime::mtlb::extract_air(&v_mtlb).map_err(|reason| {
         DrawPreparationDecline::VertexAirExtract {
@@ -391,12 +410,17 @@ fn resolve_uncached<M: HostMemory + HostOps>(
             reason,
         }
     })?;
-    let f_air = crate::runtime::mtlb::extract_air(&f_mtlb).map_err(|reason| {
-        DrawPreparationDecline::FragmentAirExtract {
-            function_ref: desc.fragment_func_ref,
-            reason,
-        }
-    })?;
+    let f_air = f_mtlb
+        .as_deref()
+        .map(|f_mtlb| {
+            crate::runtime::mtlb::extract_air(f_mtlb).map_err(|reason| {
+                DrawPreparationDecline::FragmentAirExtract {
+                    function_ref: desc.fragment_func_ref,
+                    reason,
+                }
+            })
+        })
+        .transpose()?;
     enter(Phase::PipelineXlate);
     let vertex = crate::runtime::m2v_cache::translate_cached_reflected(
         v_air,
@@ -407,15 +431,18 @@ fn resolve_uncached<M: HostMemory + HostOps>(
         pipeline_ref,
         reason,
     })?;
-    let fragment = crate::runtime::m2v_cache::translate_cached_reflected(
-        f_air,
-        metal2vulkan::passes::Stage::Fragment,
-        pipeline_ref,
-    )
-    .map_err(|reason| DrawPreparationDecline::FragmentTranslate {
-        pipeline_ref,
-        reason,
-    })?;
+    let fragment = match f_air {
+        None => colourless_fragment(),
+        Some(f_air) => crate::runtime::m2v_cache::translate_cached_reflected(
+            f_air,
+            metal2vulkan::passes::Stage::Fragment,
+            pipeline_ref,
+        )
+        .map_err(|reason| DrawPreparationDecline::FragmentTranslate {
+            pipeline_ref,
+            reason,
+        })?,
+    };
     let bind_plan = Arc::new(VertexBindPlan::build(&desc));
     Ok(ResolvedRenderPipeline {
         pipeline_object: None,
@@ -424,6 +451,64 @@ fn resolve_uncached<M: HostMemory + HostOps>(
         fragment,
         bind_plan,
     })
+}
+
+/// The fragment stage of a pipeline the guest built with no fragment function:
+/// an empty `main` with no inputs, outputs or resources. The draw masks every
+/// colour write for a fragment stage with no outputs, so only depth and
+/// stencil change, as Metal does.
+fn colourless_fragment() -> Arc<CachedShader> {
+    use metal2vulkan::reflect::{ShaderReflection, ShaderStage, REFLECTION_VERSION};
+    static SHADER: OnceLock<Arc<CachedShader>> = OnceLock::new();
+    SHADER
+        .get_or_init(|| {
+            // OpCapability Shader; OpMemoryModel Logical GLSL450;
+            // OpEntryPoint Fragment %1 "main"; OpExecutionMode %1 OriginUpperLeft;
+            // %2 = OpTypeVoid; %3 = OpTypeFunction %2;
+            // %1 = OpFunction %2 None %3; %4 = OpLabel; OpReturn; OpFunctionEnd.
+            const WORDS: [u32; 32] = [
+                0x0723_0203, 0x0001_0000, 0, 5, 0, //
+                0x0002_0011, 1, //
+                0x0003_000e, 0, 1, //
+                0x0005_000f, 4, 1, 0x6e69_616d, 0, //
+                0x0003_0010, 1, 7, //
+                0x0002_0013, 2, //
+                0x0003_0021, 3, 2, //
+                0x0005_0036, 2, 1, 0, 3, //
+                0x0002_00f8, 4, //
+                0x0001_00fd, //
+                0x0001_0038,
+            ];
+            let spirv = WORDS
+                .iter()
+                .flat_map(|word| word.to_le_bytes())
+                .collect();
+            Arc::new(CachedShader::new(
+                spirv,
+                Arc::new(ShaderReflection {
+                    reflection_version: REFLECTION_VERSION,
+                    stage: ShaderStage::Fragment,
+                    entry_point: Some("main".to_owned()),
+                    bindings: vec![],
+                    argument_buffer_fields: vec![],
+                    vertex_attributes: vec![],
+                    varyings: vec![],
+                    render_targets: vec![],
+                    depth_members: vec![],
+                    depth_qualifier: None,
+                    stencil_members: vec![],
+                    local_size: None,
+                    vertex_builtins: None,
+                    tessellation: None,
+                    imageblock_layouts: vec![],
+                    implicit_imageblock_attachments: vec![],
+                    fragment_imageblock: None,
+                    datalayout: None,
+                    function_constants: vec![],
+                }),
+            ))
+        })
+        .clone()
 }
 
 #[cfg(test)]
@@ -581,6 +666,48 @@ mod tests {
     /// A pipeline with no vertex block answers "no" to both questions rather
     /// than panicking on an empty search, which is the shape every fullscreen
     /// pass that builds its vertices in the shader takes.
+    #[test]
+    fn an_absent_fragment_function_turns_color_writes_off_and_nothing_else() {
+        use crate::runtime::decode::resource::{ColorWriteMask, PipelineColorAttachment};
+
+        let attachments = vec![
+            PipelineColorAttachment {
+                slot: 0,
+                write_mask: ColorWriteMask::ALL,
+                ..Default::default()
+            },
+            PipelineColorAttachment {
+                slot: 1,
+                write_mask: ColorWriteMask::ALL,
+                ..Default::default()
+            },
+        ];
+        let mut maskless = RenderPipelineDescriptor {
+            vertex_func_ref: 7,
+            fragment_func_ref: 0,
+            color_attachments: attachments.clone(),
+            ..Default::default()
+        };
+        assert!(settle_absent_fragment(&mut maskless));
+        assert!(
+            maskless
+                .color_attachments
+                .iter()
+                .all(|a| a.write_mask == ColorWriteMask::NONE)
+        );
+        assert_eq!(maskless.vertex_func_ref, 7);
+
+        let mut drawing = RenderPipelineDescriptor {
+            vertex_func_ref: 7,
+            fragment_func_ref: 9,
+            color_attachments: attachments,
+            ..Default::default()
+        };
+        let before = drawing.clone();
+        assert!(!settle_absent_fragment(&mut drawing));
+        assert_eq!(drawing, before);
+    }
+
     #[test]
     fn an_empty_attribute_list_names_nothing() {
         let plan = VertexBindPlan::build(&RenderPipelineDescriptor::default());

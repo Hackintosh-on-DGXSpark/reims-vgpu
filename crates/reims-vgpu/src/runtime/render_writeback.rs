@@ -697,6 +697,10 @@ settle_sites! {
     MappingBytesWrite => "settle_mapping_bytes_write",
     /// `mapper::read_mapping_bytes`.
     MappingBytesRead => "settle_mapping_bytes_read",
+    /// `surface_quarantine::quarantine_collision` — both colliding mappings'
+    /// pages, before anything is decided about them.
+    Quarantine => "settle_quarantine",
+    GuestReadRequest => "settle_guest_read_request",
 }
 
 /// Block until every guest-page write this device has submitted has executed.
@@ -841,8 +845,79 @@ pub fn store_render_frame<M: HostMemory + HostOps>(
     width: u32,
     height: u32,
 ) -> bool {
+    store_render_frame_with_format(state, host, mapping_id, identity, width, height, None)
+}
+
+/// Whether a Store into `mapping_id` under `format_override` names one plane
+/// of a multi-plane surface (or a view whose format is not the mapping's own),
+/// so it must land through that plane's native window and nothing else.
+#[cfg(feature = "backend-vulkan")]
+pub fn store_is_plane_override(state: &DeviceState, mapping_id: u32, format_override: Option<u16>) -> bool {
+    let Some(m) = state.mappings.get(&mapping_id) else {
+        return false;
+    };
+    let multiplane = crate::runtime::objects::mapping_is_multiplanar(m)
+        || crate::contract::pixel_format::is_two_plane_xr10(m.format);
+    let Some(fmt) = format_override.filter(|&f| f != 0) else {
+        return false;
+    };
+    let own = crate::runtime::mapping_write::mapping_store_format(m);
+    multiplane
+        || crate::contract::pixel_format::bytes_per_pixel(fmt)
+            != crate::contract::pixel_format::bytes_per_pixel(own)
+        || crate::contract::pixel_format::is_xr10(fmt) != crate::contract::pixel_format::is_xr10(own)
+}
+
+/// [`store_render_frame`] for a target whose declared format may differ from
+/// the mapping's: a per-plane type-11 view of a multi-plane surface writes only
+/// its own plane, through the native rail.
+#[cfg(feature = "backend-vulkan")]
+pub fn store_render_frame_with_format<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+    identity: &crate::backend::vulkan::engine::TargetIdentity,
+    width: u32,
+    height: u32,
+    format_override: Option<u16>,
+) -> bool {
     let started = std::time::Instant::now();
     crate::runtime::drain::note_store_route("surface_flush");
+    if store_is_plane_override(state, mapping_id, format_override) {
+        let fmt = format_override.unwrap_or(0);
+        let expected = if crate::contract::pixel_format::is_xr10(fmt) {
+            Some(crate::contract::pixel_format::TexelLayout::Rgba16Float)
+        } else {
+            crate::contract::pixel_format::store_texel_order(fmt)
+        };
+        let read = crate::backend::vulkan::engine::read_target_native(identity);
+        let ok = match (&read, expected) {
+            (Ok(rb), Some(layout)) if rb.layout == layout => {
+                crate::runtime::mapping_write::write_native_uncached_format(
+                    state,
+                    host,
+                    mapping_id,
+                    &rb.pixels,
+                    width,
+                    height,
+                    rb.layout,
+                    Some(fmt),
+                )
+            }
+            _ => false,
+        };
+        if !ok {
+            crate::observe::fail(format!(
+                "render_store_lost mapping={mapping_id} {width}x{height} fmt={fmt:#x} reason=plane_write_refused layout={:?}",
+                read.as_ref().ok().map(|rb| rb.layout)
+            ));
+            return false;
+        }
+        crate::runtime::drain::note_store_route("render_flush_plane_native");
+        let len = read.map(|rb| rb.pixels.len()).unwrap_or(0);
+        finish(state, mapping_id, identity, len, started, false);
+        return true;
+    }
     // The GPU writes the guest's pages directly. Tried first because when it
     // works there is nothing left to do: no staging buffer is mapped and no
     // host pass over the frame happens at all.
@@ -941,6 +1016,36 @@ pub fn store_render_frame<M: HostMemory + HostOps>(
         leased => {
             drop(leased);
             crate::runtime::drain::note_store_route("render_flush_copied");
+            let native_layout = state
+                .mappings
+                .get(&mapping_id)
+                .map(crate::runtime::mapping_write::mapping_store_format)
+                .and_then(crate::runtime::mapping_write::mapping_native_resident_layout);
+            if let Some(expected_layout) = native_layout {
+                if let Ok(rb) = crate::backend::vulkan::engine::read_target_native(identity) {
+                    if rb.layout == expected_layout {
+                        let len = rb.pixels.len();
+                        let ok = crate::runtime::mapping_write::write_native_uncached(
+                            state,
+                            host,
+                            mapping_id,
+                            &rb.pixels,
+                            width,
+                            height,
+                            rb.layout,
+                        );
+                        if ok {
+                            crate::runtime::drain::note_store_route("render_flush_copied_native");
+                            crate::runtime::drain::note_readback_phase(
+                                crate::runtime::drain::ReadbackPhase::Write,
+                                write_started.elapsed().as_micros() as u64,
+                            );
+                            finish(state, mapping_id, identity, len, started, false);
+                            return true;
+                        }
+                    }
+                }
+            }
             match crate::backend::vulkan::engine::read_target(identity) {
                 Ok(rb) => {
                     // Shared rather than owned outright: the write's tail
@@ -1285,6 +1390,37 @@ pub(crate) fn store_gva_frame<M: HostMemory + HostOps>(
     // pass and not the no-op this comment used to claim. Both spellings of that
     // declaration must reach the same answer; `ResidentReadSnapshot::bgra` is
     // where they do, and where they did not.
+    if let Some(expected_layout) = crate::contract::pixel_format::store_texel_order(c0.format)
+        .filter(|layout| !layout.is_four_byte_color())
+    {
+        let rb = crate::backend::vulkan::engine::read_target_native(identity)
+            .map_err(|inner| GvaWritebackDecline::CopiedReadRefused { inner })?;
+        if rb.layout == expected_layout {
+            let Some(tight) = crate::contract::pixel_format::tight_row_bytes(c0.width, c0.format)
+            else {
+                return Err(GvaWritebackDecline::FormatNeedsConversion { format: c0.format });
+            };
+            let extent = u64::from(c0.height.saturating_sub(1)) * u64::from(c0.row_stride)
+                + u64::from(tight);
+            crate::runtime::draw::write_gva_native_within(
+                state,
+                host,
+                task_id,
+                c0.target_gva,
+                c0.width,
+                c0.height,
+                c0.row_stride,
+                c0.format,
+                &rb.pixels,
+                Some(pages.membership()),
+            )
+            .map_err(|err| GvaWritebackDecline::CopiedWriteRefused { err })?;
+            forget_gva_host_copies(state, task_id, c0.target_gva, texture_ref);
+            crate::backend::vulkan::engine::note_resident_content_copied_out(identity);
+            crate::runtime::drain::note_store_route("gva_flush_copied_native");
+            return Ok(extent);
+        }
+    }
     let rgba = crate::backend::vulkan::engine::read_target(identity)
         .map_err(|inner| GvaWritebackDecline::CopiedReadRefused { inner })?
         .into_rgba8();

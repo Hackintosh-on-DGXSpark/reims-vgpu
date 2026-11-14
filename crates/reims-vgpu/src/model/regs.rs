@@ -369,7 +369,14 @@ pub const ROOT_OP_DEVICE_INFO_TAHOE: u16 = 0x3a;
 /// whoever reads the log: an in-range unassigned slot is a guest sending a
 /// command this build of the host does not have, while out-of-range is a corrupt
 /// header or a desynced ring.
-pub const CHILD_OP_MAX: u16 = 0x40;
+///
+/// # macOS 27 adds three
+///
+/// At [`PROTOCOL_VERSION_MACOS27`] the guest sends [`CHILD_OP_EXEC_INDIRECT3`],
+/// [`CHILD_OP_SET_OBJECT_LIST2`] and [`CHILD_OP_EXEC_INDIRECT_INFO`], so the
+/// ceiling moved from `0x40` to `0x45`. Read off the 27.2 guest's kernel
+/// driver, which builds each of them, and off the packets a 27.2 boot sends.
+pub const CHILD_OP_MAX: u16 = 0x45;
 
 /// The opcodes the reference host routes to its one shared deprecated handler.
 ///
@@ -545,6 +552,30 @@ pub const CHILD_OP_DISCARD_RESOURCES: u16 = 0x3f;
 /// the guest blocks on the reply, so a refusal is a stall and not a dropped
 /// command.
 pub const CHILD_OP_HEAP_TEXTURE_SIZE_AND_ALIGN: u16 = 0x40;
+/// [`CHILD_OP_EXEC_INDIRECT2`] with each resource record cut to its first eight
+/// bytes, `{object_id, ops}`. The 12-byte header and the 16-byte command-buffer
+/// records are unchanged. The guest sends it from protocol 200.
+pub const CHILD_OP_EXEC_INDIRECT3: u16 = 0x43;
+/// [`CHILD_OP_SET_OBJECT_LIST`] with a second list beside the first:
+/// `{u32 task, u64 list_gva, u64 list2_gva, u32 list_bytes, u32 list2_bytes}`.
+/// The first list is the 12-byte-entry object list `0x33` names by page; the
+/// second has 16-byte entries. The guest's kernel driver sends it when feature
+/// `0x29` of its protocol struct is on (from protocol 207) and `0x33` otherwise.
+pub const CHILD_OP_SET_OBJECT_LIST2: u16 = 0x44;
+/// The info encoder's submissions under the `InfoIndirect` capability (on from
+/// protocol 235): the same layout as [`CHILD_OP_EXEC_INDIRECT3`], with command
+/// buffers that hold only info-segment records — heap-texture size queries and
+/// compute-pipeline info among them — where below that protocol they arrived as
+/// child packets of their own.
+pub const CHILD_OP_EXEC_INDIRECT_INFO: u16 = 0x45;
+
+/// [`CHILD_OP_SET_OBJECT_LIST2`] payload offsets.
+pub const SET_OBJECT_LIST2_TASK_ID: usize = 0x00;
+pub const SET_OBJECT_LIST2_GVA: usize = 0x04;
+pub const SET_OBJECT_LIST2_SECOND_GVA: usize = 0x0c;
+pub const SET_OBJECT_LIST2_BYTES: usize = 0x14;
+pub const SET_OBJECT_LIST2_SECOND_BYTES: usize = 0x18;
+pub const SET_OBJECT_LIST2_LEN: usize = 28;
 
 /// `CmdDisplayTransaction2_DEPRECATED` (op 6) trailer `[pipe][surface][task]`:
 /// surface id offset. `CmdDisplaySwapMapping` (op 8) is a different command with
@@ -594,6 +625,9 @@ const _: () = {
         CHILD_OP_SYNCHRONIZE_AND_DISCARD_RESOURCES,
         CHILD_OP_DISCARD_RESOURCES,
         CHILD_OP_HEAP_TEXTURE_SIZE_AND_ALIGN,
+        CHILD_OP_EXEC_INDIRECT3,
+        CHILD_OP_SET_OBJECT_LIST2,
+        CHILD_OP_EXEC_INDIRECT_INFO,
     ];
     let mut i = 0;
     while i < ops.len() {
@@ -1093,15 +1127,42 @@ pub const MMIO_U64: u32 = 8;
 /// unlocks.
 pub const PROTOCOL_VERSION_MAX: u32 = 62;
 
+/// The macOS 27 rung this host implements.
+///
+/// A 27.2 guest writes 252 here. Its kernel driver keeps the ladder above and
+/// adds a second one from 200 to 252, whose valid rungs are 200–209, 230–233,
+/// 235, 237, 238, 245 and 250–252; each rung turns on every feature byte of the rungs
+/// below it in that ladder, plus the 26-era set. 237 is the lowest rung with
+/// feature `0x32`, which the Metal plugin passes to
+/// `-[PGSerializer setSupportsTextureDescriptor2:]`. Without it the plugin
+/// serializes texture usage in eight bits and refuses every texture whose usage
+/// needs more, which is how macOS 27 lost every Liquid Glass backdrop below
+/// this rung.
+///
+/// What 237 changes on the wire, all handled here: child packets
+/// [`CHILD_OP_EXEC_INDIRECT3`], [`CHILD_OP_SET_OBJECT_LIST2`] and
+/// [`CHILD_OP_EXEC_INDIRECT_INFO`]; the `TextureDescriptor2` texture records in
+/// object-list descriptors; resource-pool buffers (object type 19); info-segment
+/// queries in place of `0x3b` and `0x40`; and the compute pipeline descriptor's
+/// `maxTotalThreadsPerThreadgroup` field.
+pub const PROTOCOL_VERSION_MACOS27: u32 = 237;
+
 /// What this host writes back for a guest-requested protocol version.
 ///
 /// Clamping is the whole point. A guest newer than this host asks for a version
 /// past the top rung, and an echo would hand that number straight back and land
 /// the guest in its all-features-off default; clamping lands it on the newest
-/// rung both sides implement.
+/// rung both sides implement. A guest that asks for the macOS 27 ladder at or
+/// above [`PROTOCOL_VERSION_MACOS27`] gets that rung; anything below it is
+/// clamped to [`PROTOCOL_VERSION_MAX`], a rung every guest that knows the second
+/// ladder also has.
 #[inline]
 pub fn negotiate_protocol_version(requested: u32) -> u32 {
-    requested.min(PROTOCOL_VERSION_MAX)
+    if requested >= PROTOCOL_VERSION_MACOS27 {
+        PROTOCOL_VERSION_MACOS27
+    } else {
+        requested.min(PROTOCOL_VERSION_MAX)
+    }
 }
 
 /// Wire keys of the device-info reply whose value is a property of the GPU that
@@ -1196,6 +1257,15 @@ pub const DEVICE_INFO_KEY_RGB10A2_GAMMA: u32 = 8;
 /// it uses 16. Whatever this device publishes is what the guest's rows are laid
 /// out on, so it is a promise about what this device can address rather than a
 /// capability it can decline later.
+///
+/// **16, the number the guest already uses elsewhere.** macOS 27.2 answers
+/// `minimumLinearTextureAlignmentForPixelFormat:` from a 16 of its own, the
+/// alignment of the Apple GPUs it is built for, and checks the rows a caller
+/// then asks for against this key. Served 256, the two disagreed: RenderBox
+/// laid a 100 pixel RGBA8 row out on 400 bytes as it was told it could, Metal
+/// refused it (`bytesPerRow (112) must be aligned to 256 bytes`), and
+/// iconservicesagent drew no icon. Every buffer texture command carries its
+/// own row pitch, so nothing in this device depends on the larger number.
 ///
 /// Distinct from [`crate::contract::iosurface_pages::ROW_BYTES_ALIGN`], which is
 /// an IOSurface row estimate for counting pages and is deliberately not a pitch.
@@ -1325,9 +1395,16 @@ pub const DEVICE_INFO_KEY_PRIMITIVE_TYPE_MASK: u32 = 11;
 /// feature appears at 31, is explicitly turned back off at 40, and returns at
 /// 41. Both ends of the protocol encode that same gap, so it is a contract and
 /// not an accident. Do not rewrite this as `version >= 31`.
+///
+/// macOS 27's second ladder sets the same byte on every one of its valid rungs:
+/// each enters the chain of feature stores above the 26-era set, which includes
+/// offset 10.
 #[inline]
 pub fn protocol_dual_plane_textures(version: u32) -> bool {
-    matches!(version, 31 | 41 | 42 | 43 | 60 | 61 | 62)
+    matches!(
+        version,
+        31 | 41 | 42 | 43 | 60 | 61 | 62 | 200..=209 | 230..=233 | 235 | 237 | 238 | 245 | 250..=252
+    )
 }
 
 /// What the host GPU can actually do, for the keys above.
@@ -1338,6 +1415,15 @@ pub struct DeviceInfoLimits {
     pub max_threads_per_threadgroup: [u32; 3],
     pub max_threadgroup_memory_bytes: u32,
     pub native_fp16: bool,
+    /// Whether this host runs tile shaders and imageblock-backed render passes
+    /// ([`DEVICE_INFO_KEY_TILE_SHADERS`], [`DEVICE_INFO_KEY_IMAGEBLOCKS`]).
+    ///
+    /// The Metal backend does. The Vulkan backend has no tile memory to give a
+    /// render pass, and below protocol 200 the answer never mattered: the guest
+    /// ANDs it with a feature byte that only macOS 27's ladder sets. At
+    /// [`PROTOCOL_VERSION_MACOS27`] a yes made CoreAnimation build imageblock
+    /// dispatches this backend refused every frame.
+    pub tile_memory: bool,
 }
 
 /// The device-info reply for this host: GPU-dependent keys reduced to what
@@ -1366,6 +1452,9 @@ pub fn device_info_caps(limits: &DeviceInfoLimits, version: u32) -> Vec<(u32, u3
                 DEVICE_INFO_KEY_MAX_THREADS_D => limits.max_threads_per_threadgroup[2],
                 DEVICE_INFO_KEY_THREADGROUP_MEMORY => limits.max_threadgroup_memory_bytes,
                 DEVICE_INFO_KEY_NATIVE_FP16 => u32::from(limits.native_fp16),
+                DEVICE_INFO_KEY_TILE_SHADERS | DEVICE_INFO_KEY_IMAGEBLOCKS => {
+                    u32::from(limits.tile_memory)
+                }
                 DEVICE_INFO_KEY_DUAL_PLANE_TEXTURES => {
                     return (key, u32::from(protocol_dual_plane_textures(version)));
                 }
@@ -1473,7 +1562,7 @@ pub const DEVICE_INFO_CAPS: &[(u32, u32)] = &[
         crate::contract::draw::EXECUTABLE_PRIMITIVE_TYPES,
     ),
     (DEVICE_INFO_KEY_DUAL_PLANE_TEXTURES, 1),
-    (DEVICE_INFO_KEY_LINEAR_TEXTURE_ALIGN, 256),
+    (DEVICE_INFO_KEY_LINEAR_TEXTURE_ALIGN, 16),
     (DEVICE_INFO_KEY_HEAPS, 1),
     (DEVICE_INFO_KEY_HEAP_BUFFER_GRANULARITY, 32),
     (DEVICE_INFO_KEY_HEAP_TEXTURES, 1),
@@ -1835,6 +1924,7 @@ mod tests {
             max_threads_per_threadgroup: [4096, 4096, 4096],
             max_threadgroup_memory_bytes: 262_144,
             native_fp16: true,
+            tile_memory: true,
         };
         assert_eq!(
             device_info_caps(&generous, VERSION_WITH_DUAL_PLANE),
@@ -1857,6 +1947,7 @@ mod tests {
             max_threads_per_threadgroup: [4096, 4096, 4096],
             max_threadgroup_memory_bytes: 262_144,
             native_fp16: true,
+            tile_memory: true,
         };
         let key12 = |version: u32| -> u32 {
             device_info_caps(&host, version)
@@ -1898,6 +1989,50 @@ mod tests {
         }
     }
 
+    /// A macOS 27 guest lands on the one rung of its second ladder this device
+    /// implements; every older request is clamped exactly as before.
+    #[test]
+    fn a_macos27_request_lands_on_the_rung_this_device_implements() {
+        assert_eq!(negotiate_protocol_version(252), PROTOCOL_VERSION_MACOS27);
+        assert_eq!(negotiate_protocol_version(237), PROTOCOL_VERSION_MACOS27);
+        assert_eq!(negotiate_protocol_version(236), PROTOCOL_VERSION_MAX);
+        assert_eq!(negotiate_protocol_version(200), PROTOCOL_VERSION_MAX);
+        assert_eq!(negotiate_protocol_version(63), PROTOCOL_VERSION_MAX);
+        assert_eq!(negotiate_protocol_version(4), 4);
+        assert!(protocol_dual_plane_textures(PROTOCOL_VERSION_MACOS27));
+        for version in 210..=229 {
+            assert!(
+                !protocol_dual_plane_textures(version),
+                "{version} is not a rung"
+            );
+        }
+        assert!(!protocol_dual_plane_textures(236));
+    }
+
+    /// Tile shaders and imageblocks are promised only by a host that has tile
+    /// memory to back them.
+    #[test]
+    fn tile_shaders_and_imageblocks_follow_the_host() {
+        let mut host = DeviceInfoLimits {
+            max_sample_count: 8,
+            d24_stencil8: true,
+            max_threads_per_threadgroup: [1024, 1024, 64],
+            max_threadgroup_memory_bytes: 32768,
+            native_fp16: true,
+            tile_memory: true,
+        };
+        let key = |limits: &DeviceInfoLimits, key: u32| {
+            device_info_caps(limits, PROTOCOL_VERSION_MACOS27)
+                .into_iter()
+                .find(|&(k, _)| k == key)
+                .map(|(_, v)| v)
+        };
+        assert_eq!(key(&host, DEVICE_INFO_KEY_TILE_SHADERS), Some(1));
+        assert_eq!(key(&host, DEVICE_INFO_KEY_IMAGEBLOCKS), Some(1));
+        host.tile_memory = false;
+        assert_eq!(key(&host, DEVICE_INFO_KEY_TILE_SHADERS), Some(0));
+        assert_eq!(key(&host, DEVICE_INFO_KEY_IMAGEBLOCKS), Some(0));
+    }
     /// A host at the Vulkan floor is told to the guest as the floor.
     ///
     /// Each of these is an instruction the guest acts on: it sizes threadgroups
@@ -1913,6 +2048,7 @@ mod tests {
             max_threads_per_threadgroup: [128, 128, 64],
             max_threadgroup_memory_bytes: 16384,
             native_fp16: false,
+            tile_memory: false,
         };
         let served: std::collections::BTreeMap<u32, u32> =
             device_info_caps(&floor, VERSION_WITH_DUAL_PLANE)
@@ -2305,6 +2441,9 @@ mod tests {
                 "HEAP_TEXTURE_SIZE_AND_ALIGN",
                 CHILD_OP_HEAP_TEXTURE_SIZE_AND_ALIGN,
             ),
+            ("EXEC_INDIRECT3", CHILD_OP_EXEC_INDIRECT3),
+            ("SET_OBJECT_LIST2", CHILD_OP_SET_OBJECT_LIST2),
+            ("EXEC_INDIRECT_INFO", CHILD_OP_EXEC_INDIRECT_INFO),
         ];
         for (i, (name, op)) in table.iter().enumerate() {
             for (other, other_op) in &table[i + 1..] {

@@ -82,6 +82,8 @@ pub mod draw;
 pub mod input;
 /// Process-global metal2vulkan SPIR-V cache (AIR content hash → SPIR-V).
 pub mod m2v_cache;
+/// metal2vulkan translations kept on disk across boots, under `m2v_cache`.
+pub mod m2v_disk;
 /// IOSurface mapper capture + page-table resolve.
 pub mod map_audit;
 pub mod mapper;
@@ -106,6 +108,13 @@ pub mod present_identity;
 /// edit of them requires — the direction that is ordered is the map.
 pub mod range_coverage;
 pub mod released_pages;
+/// The reply commands a child FIFO holds when its doorbell rings.
+pub mod reply_fence;
+/// Type-11 mappings that claim one guest page, held out of writing until the
+/// guest says which one it released.
+pub mod surface_quarantine;
+/// Guest kernel addresses translated in software for threads without a vCPU.
+pub mod kernel_walk;
 /// Transfer a host-resident render frame into guest pages when synchronization
 /// or a guest-memory reader makes the bytes observable.
 pub mod render_writeback;
@@ -128,6 +137,8 @@ pub mod task_slot;
 pub mod texture;
 /// Track host-authoritative surface and GVA frames, and transfer them on demand.
 pub mod writeback_debt;
+/// Biplanar YCbCr surfaces expanded to RGBA8 for sampling.
+pub mod ycbcr;
 
 /// The unit-test host double, gated with its definition. An ungated re-export
 /// would keep it reachable and so keep it in the staticlib.

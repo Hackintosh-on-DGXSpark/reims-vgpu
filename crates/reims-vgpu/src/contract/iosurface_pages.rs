@@ -112,6 +112,11 @@ pub const MAPPING_INTERNAL_EXPECTED_SIZE: u32 = 0x200;
 pub const MAPPING_INTERNAL_PAGE_FIELD_48: u64 = 0x48;
 pub const MAPPING_INTERNAL_PAGE_FIELD_50: u64 = 0x50;
 pub const MAPPING_INTERNAL_PAGE_COUNT: u64 = 0x70;
+/// How far macOS 14 and later moved the page fields and the page count. The
+/// tables they point to keep their own offsets: measured on 15.6.1, `+0x58`
+/// then `+0xb8` and `+0x60` then `+0x28` reach the same valid entries, and
+/// `+0x80` holds the page count.
+pub const MAPPING_INTERNAL_SONOMA_SHIFT: u64 = 0x10;
 pub const MAPPING_PAGE_TABLE_FROM_F48: u64 = 0xb8;
 pub const MAPPING_PAGE_TABLE_FROM_F50: u64 = 0x28;
 
@@ -514,6 +519,27 @@ pub fn sample_window_from_device_desc(
                             }
                         }
                     }
+                    // No plane has the view's own geometry: try a view that
+                    // reinterprets one plane's rows, like a 1024-wide luma
+                    // plane sampled as 256 RGBA8 texels per row. The rows must
+                    // hold the same bytes, and only one plane may qualify.
+                    if matches == 0 {
+                        for p in 0..surf
+                            .plane_count
+                            .min(reims_vgpu_wire::device_desc::TYPE4_PLANE_CAP as u8)
+                        {
+                            if let Some((cand, _)) = device_desc_plane(desc, p as u32) {
+                                if cand.height == height
+                                    && cand.bytes_per_element != 0
+                                    && u64::from(cand.width) * u64::from(cand.bytes_per_element)
+                                        == u64::from(width) * u64::from(bpp)
+                                {
+                                    matches += 1;
+                                    plane = cand;
+                                }
+                            }
+                        }
+                    }
                     if matches == 1 {
                         if let Some(w) =
                             sample_window_from_device_plane(&plane, pixel_format, width, height)
@@ -542,18 +568,89 @@ pub fn sample_window_from_device_desc(
 /// This is the only place the allocation bound is applied, and it is why nothing
 /// may reach for [`packed_span_estimate`] directly and then take the span this
 /// refused.
+/// Find the unique plane index in `desc` whose geometry and element size match
+/// `(width, height, pixel_format)` (falling back to row-byte-equivalent planes
+/// in the same order as [`sample_window_from_device_desc`]).
+pub fn find_plane_index_in_device_desc(
+    desc: &[u8],
+    pixel_format: u16,
+    width: u32,
+    height: u32,
+) -> Option<u32> {
+    if desc.len() < DEVICE_DESC_LEN {
+        return None;
+    }
+    let surf = decode_device_surface(desc)?;
+    if surf.plane_count == 0 {
+        return None;
+    }
+    let bpp = format_bytes_per_pixel(pixel_format)?;
+    let cap = surf
+        .plane_count
+        .min(reims_vgpu_wire::device_desc::TYPE4_PLANE_CAP as u8);
+    let mut found = None;
+    let mut matches = 0u32;
+    for p in 0..cap {
+        if let Some((cand, _)) = device_desc_plane(desc, p as u32) {
+            if cand.width == width
+                && cand.height == height
+                && (cand.bytes_per_element == 0 || cand.bytes_per_element as u32 == bpp)
+                && sample_window_from_device_plane(&cand, pixel_format, width, height).is_some()
+            {
+                matches += 1;
+                found = Some(p as u32);
+            }
+        }
+    }
+    if matches == 0 {
+        for p in 0..cap {
+            if let Some((cand, _)) = device_desc_plane(desc, p as u32) {
+                if cand.height == height
+                    && cand.bytes_per_element != 0
+                    && u64::from(cand.width) * u64::from(cand.bytes_per_element)
+                        == u64::from(width) * u64::from(bpp)
+                    && sample_window_from_device_plane(&cand, pixel_format, width, height)
+                        .is_some()
+                {
+                    matches += 1;
+                    found = Some(p as u32);
+                }
+            }
+        }
+    }
+    (matches == 1).then_some(found).flatten()
+}
+
 pub fn mapping_span_bound(
     desc: Option<&[u8]>,
     pixel_format: u16,
     width: u32,
     height: u32,
 ) -> Option<u64> {
-    if let Some((_, _, end)) =
+    if let Some((_, _, mut end)) =
         sample_window_from_device_desc(desc, None, pixel_format, width, height)
     {
+        if pixel_format::is_two_plane_xr10(pixel_format) {
+            if let Some((_, _, a_end)) = sample_window_from_device_desc(
+                desc,
+                Some(1),
+                pixel_format::MTL_FORMAT_R8_UNORM,
+                width,
+                height,
+            ) {
+                end = end.max(a_end);
+            }
+        }
         return Some(end);
     }
-    let end = packed_span_estimate(pixel_format, width, height)?;
+    let mut end = packed_span_estimate(pixel_format, width, height)?;
+    if pixel_format::is_two_plane_xr10(pixel_format) {
+        if let Some(a_span) =
+            packed_span_estimate(pixel_format::MTL_FORMAT_R8_UNORM, width, height)
+        {
+            end = checked_add_u64(end, a_span)?;
+        }
+    }
     if let Some(desc) = desc {
         if desc.len() >= DEVICE_DESC_LEN {
             if let Some(surf) = decode_device_surface(desc) {
@@ -573,15 +670,29 @@ pub fn entry_gpa_shift(entry: u32, page_shift: u32) -> Option<u64> {
     Some(((entry >> PAGE_ENTRY_PFN_SHIFT) as u64) << page_shift)
 }
 
-pub fn mapper_request_entry_offset(index: u32) -> u64 {
-    (index as u64) * MAPPER_REQUEST_ENTRY_LEN as u64
+/// Byte offset, from the ring base, of mapper request `index`.
+///
+/// The guest's mapper keeps a free-running request counter and writes request
+/// `n` into slot `n % capacity`, where `capacity` is the entry count it programs
+/// into the capacity register. Reading `n * 16` instead runs past the ring once
+/// the counter passes `capacity`: every later MAP and UNMAP is lost, and a lost
+/// UNMAP leaves this device writing frames into pages the guest has freed.
+/// `None` for a ring whose capacity is not programmed.
+pub fn mapper_request_entry_offset(index: u32, capacity: u32) -> Option<u64> {
+    if capacity == 0 {
+        return None;
+    }
+    Some(u64::from(index % capacity) * MAPPER_REQUEST_ENTRY_LEN as u64)
 }
 
-pub fn mapper_request_published_entry_offset(producer: u32) -> Option<u64> {
+/// Offset of the request published by moving the producer to `producer`, that
+/// is request `producer - 1`. `None` before the first request and for an
+/// unprogrammed ring.
+pub fn mapper_request_published_entry_offset(producer: u32, capacity: u32) -> Option<u64> {
     if producer == 0 {
         None
     } else {
-        Some(mapper_request_entry_offset(producer - 1))
+        mapper_request_entry_offset(producer - 1, capacity)
     }
 }
 
@@ -715,13 +826,31 @@ pub fn read_mapper_internal(
     mapper_device_kva: u64,
 ) -> Result<MapperInternalFields, Status> {
     let mut fields = read_mapper_identity(mem, internal_kva, has_mapper_device, mapper_device_kva)?;
-    fields.page_field_48 = read_u64_at(mem, internal_kva, MAPPING_INTERNAL_PAGE_FIELD_48).ok_or(
-        Status::ErrInternalRead("iosurface_mapper_page_field_48_read"),
-    )?;
-    fields.page_field_50 = read_u64_at(mem, internal_kva, MAPPING_INTERNAL_PAGE_FIELD_50).ok_or(
-        Status::ErrInternalRead("iosurface_mapper_page_field_50_read"),
-    )?;
-    fields.raw_page_count = read_u64_at(mem, internal_kva, MAPPING_INTERNAL_PAGE_COUNT)
+    let page_fields = |shift: u64| -> Result<(u64, u64), Status> {
+        Ok((
+            read_u64_at(mem, internal_kva, MAPPING_INTERNAL_PAGE_FIELD_48 + shift).ok_or(
+                Status::ErrInternalRead("iosurface_mapper_page_field_48_read"),
+            )?,
+            read_u64_at(mem, internal_kva, MAPPING_INTERNAL_PAGE_FIELD_50 + shift).ok_or(
+                Status::ErrInternalRead("iosurface_mapper_page_field_50_read"),
+            )?,
+        ))
+    };
+    // The header up to the size word is the same on every release. macOS 14
+    // and later put 16 more bytes in front of the page fields and leave
+    // `+0x48` and `+0x50` zero, which is what tells the two layouts apart.
+    let mut shift = 0;
+    let (mut field_48, mut field_50) = page_fields(0)?;
+    if !mem.is_kernel_va(field_48) && !mem.is_kernel_va(field_50) {
+        let (moved_48, moved_50) = page_fields(MAPPING_INTERNAL_SONOMA_SHIFT)?;
+        if mem.is_kernel_va(moved_48) || mem.is_kernel_va(moved_50) {
+            shift = MAPPING_INTERNAL_SONOMA_SHIFT;
+            (field_48, field_50) = (moved_48, moved_50);
+        }
+    }
+    fields.page_field_48 = field_48;
+    fields.page_field_50 = field_50;
+    fields.raw_page_count = read_u64_at(mem, internal_kva, MAPPING_INTERNAL_PAGE_COUNT + shift)
         .ok_or(Status::ErrInternalRead("iosurface_mapper_page_count_read"))?;
     Ok(fields)
 }
@@ -778,10 +907,13 @@ fn read_table_entries(
     for i in 0..pages {
         let entry = read_u32_at(mem, table_kva, (i as u64) * U32_SIZE as u64)
             .ok_or(Status::ErrPageTableRead("iosurface_page_table_entry_read"))?;
-        let gpa = entry_gpa_shift(entry, page_shift)
-            .ok_or(Status::ErrPageEntry("iosurface_page_table_entry_invalid"))?;
-        if !mem.is_ram_gpa(gpa) {
-            return Err(Status::ErrPageEntry("iosurface_page_table_gpa_not_ram"));
+        // A page the guest has not touched yet has no frame. Keep the entry, so
+        // the mapping resolves now and readers see the hole; a later resolve
+        // picks the frame up once the guest has written it.
+        if let Some(gpa) = entry_gpa_shift(entry, page_shift) {
+            if !mem.is_ram_gpa(gpa) {
+                return Err(Status::ErrPageEntry("iosurface_page_table_gpa_not_ram"));
+            }
         }
         entries.push(entry);
     }
@@ -862,6 +994,20 @@ pub fn build_table_plan(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mapper_request_slots_wrap_at_the_programmed_capacity() {
+        use super::{mapper_request_entry_offset, mapper_request_published_entry_offset};
+        assert_eq!(mapper_request_entry_offset(0, 4), Some(0));
+        assert_eq!(mapper_request_entry_offset(3, 4), Some(3 * 16));
+        assert_eq!(mapper_request_entry_offset(4, 4), Some(0));
+        assert_eq!(mapper_request_entry_offset(9, 4), Some(16));
+        assert_eq!(mapper_request_entry_offset(u32::MAX, 64), Some(63 * 16));
+        assert_eq!(mapper_request_entry_offset(5, 0), None);
+        assert_eq!(mapper_request_published_entry_offset(0, 4), None);
+        assert_eq!(mapper_request_published_entry_offset(5, 4), Some(0));
+        assert_eq!(mapper_request_published_entry_offset(5, 0), None);
+    }
+
     use super::*;
     use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::model::{PAGE_SHIFT_ARM64E, PAGE_SIZE_ARM64E};
@@ -1051,29 +1197,61 @@ mod tests {
         .expect_err("the deleted chase does not answer this");
         assert_eq!(error.refusal(), Some("iosurface_page_table_only_field_50"));
 
-        // Both populated, `+0x48`'s table unparseable. This is the one shape
-        // the fallback was ever load-bearing for, and `earlier_failed` read
-        // zero over both driven boots — so it is now a refusal carrying the
-        // reason the table failed, rather than a silent rescue.
+        // Both populated, and `+0x48`'s table names a page the guest has not
+        // touched yet. The plan still comes through `+0x48` and keeps the hole,
+        // so readers see it and a later resolve picks the frame up; `table_b`
+        // does not rescue it.
         let mut mem = MapMem::new();
         mem.put_u64(field_48 + MAPPING_PAGE_TABLE_FROM_F48, table_a);
         mem.put_u64(field_50 + MAPPING_PAGE_TABLE_FROM_F50, table_b);
-        mem.put_u32(table_a, 0); // a zero entry is refused
+        mem.put_u32(table_a, 0);
         mem.put_u32(table_b, good_entry);
-        let error = build_table_plan(
+        let plan = build_table_plan(
             &mem,
             3,
             &base(field_48, field_50),
             PAGE_SIZE_ARM64E,
             PAGE_SHIFT_ARM64E,
         )
-        .expect_err("no second candidate rescues this any more");
-        assert_eq!(
-            error.refusal(),
-            Some("iosurface_page_table_entry_invalid"),
-            "the refusal names why the chased table failed, not that a \
-             fallback was missing"
+        .expect("a hole is a plan");
+        assert_eq!(plan.page_table_kva, table_a);
+        assert_eq!(plan.entries, vec![0]);
+    }
+
+    /// macOS 14 and later leave `+0x48` and `+0x50` zero and keep the page
+    /// fields and the page count 16 bytes further on.
+    #[test]
+    fn the_sonoma_layout_reads_the_page_fields_sixteen_bytes_on() {
+        let internal = 0xffff_fe00_0001_0000u64;
+        let field_58 = 0xffff_fe00_0002_0000u64;
+        let table = 0xffff_fe00_0003_0000u64;
+        let mut mem = MapMem::new();
+        mem.put_u64(internal + MAPPING_INTERNAL_BACKPTR, 0xffff_fe00_0004_0000);
+        mem.put_u32(internal + MAPPING_INTERNAL_ID, 3);
+        mem.put_u32(internal + MAPPING_INTERNAL_SIZE, MAPPING_INTERNAL_EXPECTED_SIZE);
+        mem.put_u64(internal + MAPPING_INTERNAL_PAGE_FIELD_48, 0);
+        mem.put_u64(internal + MAPPING_INTERNAL_PAGE_FIELD_50, 0);
+        mem.put_u64(internal + MAPPING_INTERNAL_PAGE_COUNT, 0);
+        mem.put_u64(
+            internal + MAPPING_INTERNAL_PAGE_FIELD_48 + MAPPING_INTERNAL_SONOMA_SHIFT,
+            field_58,
         );
+        mem.put_u64(
+            internal + MAPPING_INTERNAL_PAGE_FIELD_50 + MAPPING_INTERNAL_SONOMA_SHIFT,
+            0,
+        );
+        mem.put_u64(
+            internal + MAPPING_INTERNAL_PAGE_COUNT + MAPPING_INTERNAL_SONOMA_SHIFT,
+            1,
+        );
+        let fields = read_mapper_internal(&mem, internal, false, 0).expect("fields read");
+        assert_eq!(fields.page_field_48, field_58);
+        assert_eq!(fields.raw_page_count, 1);
+        mem.put_u64(field_58 + MAPPING_PAGE_TABLE_FROM_F48, table);
+        mem.put_u32(table, (0x1234 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID);
+        let plan = build_table_plan(&mem, 3, &fields, PAGE_SIZE_ARM64E, PAGE_SHIFT_ARM64E)
+            .expect("the moved fields are a plan");
+        assert_eq!(plan.page_table_kva, table);
     }
 
     #[test]
@@ -1344,5 +1522,43 @@ mod tests {
             350
         )
         .is_none());
+    }
+
+    #[test]
+    fn two_plane_xr10_span_bound_and_plane_index_lookup() {
+        use crate::contract::endian::{st16, st32, st64};
+        use crate::contract::pixel_format::{
+            MTL_FORMAT_BGR10_XR, MTL_FORMAT_R8_UNORM, MTL_FORMAT_RGB10A8_2P_XR10,
+        };
+
+        let mut desc = vec![0u8; DEVICE_DESC_LEN];
+        st32(&mut desc[DEVICE_DESC_ALLOC_SIZE..], 0x40000);
+        st32(&mut desc[DEVICE_DESC_PIXEL_FORMAT..], 0x6233_6138); // 'b3a8'
+        desc[DEVICE_DESC_PLANE_COUNT] = 2;
+        // Plane 0: 64x64 BGR10_XR (bpe=4, bpr=256, offset=0, size=16384)
+        let p0 = DEVICE_DESC_PLANES;
+        st32(&mut desc[p0 + DEVICE_PLANE_OFFSET..], 0);
+        st32(&mut desc[p0 + DEVICE_PLANE_SIZE..], 16384);
+        st64(&mut desc[p0 + DEVICE_PLANE_DIMS..], pack_plane_dims(64, 64));
+        st32(&mut desc[p0 + DEVICE_PLANE_BPR..], 256);
+        st16(&mut desc[p0 + DEVICE_PLANE_BPE..], 4);
+        // Plane 1: 64x64 R8_UNORM (bpe=1, bpr=64, offset=16384, size=4096)
+        let p1 = DEVICE_DESC_PLANES + DEVICE_PLANE_DESC_LEN;
+        st32(&mut desc[p1 + DEVICE_PLANE_OFFSET..], 16384);
+        st32(&mut desc[p1 + DEVICE_PLANE_SIZE..], 4096);
+        st64(&mut desc[p1 + DEVICE_PLANE_DIMS..], pack_plane_dims(64, 64));
+        st32(&mut desc[p1 + DEVICE_PLANE_BPR..], 64);
+        st16(&mut desc[p1 + DEVICE_PLANE_BPE..], 1);
+
+        assert_eq!(
+            find_plane_index_in_device_desc(&desc, MTL_FORMAT_BGR10_XR, 64, 64),
+            Some(0)
+        );
+        assert_eq!(
+            find_plane_index_in_device_desc(&desc, MTL_FORMAT_R8_UNORM, 64, 64),
+            Some(1)
+        );
+        let bound = mapping_span_bound(Some(&desc), MTL_FORMAT_RGB10A8_2P_XR10, 64, 64).unwrap();
+        assert_eq!(bound, 16384 + 63 * 64 + 64);
     }
 }

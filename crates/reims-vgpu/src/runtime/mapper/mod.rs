@@ -140,28 +140,141 @@ fn capture_xreg_failed(
 }
 
 /// Adapter: mapper internals are KVA; page content GPAs use HostMemory.
+///
+/// A kernel address read on a vCPU goes through the CPU and, when a root has
+/// been captured, is also read through the software walk for runtime
+/// validation. Without a vCPU it is served by the walk, refused, or answered
+/// `NoCpu` as before, as [`crate::runtime::kernel_walk::WalkPolicy`] says.
 struct MapperMem<'a, H: HostMemory + HostOps> {
     host: &'a H,
     last_error: std::cell::Cell<Option<MemError>>,
+    walk: crate::runtime::kernel_walk::WalkPolicy,
+    /// The first refusal without a vCPU, and the address it was for.
+    refused: std::cell::Cell<Option<(crate::runtime::kernel_walk::Refused, u64)>>,
+    log: Option<&'a std::cell::RefCell<crate::runtime::kernel_walk::WalkLog>>,
+    /// Samples taken, against [`crate::runtime::kernel_walk::WalkPolicy::sample_limit`].
+    sampled: std::cell::Cell<u32>,
+    /// Kernel pages this reader has sampled, while its root validates.
+    pages: std::cell::RefCell<Vec<u64>>,
 }
 
 impl<'a, H: HostMemory + HostOps> MapperMem<'a, H> {
+    /// A reader that only runs on a vCPU and takes no part in the walk.
     fn new(host: &'a H) -> Self {
+        Self::with_walk(host, crate::runtime::kernel_walk::WalkPolicy::OFF, None)
+    }
+
+    fn with_walk(
+        host: &'a H,
+        walk: crate::runtime::kernel_walk::WalkPolicy,
+        log: Option<&'a std::cell::RefCell<crate::runtime::kernel_walk::WalkLog>>,
+    ) -> Self {
         Self {
             host,
             last_error: std::cell::Cell::new(None),
+            walk,
+            refused: std::cell::Cell::new(None),
+            log,
+            sampled: std::cell::Cell::new(0),
+            pages: std::cell::RefCell::new(Vec::new()),
         }
     }
 
     fn last_error(&self) -> Option<MemError> {
         self.last_error.get()
     }
+
+    fn refused(&self) -> Option<(crate::runtime::kernel_walk::Refused, u64)> {
+        self.refused.get()
+    }
+
+    fn read_kernel(&self, address: u64, dst: &mut [u8]) -> Result<(), MemError> {
+        use crate::runtime::kernel_walk::{self, Refused, Serve};
+        match self.host.read_kva(address, dst) {
+            Ok(()) => {
+                self.validate(address, dst);
+                Ok(())
+            }
+            Err(MemError::NoCpu) => {
+                let refusal = match self.walk.serve {
+                    Serve::Off => return Err(MemError::NoCpu),
+                    Serve::Walk(root) => match kernel_walk::read(self.host, &root, address, dst) {
+                        Ok(()) => return Ok(()),
+                        Err(why) => Refused::Walk(why),
+                    },
+                    Serve::Refuse(why) => Refused::Gate(why),
+                };
+                if self.refused.get().is_none() {
+                    self.refused.set(Some((refusal, address)));
+                }
+                Err(MemError::KernelWalkRefused)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Runtime validation: the bytes the CPU just read, read through the walk and
+    /// then through the CPU again (see [`crate::runtime::kernel_walk::sample`]).
+    ///
+    /// Up to the policy's sample limit, and — while the root validates — also
+    /// the first read of each new kernel page this reader touches, up to
+    /// [`crate::runtime::kernel_walk::PAGES_PER_READER_VALIDATING`] pages, so one
+    /// resolve samples the MappingInternal, its page object and its page table
+    /// rather than one object many times. While a crossing is still owed, each
+    /// new page also gets one probe across its end.
+    fn validate(&self, address: u64, cpu: &[u8]) {
+        use crate::runtime::kernel_walk::{self, Source, PAGES_PER_READER_VALIDATING};
+        let (Some(root), Some(log)) = (self.walk.root, self.log) else {
+            return;
+        };
+        let page = address & !((1u64 << 14) - 1);
+        let new_page = !self.walk.validated && {
+            let mut pages = self.pages.borrow_mut();
+            let new = pages.len() < PAGES_PER_READER_VALIDATING && !pages.contains(&page);
+            if new {
+                pages.push(page);
+            }
+            new
+        };
+        if !new_page && self.sampled.get() >= self.walk.sample_limit() {
+            return;
+        }
+        self.sampled.set(self.sampled.get() + 1);
+        let mut log = log.borrow_mut();
+        let again = |at: u64| move |buf: &mut [u8]| self.host.read_kva(at, buf).is_ok();
+        log.compares.push(kernel_walk::sample(
+            self.host,
+            &root,
+            address,
+            cpu,
+            again(address),
+            Source::Mapper,
+        ));
+        if !self.walk.wants_crossing || !new_page {
+            return;
+        }
+        let Some((at, len)) = kernel_walk::crossing_probe(&root, address) else {
+            return;
+        };
+        log.probes += 1;
+        let mut probe = vec![0u8; len];
+        if self.host.read_kva(at, &mut probe).is_ok() {
+            log.compares.push(kernel_walk::sample(
+                self.host,
+                &root,
+                at,
+                &probe,
+                again(at),
+                Source::Mapper,
+            ));
+        }
+    }
 }
 
 impl<H: HostMemory + HostOps> PagesMemory for MapperMem<'_, H> {
     fn read(&self, address: u64, dst: &mut [u8]) -> bool {
         if guest_kernel_va(address) {
-            match self.host.read_kva(address, dst) {
+            match self.read_kernel(address, dst) {
                 Ok(()) => true,
                 Err(e) => {
                     self.last_error.set(Some(e));
@@ -186,6 +299,39 @@ impl<H: HostMemory + HostOps> PagesMemory for MapperMem<'_, H> {
     }
 }
 
+/// The MappingInternal in whichever register holds it.
+///
+/// macOS 26's driver leaves the handoff in other registers than x19/x21/x22.
+/// A MappingInternal names its own mapping id and size, so the register can be
+/// found by asking each one, and its back pointer is the mapper device.
+fn find_mapping_internal<H: HostMemory + HostOps>(
+    host: &H,
+    producer: u32,
+    mid: u32,
+    request_type: u32,
+) -> Option<MapperCapture> {
+    let mem = MapperMem::new(host);
+    (0..=30u32).find_map(|reg| {
+        let internal = host.read_xreg(reg).ok().filter(|&v| guest_kernel_va(v))?;
+        let fields = read_mapper_identity(&mem, internal, false, 0).ok()?;
+        if fields.mapping_id != mid
+            || fields.internal_size != iosurface_pages::MAPPING_INTERNAL_EXPECTED_SIZE
+            || !guest_kernel_va(fields.owner_kva)
+        {
+            return None;
+        }
+        if crate::observe::first_sight("mapper_capture_register", u64::from(reg)) {
+            crate::observe::off(format!("mapper_capture_register reg=x{reg} mapping={mid}"));
+        }
+        Some(MapperCapture {
+            producer,
+            mapper_device_kva: fields.owner_kva,
+            request_type,
+            mapping_internal: internal,
+        })
+    })
+}
+
 /// Capture mapper handoff registers while still on the publishing vCPU.
 ///
 /// Call from the iosfc producer MMIO write path before scheduling the drain BH.
@@ -197,7 +343,7 @@ pub fn capture_at_producer<H: HostMemory + HostOps>(
     if producer == 0 || state.iosfc.ring_base == 0 {
         return None;
     }
-    let entry_off = mapper_request_published_entry_offset(producer)?;
+    let entry_off = mapper_request_published_entry_offset(producer, state.iosfc.capacity)?;
     let mut e = [0u8; MAPPER_REQUEST_ENTRY_LEN];
     host.read_gpa(state.iosfc.ring_base + entry_off, &mut e)
         .ok()?;
@@ -236,6 +382,11 @@ pub fn capture_at_producer<H: HostMemory + HostOps>(
             return capture_xreg_failed(mid, producer, decline);
         }
     };
+    if rtype != request.request_type || !guest_kernel_va(internal) {
+        if let Some(capture) = find_mapping_internal(host, producer, mid, request.request_type) {
+            return Some(capture);
+        }
+    }
     if rtype != request.request_type {
         let decline = MapperDecline::CaptureRequestTypeMismatch;
         note_capture_fail(
@@ -348,10 +499,29 @@ pub fn apply_capture(state: &mut DeviceState, cap: &MapperCapture, mapping_id: u
 /// Resolve page table + device-descriptor geometry for a mapped slot.
 ///
 /// Safe to call repeatedly; refreshes pages when `mapping_internal` is set.
+/// Off a vCPU the re-read goes through [`crate::runtime::kernel_walk`] in the
+/// mode it is in, and what a vCPU read compared is folded into its runtime
+/// validation afterwards.
 pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &H,
     mapping_id: u32,
+) -> bool {
+    let walk = state
+        .kernel_walk
+        .policy(crate::runtime::kernel_walk::mode());
+    let log = std::cell::RefCell::new(crate::runtime::kernel_walk::WalkLog::default());
+    let resolved = resolve_mapping_backing_walked(state, host, mapping_id, walk, &log);
+    state.kernel_walk.fold(log.into_inner());
+    resolved
+}
+
+fn resolve_mapping_backing_walked<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &H,
+    mapping_id: u32,
+    walk: crate::runtime::kernel_walk::WalkPolicy,
+    log: &std::cell::RefCell<crate::runtime::kernel_walk::WalkLog>,
 ) -> bool {
     let Some(m) = state.mappings.get(&mapping_id) else {
         return false;
@@ -364,13 +534,21 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
     let cached_pages = m.page_entries.len();
     let cached_table = m.page_table_kva;
     let had_cached_pages = cached_pages != 0;
-    let mem = MapperMem::new(host);
+    let mem = MapperMem::with_walk(host, walk, Some(log));
 
     let fields = match read_mapper_internal(&mem, internal, mapper != 0, mapper) {
         Ok(f) => f,
         Err(status) => {
             let reason = refusal_reason(&status);
             let host_error = mem.last_error();
+            // Off a vCPU in strict mode, a page list that could not be re-read
+            // is not one to keep writing through: refuse, and say when.
+            if let Some((why, kva)) = mem.refused() {
+                state
+                    .kernel_walk
+                    .note_refusal(mapping_id, cached_pages, why, kva);
+                return false;
+            }
             let host_reason = host_error
                 .map(|error| crate::observe::Decline::slug(&error))
                 .unwrap_or("none");
@@ -507,10 +685,29 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
     // multi-plane, prefer alloc_size already latched from the device descriptor.
     if let Some(m) = state.mappings.get(&mapping_id) {
         if m.has_geom && m.width > 0 && m.height > 0 {
-            width = m.width;
-            height = m.height;
-            format = if m.format != 0 { m.format } else { format };
             let desc_slice = device_desc.as_deref().or(m.device_desc_complete());
+            let desc_surf = desc_slice.and_then(decode_device_surface);
+            let desc_multiplane = desc_surf.is_some_and(|s| {
+                s.plane_count > 1
+                    || crate::runtime::objects::iosurface_fourcc_is_biplanar(s.pixel_format)
+            });
+            if !desc_multiplane || width == 0 || height == 0 {
+                width = m.width;
+                height = m.height;
+            }
+            format = if desc_multiplane {
+                if crate::contract::pixel_format::is_two_plane_xr10(m.format)
+                    || crate::runtime::ycbcr::Sampling::of(m.format).is_some()
+                {
+                    m.format
+                } else {
+                    format
+                }
+            } else if m.format != 0 {
+                m.format
+            } else {
+                format
+            };
             if let Some(end) = mapping_span_bound(desc_slice, format, width, height) {
                 min_size = min_size.max(end).max(guest_page);
             }
@@ -520,6 +717,11 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
     let plan = match build_table_plan(&mem, mapping_id, &fields, min_size, state.page_shift) {
         Ok(p) => p,
         Err(status) => {
+            if let Some((why, kva)) = mem.refused() {
+                state
+                    .kernel_walk
+                    .note_refusal(mapping_id, cached_pages, why, kva);
+            }
             // Still latch geom / device desc if we decoded them, even without pages yet.
             if let Some(ref d) = device_desc {
                 let _ = state.set_mapping_device_desc(mapping_id, d);
@@ -676,6 +878,7 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
             }
         }
         m.page_entries = plan.entries;
+        m.validated_ms = crate::observe::elapsed_ms() as u64;
         m.page_table_kva = plan.page_table_kva;
         m.mapping_internal = internal;
         m.mapped = true;
@@ -733,6 +936,11 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
     if pages_changed && !surface_pages_are_exclusively_owned(state, mapping_id, "rewire") {
         return false;
     }
+    // Only now, with the adopted table past every check above: a quarantined id
+    // whose new backing is proven lifts here, and a table that failed a check
+    // returned before it could lift anything or drop its frame. See
+    // `runtime::surface_quarantine::confirm_new_backing`.
+    crate::runtime::surface_quarantine::confirm_new_backing(state, mapping_id);
     // Resolved: re-arm the fail latch so a later genuine failure (a re-map that
     // goes bad, a corrupted descriptor) is logged again rather than swallowed.
     clear_resolve_fail(mapping_id);
@@ -755,7 +963,16 @@ fn surface_pages_are_exclusively_owned(
     mapping_id: u32,
     site: &str,
 ) -> bool {
-    let Some((gpa, owner)) = first_surface_page_collision(state, mapping_id) else {
+    let (valid, withdrawn) = surface_page_overlaps(state, mapping_id);
+    // An incarnation the wire guard proved the guest unwired owns nothing here;
+    // every other owner still does. See `runtime::surface_quarantine::withdraw`.
+    let held = crate::runtime::surface_quarantine::is_quarantined(state, mapping_id);
+    for (gpa, old) in withdrawn {
+        crate::runtime::surface_quarantine::note_withdrawn_overlap(
+            mapping_id, old, gpa, site, held,
+        );
+    }
+    let Some((gpa, owner)) = valid else {
         return true;
     };
     let mine_pages = state
@@ -779,14 +996,31 @@ fn surface_pages_are_exclusively_owned(
 /// this. It is not measure-only; the doc said so for a while and was wrong,
 /// which is the worse way round for a detector on the guest-corruption rail.
 ///
+/// An owner whose incarnation withdrew its page claims is not counted: see
+/// [`crate::runtime::surface_quarantine::withdraw`].
+///
 /// Cost O(this_pages + Σ other live pages); called only on a rewire.
 fn first_surface_page_collision(state: &DeviceState, mapping_id: u32) -> Option<(u64, u32)> {
+    surface_page_overlaps(state, mapping_id).0
+}
+
+/// `mapping_id`'s overlaps with every other live mapping: the first page it
+/// shares with a valid owner, and one shared page for each owner whose
+/// incarnation withdrew its claims.
+fn surface_page_overlaps(
+    state: &DeviceState,
+    mapping_id: u32,
+) -> (Option<(u64, u32)>, Vec<(u64, u32)>) {
+    let mut valid = None;
+    let mut withdrawn = Vec::new();
     let page_shift = state.page_shift;
     let page = state.page_size();
     let page_base = |gpa: u64| gpa & !(page - 1);
-    let m = state.mappings.get(&mapping_id)?;
+    let Some(m) = state.mappings.get(&mapping_id) else {
+        return (valid, withdrawn);
+    };
     if !m.mapped || m.page_entries.is_empty() {
-        return None;
+        return (valid, withdrawn);
     }
     let mine: std::collections::HashSet<u64> = m
         .page_entries
@@ -795,21 +1029,29 @@ fn first_surface_page_collision(state: &DeviceState, mapping_id: u32) -> Option<
         .map(page_base)
         .collect();
     if mine.is_empty() {
-        return None;
+        return (valid, withdrawn);
     }
     for (&other_id, other) in &state.mappings {
         if other_id == mapping_id || !other.mapped || other.page_entries.is_empty() {
             continue;
         }
-        for &e in &other.page_entries {
-            if let Some(gpa) = crate::contract::iosurface_pages::entry_gpa_shift(e, page_shift) {
-                if mine.contains(&page_base(gpa)) {
-                    return Some((page_base(gpa), other_id));
-                }
-            }
+        let gone = crate::runtime::surface_quarantine::entry_withdrawn(other);
+        if valid.is_some() && !gone {
+            continue;
+        }
+        let shared = other
+            .page_entries
+            .iter()
+            .filter_map(|&e| crate::contract::iosurface_pages::entry_gpa_shift(e, page_shift))
+            .map(page_base)
+            .find(|gpa| mine.contains(gpa));
+        match (shared, gone) {
+            (Some(gpa), true) => withdrawn.push((gpa, other_id)),
+            (Some(gpa), false) => valid = Some((gpa, other_id)),
+            (None, _) => {}
         }
     }
-    None
+    (valid, withdrawn)
 }
 
 /// Always-on, deduped-per-`(mid, owner, gpa)` fail line for a cross-surface
@@ -853,6 +1095,9 @@ fn fail_closed_surface_page_collision(
     path: &str,
 ) {
     note_surface_page_collision(mapping_id, gpa, owner, mine_pages, path);
+    // Both sides, before this one's page list is withdrawn below: the collision
+    // does not say which of the two is stale.
+    crate::runtime::surface_quarantine::quarantine_collision(state, mapping_id, owner, gpa, path);
     let _ = state.invalidate_mapping_pages(mapping_id);
 }
 
@@ -976,18 +1221,22 @@ pub fn ensure_resolved_for_scanout<H: HostMemory + HostOps>(
     host: &H,
     mapping_id: u32,
 ) -> bool {
-    let (mapped, has_internal, empty_pages, has_geom) = match state.mappings.get(&mapping_id) {
+    let page_shift = state.page_shift;
+    let (mapped, has_internal, empty_pages, has_geom, has_holes) = match state.mappings.get(&mapping_id) {
         Some(m) => (
             m.mapped,
             m.mapping_internal != 0,
             m.page_entries.is_empty(),
             m.has_geom,
+            m.page_entries.iter().any(|&e| {
+                crate::contract::iosurface_pages::entry_gpa_shift(e, page_shift).is_none()
+            }),
         ),
         None => return false,
     };
     let needs = mapped
         && has_internal
-        && (empty_pages || !has_geom || !pages_cover_geom(state, mapping_id));
+        && (empty_pages || has_holes || !has_geom || !pages_cover_geom(state, mapping_id));
     if needs {
         resolve_mapping_backing(state, host, mapping_id)
     } else {
@@ -1360,6 +1609,8 @@ pub fn type4_pages_witness<H: HostMemory>(
 pub struct PagesVouched {
     mapping_id: u32,
     map_generation: u32,
+    /// The mapping's write epoch when minted; a revocation moves it.
+    write_epoch: u64,
 }
 
 impl PagesVouched {
@@ -1373,7 +1624,12 @@ impl PagesVouched {
             && state
                 .mappings
                 .get(&mapping_id)
-                .is_some_and(|m| m.map_generation == self.map_generation)
+                .is_some_and(|m| {
+                    m.map_generation == self.map_generation && m.write_epoch == self.write_epoch
+                })
+            // A quarantine revokes every proof at once, including one minted
+            // before it: see `runtime::surface_quarantine`.
+            && !crate::runtime::surface_quarantine::is_quarantined(state, mapping_id)
     }
 }
 
@@ -1406,9 +1662,14 @@ pub fn vouch_mapping_pages_verdict<H: HostMemory + HostOps>(
     if verdict == PagesVerdict::Drifted {
         return (verdict, None);
     }
+    if crate::runtime::surface_quarantine::is_quarantined(state, mapping_id) {
+        crate::runtime::surface_quarantine::note_refused(mapping_id, "vouch");
+        return (verdict, None);
+    }
     let token = state.mappings.get(&mapping_id).map(|m| PagesVouched {
         mapping_id,
         map_generation: m.map_generation,
+        write_epoch: m.write_epoch,
     });
     (verdict, token)
 }
@@ -1781,6 +2042,12 @@ pub fn mapping_page_gpas<H: HostMemory + HostOps>(
     host: &mut H,
     mapping_id: u32,
 ) -> Option<Vec<u64>> {
+    // A condemned incarnation's pages belong to someone else now: no list of
+    // them goes to a reader, nor to anything else. See
+    // [`wire_watch::refuse_guest_read`].
+    if wire_watch::refuse_guest_read(state, mapping_id, "page_list") {
+        return None;
+    }
     if !{ revalidate_mapping_pages(state, host, mapping_id) } {
         return None;
     }
@@ -1938,6 +2205,10 @@ pub fn ensure_contig_view_with_pages<H: HostMemory + HostOps>(
     host: &mut H,
     mapping_id: u32,
 ) -> Option<(usize, usize, std::sync::Arc<[u64]>)> {
+    // Nor a view of them, cached or new; see [`mapping_page_gpas`].
+    if wire_watch::refuse_guest_read(state, mapping_id, "contig_view") {
+        return None;
+    }
     // Always revalidate before returning a cached contig (ReplacePhysical /
     // recycle must not leave a live view over freelist PFNs).
     if !revalidate_mapping_pages(state, host, mapping_id) {
@@ -2011,6 +2282,10 @@ pub fn ensure_contig_import_with_footprint<H: HostMemory + HostOps>(
     std::sync::Arc<crate::runtime::guest_ram::GuestRamImport>,
     crate::runtime::guest_ram::GuestPageFootprint,
 )> {
+    // The GPU would read the pages through it; see [`mapping_page_gpas`].
+    if wire_watch::refuse_guest_read(state, mapping_id, "contig_import") {
+        return None;
+    }
     if !host.map_pages_stable() {
         return None;
     }
@@ -2254,9 +2529,15 @@ fn copy_mapping_runs<H: HostMemory + HostOps>(
     site: &str,
 ) -> bool {
     if copy.is_write() {
+        if !wire_watch::before_write(state, &*host, mapping_id, site, wire_watch::WriteKind::Cpu) {
+            return false;
+        }
         // Puts bytes into guest pages the hypervisor's dirty bitmap cannot
         // witness. The read direction shares this walk and writes nothing.
         state.note_host_wrote_mapping(mapping_id);
+    } else if wire_watch::refuse_guest_read(state, mapping_id, site) {
+        // A condemned incarnation's pages hold another owner's bytes.
+        return false;
     }
     let page_size = state.page_size();
     let len = copy.len();
@@ -2513,8 +2794,13 @@ fn mapping_run_import_is_slow(elapsed_us: u64) -> bool {
     elapsed_us >= MAPPING_RUN_IMPORT_SLOW_US
 }
 
+pub mod wire_watch;
+
 #[cfg(test)]
 mod revalidate_tests;
+
+#[cfg(test)]
+mod quarantine_tests;
 
 #[cfg(test)]
 mod tests;
